@@ -53,7 +53,7 @@ The Memory memory plugin adds a **cloud-based, encrypted memory layer** to OpenC
   <Card title="Reference" icon="book" href="/openclaw/reference">
     Hooks, tools, CLI, configuration, and troubleshooting
   </Card>
-  <Card title="Source Code" icon="github" href="https://github.com/the-social-proof-foundation/Memory/tree/main/packages/openclaw-memory">
+  <Card title="Source Code" icon="github" href="https://github.com/the-social-proof-foundation/myso-memory/tree/main/packages/openclaw-memory">
     Browse the source on GitHub
   </Card>
 </CardGroup>

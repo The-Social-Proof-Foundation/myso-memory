@@ -102,7 +102,7 @@ And many more — check out the example apps below to see Memory in action.
 
 ## Example Apps
 
-The repo ships with ready-to-run apps in the [`/apps`](https://github.com/the-social-proof-foundation/Memory/tree/main/apps) directory:
+The repo ships with ready-to-run apps in the [`/apps`](https://github.com/the-social-proof-foundation/myso-memory/tree/main/apps) directory:
 
 - **Playground** — dashboard demo for Memory
 - **Chatbot** — AI chat app with persistent memory across sessions

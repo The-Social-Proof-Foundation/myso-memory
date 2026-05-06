@@ -226,7 +226,7 @@ export default function LandingPage() {
                                 </a>
                             )}
                             <a
-                                href="https://github.com/the-social-proof-foundation/memory"
+                                href="https://github.com/the-social-proof-foundation/myso-memory"
                                 target="_blank"
                                 rel="noopener noreferrer"
                                 className="lp-btn-outline"

@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/the-social-proof-foundation/Memory",
+    "url": "https://github.com/the-social-proof-foundation/myso-memory",
     "directory": "packages/openclaw-memory"
   },
   "main": "./dist/index.js",
