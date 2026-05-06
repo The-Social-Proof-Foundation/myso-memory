@@ -1,0 +1,58 @@
+# Memory
+
+> Memory is a privacy-first AI memory layer. It stores encrypted memories on File Storage (decentralized storage) and retrieves them with semantic search. Ownership is enforced onchain via MySo smart contracts. The TypeScript SDK (`@socialproof/memory`) gives any app persistent, encrypted memory in a few lines of code.
+
+Important notes:
+
+- Memory is currently in beta
+- The SDK talks to a relayer service that handles embedding, MYDATA encryption, File Storage upload/download, and vector search
+- All content is end-to-end encrypted — only the owner and authorized delegates can decrypt
+- Delegate keys provide scoped access — agents can read/write memory without holding the owner's private key
+- Memory is scoped by `owner + namespace` — each namespace is an isolated memory space
+
+## Docs
+
+- [What is Memory?](https://docs.mysocial.network/getting-started/what-is-memory): Overview of features, architecture, and use cases
+- [Quick Start](https://docs.mysocial.network/getting-started/quick-start): Install the SDK, generate credentials, store and recall your first memory
+- [Choose Your Path](https://docs.mysocial.network/getting-started/choose-your-path): Pick the right integration path (Memory, MemoryManual, or withMemory AI middleware)
+
+## SDK
+
+- [SDK Quick Start](https://docs.mysocial.network/sdk/quick-start): Install, configure, and store your first memory
+- [Memory Usage](https://docs.mysocial.network/sdk/usage/memory): Default relayer-handled client — remember, recall, analyze, restore
+- [MemoryManual Usage](https://docs.mysocial.network/sdk/usage/memory-manual): Manual client — client-side embedding and MYDATA encryption
+- [withMemory AI Middleware](https://docs.mysocial.network/sdk/usage/with-memory): Vercel AI SDK integration — automatic memory recall and save
+- [SDK API Reference](https://docs.mysocial.network/sdk/api-reference): Full method signatures, return types, and config fields
+
+## Relayer
+
+- [Relayer Overview](https://docs.mysocial.network/relayer/overview): Architecture, trust boundary, key pool, single-instance design
+- [Public Relayer](https://docs.mysocial.network/relayer/public-relayer): Managed relayer endpoints provided by File Storage Foundation
+- [Self-Hosting](https://docs.mysocial.network/relayer/self-hosting): Run your own relayer with full control over encryption and embedding
+- [Relayer API Reference](https://docs.mysocial.network/relayer/api-reference): HTTP routes, authentication headers, request/response shapes
+
+## Smart Contract
+
+- [Contract Overview](https://docs.mysocial.network/contract/overview): Onchain ownership model and package IDs
+- [Delegate Key Management](https://docs.mysocial.network/contract/delegate-key-management): Add, remove, and rotate delegate keys
+- [Ownership & Permissions](https://docs.mysocial.network/contract/ownership-and-permissions): Access control model
+
+## OpenClaw Plugin
+
+- [OpenClaw Overview](https://docs.mysocial.network/openclaw/overview): NemoClaw/OpenClaw memory plugin overview
+- [OpenClaw Quick Start](https://docs.mysocial.network/openclaw/quick-start): Install and configure the plugin
+- [How It Works](https://docs.mysocial.network/openclaw/how-it-works): Architecture, hooks, and message flow
+- [OpenClaw Reference](https://docs.mysocial.network/openclaw/reference): Hooks, tools, CLI, and configuration
+
+## Reference
+
+- [Configuration](https://docs.mysocial.network/reference/configuration): MemoryConfig, MemoryManualConfig, WithMemoryOptions
+- [Environment Variables](https://docs.mysocial.network/reference/environment-variables): Relayer env vars for self-hosting
+
+## Optional
+
+- [Concepts: Memory Space](https://docs.mysocial.network/fundamentals/concepts/memory-space): Namespace isolation and memory boundaries
+- [Architecture: Core Components](https://docs.mysocial.network/fundamentals/architecture/core-components): System overview and component responsibilities
+- [Data Flow & Security Model](https://docs.mysocial.network/fundamentals/architecture/data-flow-security-model): Trust boundaries and encryption flows
+- [Contributing: Run Repo Locally](https://docs.mysocial.network/contributing/run-repo-locally): Monorepo setup for contributors
+- [Example Apps](https://docs.mysocial.network/examples/example-apps): Playground, Chatbot, Noter, Researcher

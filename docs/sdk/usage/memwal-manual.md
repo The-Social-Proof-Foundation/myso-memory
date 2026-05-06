@@ -1,0 +1,100 @@
+---
+title: "MemoryManual"
+description: "Client-managed embeddings and local MYDATA operations."
+---
+
+Use when the client must handle embedding calls and local MYDATA operations. The relayer still handles
+upload relay, vector registration, search, and restore.
+
+This is the recommended path for Web3-native users who want to minimize trust in the relayer — it never sees your plaintext data.
+
+## What the client handles vs. what the relayer handles
+
+| Operation | Client (MemoryManual) | Relayer |
+|-----------|----------------------|---------|
+| Embedding | Client calls OpenAI/compatible API | — |
+| MYDATA encryption | Client encrypts locally | — |
+| File Storage upload | — | Server uploads via sidecar (server pays gas) |
+| Vector registration | — | Server stores `{blob_id, vector}` in PostgreSQL |
+| Recall search | — | Server searches vectors, returns `{blob_id, distance}` |
+| File Storage download | Client downloads from aggregator | — |
+| MYDATA decryption | Client decrypts locally (SessionKey) | — |
+
+## Setup
+
+```ts
+import { MemoryManual } from "@socialproof/memory/manual";
+
+const manual = MemoryManual.create({
+  key: "<your-ed25519-private-key>",
+  serverUrl: "https://your-relayer-url.com",
+  mysoPrivateKey: "<your-myso-private-key>",    // OR walletSigner
+  embeddingApiKey: "<your-openai-api-key>",
+  packageId: "<memory-package-id>",
+  accountId: "<memory-account-id>",
+  namespace: "chatbot-prod",
+});
+```
+
+## Core Methods
+
+```ts
+// Embed locally, encrypt locally, relay encrypted payload + vector
+await manual.rememberManual("User prefers dark mode.");
+
+// Embed locally, search via relayer, download and decrypt locally
+const result = await manual.recallManual("What do we know?", 5);
+for (const memory of result.results) {
+  console.log(memory.text, memory.distance);
+}
+
+// Same relayer restore endpoint
+await manual.restore("chatbot-prod", 50);
+
+// Check if using a connected wallet signer
+console.log(manual.isWalletMode);
+```
+
+## Remember flow (under the hood)
+
+1. Client generates embedding via OpenAI-compatible API
+2. Client MYDATA-encrypts the plaintext locally (no wallet signature needed)
+3. Client sends `{encrypted_data (base64), vector}` to the relayer
+4. Relayer uploads encrypted bytes to File Storage via upload-relay sidecar (server pays gas)
+5. Relayer stores `{blob_id, vector, owner, namespace}` in PostgreSQL
+
+## Recall flow (under the hood)
+
+1. Client generates query embedding via OpenAI-compatible API
+2. Client sends the vector to the relayer
+3. Relayer searches PostgreSQL and returns `{blob_id, distance}` hits
+4. Client downloads all matching encrypted blobs from File Storage concurrently
+5. Client creates a single MYDATA SessionKey (one wallet popup in browser mode)
+6. Client decrypts each blob locally using the shared session key
+
+## Browser Integration (wallet signer)
+
+Use `walletSigner` instead of `mysoPrivateKey` when integrating with a connected wallet (e.g., `@socialproof/dapp-kit`):
+
+```ts
+const manual = MemoryManual.create({
+  key: "<your-ed25519-delegate-key>",
+  walletSigner: {
+    address: walletAddress,
+    signAndExecuteTransaction: signAndExecuteTransaction,
+    signPersonalMessage: signPersonalMessage,
+  },
+  embeddingApiKey: "<your-openai-api-key>",
+  packageId: "<memory-package-id>",
+  accountId: "<memory-account-id>",
+});
+```
+
+## Config Notes
+
+- `mysoNetwork` defaults to `mainnet`
+- `mydataKeyServers` lets the client override the built-in MYDATA key server object IDs
+- File Storage publisher, aggregator, and upload relay defaults follow `mysoNetwork`
+- `embeddingModel` defaults to `text-embedding-3-small` (or `openai/text-embedding-3-small` for OpenRouter)
+- `fileStorageEpochs` defaults to `50` (storage duration)
+- All `@mysten/*` peer dependencies are loaded dynamically — users who only use the default `Memory` client don't need them installed

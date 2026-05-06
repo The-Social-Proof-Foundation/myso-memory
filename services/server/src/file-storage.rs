@@ -1,0 +1,221 @@
+use crate::types::{AppError, SidecarError};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+/// Result of a File Storage blob upload
+pub struct UploadResult {
+    /// File Storage content-addressed blob ID (base64url)
+    pub blob_id: String,
+    /// MySo object ID of the Blob object (hex, e.g. "0x...")
+    #[allow(dead_code)]
+    pub object_id: Option<String>,
+}
+
+/// A blob discovered from on-chain query
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct OnChainBlob {
+    /// File Storage blob ID
+    #[serde(rename = "blobId")]
+    pub blob_id: String,
+    /// MySo object ID
+    #[serde(rename = "objectId")]
+    pub object_id: String,
+    /// Namespace from on-chain metadata
+    pub namespace: String,
+    /// Memory package ID from on-chain metadata
+    #[serde(rename = "packageId", default)]
+    pub package_id: String,
+}
+
+/// Response from sidecar query-blobs endpoint
+#[derive(Debug, serde::Deserialize)]
+struct QueryBlobsResponse {
+    blobs: Vec<OnChainBlob>,
+    total: usize,
+}
+
+/// Request/response types for sidecar HTTP API
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FileStorageUploadRequest {
+    data: String,
+    key_index: usize,
+    owner: String,
+    namespace: String,
+    package_id: String,
+    epochs: u64,
+    #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
+    agent_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileStorageUploadResponse {
+    blob_id: String,
+    object_id: Option<String>,
+}
+
+/// Upload an encrypted blob to File Storage via the HTTP sidecar.
+///
+/// Calls the long-lived sidecar server at `POST /file-storage/upload` which uses
+/// `@socialproof/file-storage` SDK with the multi-step writeBlobFlow.
+///
+/// The server wallet pays for gas + storage. After certify, the blob object
+/// is transferred to `owner_address`. Namespace + owner are stored as
+/// on-chain metadata attributes for discoverability.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_blob(
+    client: &reqwest::Client,
+    sidecar_url: &str,
+    sidecar_secret: Option<&str>,
+    data: &[u8],
+    epochs: u64,
+    owner_address: &str,
+    key_index: usize,
+    namespace: &str,
+    package_id: &str,
+    agent_id: Option<&str>,
+) -> Result<UploadResult, AppError> {
+    let url = format!("{}/file-storage/upload", sidecar_url);
+    let data_b64 = BASE64.encode(data);
+
+    let mut req = client
+        .post(&url)
+        .json(&FileStorageUploadRequest {
+            data: data_b64,
+            key_index,
+            owner: owner_address.to_string(),
+            namespace: namespace.to_string(),
+            package_id: package_id.to_string(),
+            epochs,
+            agent_id: agent_id.map(|s| s.to_string()),
+        });
+    if let Some(secret) = sidecar_secret {
+        req = req.header("authorization", format!("Bearer {}", secret));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Sidecar file-storage/upload request failed: {}. Is the sidecar running?", e))
+        })?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        if let Ok(err) = serde_json::from_str::<SidecarError>(&body) {
+            return Err(AppError::Internal(format!("file-storage upload failed: {}", err.error)));
+        }
+        return Err(AppError::Internal(format!("file-storage upload failed: {}", body)));
+    }
+
+    let result: FileStorageUploadResponse = resp.json().await.map_err(|e| {
+        AppError::Internal(format!("Failed to parse file storage/upload response: {}", e))
+    })?;
+
+    tracing::info!(
+        "file-storage upload via sidecar ok: blob_id={}, object_id={:?}, owner={}, ns={}",
+        result.blob_id,
+        result.object_id,
+        owner_address,
+        namespace
+    );
+
+    Ok(UploadResult {
+        blob_id: result.blob_id,
+        object_id: result.object_id,
+    })
+}
+
+/// Query user's File Storage Blob objects from the MySo chain via sidecar.
+///
+/// This enables restore-from-zero: even if the local DB is empty,
+/// we can discover all blob_ids by querying the user's on-chain objects
+/// and reading the `memory_namespace` metadata attribute.
+pub async fn query_blobs_by_owner(
+    client: &reqwest::Client,
+    sidecar_url: &str,
+    sidecar_secret: Option<&str>,
+    owner_address: &str,
+    namespace: Option<&str>,
+    package_id: Option<&str>,
+) -> Result<Vec<OnChainBlob>, AppError> {
+    let url = format!("{}/file-storage/query-blobs", sidecar_url);
+
+    let mut body = serde_json::json!({ "owner": owner_address });
+    if let Some(ns) = namespace {
+        body["namespace"] = serde_json::json!(ns);
+    }
+    if let Some(pkg) = package_id {
+        body["packageId"] = serde_json::json!(pkg);
+    }
+
+    let mut req = client
+        .post(&url)
+        .json(&body);
+    if let Some(secret) = sidecar_secret {
+        req = req.header("authorization", format!("Bearer {}", secret));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!("Sidecar file storage/query-blobs failed: {}", e))
+        })?;
+
+    if !resp.status().is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!("file storage query-blobs failed: {}", body)));
+    }
+
+    let result: QueryBlobsResponse = resp.json().await.map_err(|e| {
+        AppError::Internal(format!("Failed to parse query-blobs response: {}", e))
+    })?;
+
+    tracing::info!(
+        "file storage query-blobs ok: {} blobs for owner={}, ns={:?}",
+        result.total, owner_address, namespace
+    );
+
+    Ok(result.blobs)
+}
+
+/// Download a blob from File Storage via the file_storage_rs SDK (Aggregator HTTP API).
+/// Note: this is already native Rust — no sidecar needed.
+///
+/// Returns `AppError::BlobNotFound` when the blob has expired or doesn't exist
+/// (HTTP 404 from the aggregator). Callers can use this to trigger DB cleanup.
+pub async fn download_blob(
+    file_storage_client: &file_storage_rs::FileStorageClient,
+    blob_id: &str,
+) -> Result<Vec<u8>, AppError> {
+    // Timeout to avoid hanging on broken/slow blobs (File Storage 500s can take 60s+)
+    let download_fut = file_storage_client.read_blob_by_id(blob_id);
+    let bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        download_fut,
+    ).await {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
+            let err_str = e.to_string();
+            let is_not_found = err_str.contains("404")
+                || err_str.to_lowercase().contains("not found")
+                || err_str.to_lowercase().contains("blob not found");
+            if is_not_found {
+                return Err(AppError::BlobNotFound(format!("Blob {} expired or not found: {}", blob_id, err_str)));
+            } else {
+                return Err(AppError::Internal(format!("File Storage download failed: {}", err_str)));
+            }
+        }
+        Err(_) => {
+            return Err(AppError::Internal(format!("File Storage download timed out after 10s for blob {}", blob_id)));
+        }
+    };
+
+    tracing::info!(
+        "file storage download ok: blob_id={}, {} bytes",
+        blob_id,
+        bytes.len()
+    );
+    Ok(bytes)
+}
+

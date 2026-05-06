@@ -1,0 +1,59 @@
+name: memory
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: memory-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: memory
+      POSTGRES_USER: memory
+      POSTGRES_PASSWORD: memory_secret
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - memory_pgdata:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+        reservations:
+          memory: 128m
+          cpus: "0.25"
+
+  redis:
+    image: redis:7-alpine
+    container_name: memory-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - memory_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 300m
+          cpus: "0.5"
+        reservations:
+          memory: 64m
+          cpus: "0.1"
+
+volumes:
+  memory_pgdata:
+  memory_redis:
