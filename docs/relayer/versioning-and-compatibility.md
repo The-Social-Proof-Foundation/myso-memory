@@ -8,7 +8,7 @@ The Memory relayer exposes a versioned API contract for SDKs, MCP clients, and s
 
 | Constant | Value |
 | --- | --- |
-| `RELAYER_API_VERSION` | `1.0.0` |
+| `RELAYER_API_VERSION` | `1.1.0` |
 | `MIN_TYPESCRIPT_SDK_VERSION` | `0.6.0` |
 | `MIN_MCP_PACKAGE_VERSION` | `0.1.0` |
 
@@ -19,7 +19,7 @@ Modern relayers expose compatibility metadata at `GET /version`:
 ```json
 {
   "relayerVersion": "0.1.0",
-  "apiVersion": "1.0.0",
+  "apiVersion": "1.1.0",
   "minSupportedSdk": {
     "typescript": "0.6.0",
     "mcp": "0.1.0"
@@ -28,7 +28,8 @@ Modern relayers expose compatibility metadata at `GET /version`:
     "remember.asyncJobs": true,
     "remember.bulk": true,
     "recall.compositeRanker": true,
-    "runtime.versionEndpoint": true
+    "runtime.versionEndpoint": true,
+    "social.subAgentActions": true
   },
   "deprecations": [
     {
@@ -54,6 +55,10 @@ Run `node scripts/check-compatibility-contract.mjs` in CI to keep server constan
 - `rememberAndWait(text, subLabel?)`
 - `waitForRememberJob(jobId, opts?)`
 - `rememberBulk(texts)` + `waitForRememberBulk(jobIds)`
+
+## Social sub-agent actions (API 1.1.0)
+
+`GET /version` reports `featureFlags.social.subAgentActions: true`. Sub-agents with `CAP_POST_PUBLISH`, `CAP_COMMENT`, and `CAP_REACT` can call `/api/social/*` on the relayer. Delete routes require owner co-sign headers. See [social-actions.md](./social-actions.md).
 
 ## Composite Ranker
 

@@ -12,12 +12,13 @@ mod ranker;
 mod rate_limit;
 mod routes;
 mod social;
+mod social_routes;
 mod types;
 mod vault;
 #[path = "file-storage.rs"]
 mod file_storage;
 
-use axum::{extract::DefaultBodyLimit, middleware, routing::{get, post}, Router};
+use axum::{extract::DefaultBodyLimit, middleware, routing::{delete, get, post}, Router};
 use std::net::SocketAddr;
 use axum::http::{header, HeaderValue, Method};
 use std::sync::Arc;
@@ -155,7 +156,7 @@ async fn main() {
     // auth + rate-limit middleware even sees the request.
     let protected_routes = Router::new()
         .route("/api/remember", post(routes::remember))
-        .route("/api/remember/:job_id", get(routes::remember_status))
+        .route("/api/remember/{job_id}", get(routes::remember_status))
         .route("/api/remember/bulk", post(routes::remember_bulk))
         .route("/api/remember/bulk/status", post(routes::remember_bulk_status))
         .route("/api/recall", post(routes::recall))
@@ -165,6 +166,19 @@ async fn main() {
         .route("/api/analyze", post(routes::analyze))
         .route("/api/ask", post(routes::ask))
         .route("/api/restore", post(routes::restore))
+        .route("/api/social/post", post(social_routes::create_post))
+        .route("/api/social/comment", post(social_routes::create_comment))
+        .route("/api/social/react/post", post(social_routes::react_to_post))
+        .route("/api/social/react/comment", post(social_routes::react_to_comment))
+        .route("/api/social/repost", post(social_routes::create_repost))
+        .route(
+            "/api/social/post/{post_id}",
+            delete(social_routes::delete_post),
+        )
+        .route(
+            "/api/social/comment/{comment_id}",
+            delete(social_routes::delete_comment),
+        )
         // Router::layer runs middleware bottom-to-top (last added runs first).
         // Keep auth outer so AuthInfo is in request extensions before rate limiting reads it.
         .layer(middleware::from_fn_with_state(
@@ -226,7 +240,7 @@ async fn main() {
             tracing::info!("  CORS origins: {}", config.allowed_origins);
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(origins))
-                .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
                 .allow_headers([
                     header::CONTENT_TYPE,
                     header::AUTHORIZATION,
@@ -237,6 +251,10 @@ async fn main() {
                     "x-nonce".parse::<header::HeaderName>().unwrap(),
                     "x-account-id".parse::<header::HeaderName>().unwrap(),
                     "x-delegate-key".parse::<header::HeaderName>().unwrap(),
+                    "x-platform-id".parse::<header::HeaderName>().unwrap(),
+                    "x-owner-public-key".parse::<header::HeaderName>().unwrap(),
+                    "x-owner-signature".parse::<header::HeaderName>().unwrap(),
+                    "x-owner-delegate-key".parse::<header::HeaderName>().unwrap(),
                     // ENG-1697: SessionKey envelope replacing x-delegate-key
                     "x-mydata-session".parse::<header::HeaderName>().unwrap(),
                 ])

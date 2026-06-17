@@ -6,7 +6,7 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-pub const RELAYER_API_VERSION: &str = "1.0.0";
+pub const RELAYER_API_VERSION: &str = "1.1.0";
 pub const MIN_TYPESCRIPT_SDK_VERSION: &str = "0.6.0";
 pub const MIN_MCP_PACKAGE_VERSION: &str = "0.1.0";
 
@@ -86,6 +86,7 @@ fn feature_flags() -> BTreeMap<String, bool> {
         ("remember.asyncJobs".to_string(), true),
         ("remember.bulk".to_string(), true),
         ("recall.compositeRanker".to_string(), true),
+        ("social.subAgentActions".to_string(), true),
         ("runtime.versionEndpoint".to_string(), true),
     ])
 }
@@ -162,7 +163,7 @@ mod tests {
         let response = version_response();
 
         assert_eq!(response.relayer_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(response.api_version, RELAYER_API_VERSION);
+        assert_eq!(response.api_version, "1.1.0");
         assert_eq!(
             response.min_supported_sdk.typescript,
             MIN_TYPESCRIPT_SDK_VERSION

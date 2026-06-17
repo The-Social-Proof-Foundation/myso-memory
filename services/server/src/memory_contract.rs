@@ -4,6 +4,11 @@
 pub const CAP_MEMORY_READ: u64 = 1;
 pub const CAP_MEMORY_WRITE: u64 = 2;
 pub const CAP_MYDATA_READ: u64 = 4;
+pub const CAP_POST_PUBLISH: u64 = 16;
+pub const CAP_MESSAGE_READ: u64 = 32;
+pub const CAP_MESSAGE_SEND: u64 = 64;
+pub const CAP_COMMENT: u64 = 512;
+pub const CAP_REACT: u64 = 1024;
 
 pub const CLASS_HUMAN: u8 = 0;
 pub const CLASS_DELEGATED_AI: u8 = 1;

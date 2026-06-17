@@ -9,7 +9,9 @@ use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-use crate::memory_contract::{self, CAP_MEMORY_READ, CAP_MEMORY_WRITE};
+use crate::memory_contract::{
+    self, CAP_COMMENT, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_POST_PUBLISH, CAP_REACT,
+};
 use crate::myso::{derived_address_from_public_key, verify_sub_agent_onchain};
 use crate::policy::{PolicyError, RequestPolicyInput, validate_agent_policy};
 use crate::social::{
@@ -148,11 +150,12 @@ pub async fn verify_signature(
     let signature = Signature::from_bytes(&sig_array);
 
     let method = request.method().as_str().to_string();
+    let path_only = request.uri().path().to_string();
     let path = request
         .uri()
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| request.uri().path().to_string());
+        .unwrap_or_else(|| path_only.clone());
 
     let owner_pk_header = headers
         .get("x-owner-public-key")
@@ -160,6 +163,10 @@ pub async fn verify_signature(
         .map(String::from);
     let owner_sig_header = headers
         .get("x-owner-signature")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let owner_delegate_key = headers
+        .get("x-owner-delegate-key")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
@@ -202,8 +209,8 @@ pub async fn verify_signature(
         }
     }
 
-    let required_cap = required_capability_for_path(method.as_str(), path.as_str());
-    let is_write = required_cap == CAP_MEMORY_WRITE;
+    let required_cap = required_capability_for_path(method.as_str(), &path_only);
+    let is_write = is_write_route(method.as_str(), &path_only);
 
     let policy_input = RequestPolicyInput::from_headers(
         &parts.headers,
@@ -249,6 +256,7 @@ pub async fn verify_signature(
         sub_agent_key: sub_agent_key_hex,
         mydata_session,
         owner_co_signed: resolved.owner_co_signed,
+        owner_delegate_key,
     });
 
     let request = Request::from_parts(parts, axum::body::Body::from(body_bytes));
@@ -266,7 +274,40 @@ enum ResolveError {
     Other(String),
 }
 
+fn is_write_route(method: &str, path: &str) -> bool {
+    if path.starts_with("/api/social/") {
+        return true;
+    }
+    method == "POST"
+        && (path.starts_with("/api/remember")
+            || path == "/api/analyze"
+            || path == "/api/restore")
+}
+
 fn required_capability_for_path(method: &str, path: &str) -> u64 {
+    if path.starts_with("/api/social/") {
+        if method == "DELETE" {
+            if path.starts_with("/api/social/post/") {
+                return CAP_POST_PUBLISH;
+            }
+            if path.starts_with("/api/social/comment/") {
+                return CAP_COMMENT;
+            }
+        }
+        if method == "POST" {
+            if path == "/api/social/post" || path == "/api/social/repost" {
+                return CAP_POST_PUBLISH;
+            }
+            if path == "/api/social/comment" {
+                return CAP_COMMENT;
+            }
+            if path.starts_with("/api/social/react/") {
+                return CAP_REACT;
+            }
+        }
+        return CAP_MEMORY_READ;
+    }
+
     if method != "POST" {
         return CAP_MEMORY_READ;
     }
@@ -413,6 +454,28 @@ mod tests {
     }
 
     #[test]
+    fn required_capability_social_post() {
+        assert_eq!(
+            required_capability_for_path("POST", "/api/social/post"),
+            CAP_POST_PUBLISH
+        );
+    }
+
+    #[test]
+    fn required_capability_social_delete_post() {
+        assert_eq!(
+            required_capability_for_path("DELETE", "/api/social/post/0xabc"),
+            CAP_POST_PUBLISH
+        );
+    }
+
+    #[test]
+    fn is_write_route_social() {
+        assert!(is_write_route("POST", "/api/social/post"));
+        assert!(is_write_route("DELETE", "/api/social/post/0xabc"));
+    }
+
+    #[test]
     fn auth_info_includes_policy_fields() {
         let auth = AuthInfo {
             public_key: "abcd".into(),
@@ -429,6 +492,7 @@ mod tests {
             sub_agent_key: None,
             mydata_session: None,
             owner_co_signed: false,
+            owner_delegate_key: None,
         };
         assert_eq!(auth.agent_object_id, "0xagent");
     }

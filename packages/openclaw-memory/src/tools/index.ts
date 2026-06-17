@@ -9,6 +9,7 @@
 import type { Memory } from "@socialproof/memory";
 import { registerSearchTool } from "./search.js";
 import { registerStoreTool } from "./store.js";
+export { registerSocialTools } from "./social.js";
 import type { PluginConfig } from "../types.js";
 
 /** Register all agent-callable tools. */

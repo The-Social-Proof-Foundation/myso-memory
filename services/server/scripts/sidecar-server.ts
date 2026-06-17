@@ -1040,6 +1040,33 @@ app.post("/memory/ensure-vault", async (req, res) => {
 });
 
 // ============================================================
+// Social actions — PTB build + execute for sub-agent feed interactions
+// ============================================================
+app.post("/social/build", async (req, res) => {
+    try {
+        const { buildSocialTransaction } = await import("./social-execute.js");
+        const bytes = await buildSocialTransaction(req.body);
+        res.json({
+            transactionBlockKindBytes: Buffer.from(bytes).toString("base64"),
+        });
+    } catch (err: any) {
+        console.error(`[social/build] error: ${err.message || err}`);
+        res.status(500).json({ error: err.message || String(err) });
+    }
+});
+
+app.post("/social/execute", async (req, res) => {
+    try {
+        const { executeSocialAction } = await import("./social-execute.js");
+        const result = await executeSocialAction(req.body);
+        res.json(result);
+    } catch (err: any) {
+        console.error(`[social/execute] error: ${err.message || err}`);
+        res.status(500).json({ error: err.message || String(err) });
+    }
+});
+
+// ============================================================
 // POST /sponsor — Create Enoki-sponsored transaction for frontend
 // Frontend sends TransactionKind bytes + sender → returns sponsored { bytes, digest }
 // ============================================================

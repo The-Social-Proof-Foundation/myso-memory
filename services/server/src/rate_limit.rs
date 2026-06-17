@@ -128,6 +128,13 @@ fn endpoint_weight(path: &str) -> i64 {
         "/api/remember/manual" => 3,   // File Storage upload only (client did embed/encrypt)
         "/api/restore" => 3,           // download + decrypt + re-embed
         "/api/ask" => 2,               // recall + LLM
+        "/api/social/post" => 3,
+        "/api/social/comment" => 2,
+        "/api/social/repost" => 3,
+        "/api/social/react/post" => 1,
+        "/api/social/react/comment" => 1,
+        _ if path.starts_with("/api/social/post/") => 2,
+        _ if path.starts_with("/api/social/comment/") => 2,
         _ => 1,                        // recall, recall/manual, etc.
     }
 }

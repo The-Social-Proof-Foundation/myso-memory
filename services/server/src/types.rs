@@ -101,6 +101,45 @@ pub struct Config {
     pub sponsor_rate_limit: SponsorRateLimitConfig,
     /// Allowed CORS origins (comma-separated, e.g. "http://localhost:3000,https://mysocial.network")
     pub allowed_origins: String,
+    /// Bootstrap shared objects for social_contracts::post PTBs
+    pub social_chain: SocialChainConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SocialChainConfig {
+    pub username_registry_id: String,
+    pub platform_registry_id: String,
+    pub platform_object_id: String,
+    pub block_list_registry_id: String,
+    pub post_config_id: String,
+    pub mydata_registry_id: String,
+}
+
+impl SocialChainConfig {
+    pub fn from_env() -> Self {
+        Self {
+            username_registry_id: std::env::var("USERNAME_REGISTRY_ID")
+                .unwrap_or_default(),
+            platform_registry_id: std::env::var("PLATFORM_REGISTRY_ID")
+                .unwrap_or_default(),
+            platform_object_id: std::env::var("PLATFORM_OBJECT_ID")
+                .unwrap_or_default(),
+            block_list_registry_id: std::env::var("BLOCK_LIST_REGISTRY_ID")
+                .unwrap_or_default(),
+            post_config_id: std::env::var("POST_CONFIG_ID").unwrap_or_default(),
+            mydata_registry_id: std::env::var("MYDATA_REGISTRY_ID")
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.username_registry_id.is_empty()
+            && !self.platform_registry_id.is_empty()
+            && !self.platform_object_id.is_empty()
+            && !self.block_list_registry_id.is_empty()
+            && !self.post_config_id.is_empty()
+            && !self.mydata_registry_id.is_empty()
+    }
 }
 
 impl Config {
@@ -163,6 +202,7 @@ impl Config {
             sponsor_rate_limit: SponsorRateLimitConfig::from_env(),
             allowed_origins: std::env::var("ALLOWED_ORIGINS")
                 .unwrap_or_default(),
+            social_chain: SocialChainConfig::from_env(),
         }
     }
 }
@@ -534,6 +574,8 @@ pub struct AuthInfo {
     pub mydata_session: Option<String>,
     /// True when owner co-signed this request (approval-gated writes).
     pub owner_co_signed: bool,
+    /// Owner private key hex for delete chain txs (x-owner-delegate-key).
+    pub owner_delegate_key: Option<String>,
 }
 
 /// Parse optional sub_label from deprecated namespace field.
@@ -584,6 +626,8 @@ pub enum AppError {
     RateLimited(String),
     /// Storage quota exceeded (HTTP 402)
     QuotaExceeded(String),
+    /// Policy / capability rejection (HTTP 403)
+    Forbidden(String),
 }
 
 impl std::fmt::Display for AppError {
@@ -595,6 +639,7 @@ impl std::fmt::Display for AppError {
             AppError::BlobNotFound(msg) => write!(f, "Blob Not Found: {}", msg),
             AppError::RateLimited(msg) => write!(f, "Rate Limited: {}", msg),
             AppError::QuotaExceeded(msg) => write!(f, "Quota Exceeded: {}", msg),
+            AppError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
         }
     }
 }
@@ -622,6 +667,7 @@ impl axum::response::IntoResponse for AppError {
             AppError::BlobNotFound(msg) => (axum::http::StatusCode::NOT_FOUND, msg.clone()),
             AppError::RateLimited(msg) => (axum::http::StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::QuotaExceeded(msg) => (axum::http::StatusCode::PAYMENT_REQUIRED, msg.clone()),
+            AppError::Forbidden(msg) => (axum::http::StatusCode::FORBIDDEN, msg.clone()),
         };
 
         let body = serde_json::json!({ "error": message });
@@ -663,6 +709,7 @@ mod tests {
             sub_agent_key: None,
             mydata_session: None,
             owner_co_signed: false,
+            owner_delegate_key: None,
         }
     }
 

@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@socialproof/memory": "workspace:*",
+    "@socialproof/social": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {

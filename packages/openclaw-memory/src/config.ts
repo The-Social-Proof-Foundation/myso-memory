@@ -29,6 +29,10 @@ const ConfigSchema = z.object({
   maxRecallResults: z.number().min(1).max(20).default(5),
   minRelevance: z.number().min(0).max(1).default(0.3),
   captureMaxMessages: z.number().min(1).max(50).default(10),
+  socialEnabled: z.boolean().default(false),
+  ownerCoSignKey: z.string()
+    .regex(/^[0-9a-fA-F]{64}$/, "must be a 64-character hex string")
+    .optional(),
 });
 
 function resolveEnvVar(value: string): string {

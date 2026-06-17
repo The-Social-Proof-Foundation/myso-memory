@@ -236,6 +236,50 @@ Lifecycle hooks run automatically:
 - `before_reset` — saves session summary
 - `agent_end` — captures last response
 
+### Social actions (sub-agent)
+
+Enable on-chain feed tools when the sub-agent has `CAP_POST_PUBLISH`, `CAP_COMMENT`, and `CAP_REACT`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "oc-memory": {
+        "enabled": true,
+        "config": {
+          "privateKey": "${MEMORY_PRIVATE_KEY}",
+          "accountId": "0x...",
+          "serverUrl": "https://memory.mysocial.network",
+          "platformId": "0x...",
+          "socialEnabled": true,
+          "ownerCoSignKey": "${OWNER_PRIVATE_KEY}"
+        }
+      }
+    }
+  }
+}
+```
+
+Register social caps via `@socialproof/memory/account`:
+
+```typescript
+import {
+  registerSubAgent,
+  CAP_POST_PUBLISH,
+  CAP_COMMENT,
+  CAP_REACT,
+} from "@socialproof/memory/account";
+
+await registerSubAgent({
+  capabilities: CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_POST_PUBLISH | CAP_COMMENT | CAP_REACT,
+  // ...
+});
+```
+
+Or use `@socialproof/social` `SocialClient` directly. See [social-actions.md](docs/relayer/social-actions.md).
+
+Delete post/comment requires **owner co-sign** — sub-agents cannot delete alone on current `post.move`.
+
 ---
 
 ## Troubleshooting

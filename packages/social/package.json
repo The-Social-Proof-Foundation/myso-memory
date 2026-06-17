@@ -1,0 +1,39 @@
+{
+    "name": "@socialproof/social",
+    "version": "0.1.0",
+    "description": "Sub-agent social actions SDK for MySocial (post, comment, react, repost)",
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "import": "./dist/index.js",
+            "types": "./dist/index.d.ts"
+        },
+        "./ptb": {
+            "import": "./dist/ptb/index.js",
+            "types": "./dist/ptb/index.d.ts"
+        }
+    },
+    "scripts": {
+        "build": "tsc",
+        "typecheck": "tsc --noEmit",
+        "test": "node --import tsx --test src/ptb/post.test.ts"
+    },
+    "dependencies": {
+        "@noble/ed25519": "^2.3.0",
+        "@socialproof/memory": "workspace:*"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "tsx": "^4.19.0",
+        "typescript": "^5.5.0"
+    },
+    "peerDependencies": {
+        "@socialproof/myso": "0.0.4"
+    },
+    "files": [
+        "dist"
+    ],
+    "license": "Apache-2.0"
+}

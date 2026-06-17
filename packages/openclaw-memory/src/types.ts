@@ -20,4 +20,8 @@ export interface PluginConfig {
   maxRecallResults: number;
   minRelevance: number;
   captureMaxMessages: number;
+  /** Enable on-chain social feed tools (post, comment, react, repost). */
+  socialEnabled?: boolean;
+  /** Owner Ed25519 key for delete co-sign + chain tx (optional). */
+  ownerCoSignKey?: string;
 }

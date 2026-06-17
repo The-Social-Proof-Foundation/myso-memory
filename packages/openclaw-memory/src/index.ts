@@ -18,9 +18,10 @@
  */
 
 import { Memory } from "@socialproof/memory";
+import { SocialClient } from "@socialproof/social";
 import { parseConfig, keyPreview } from "./config.js";
 import { registerHooks } from "./hooks/index.js";
-import { registerTools } from "./tools/index.js";
+import { registerTools, registerSocialTools } from "./tools/index.js";
 import { registerCli } from "./cli/index.js";
 
 export default {
@@ -48,6 +49,24 @@ export default {
 
     registerHooks(api, client, config);
     registerTools(api, client, config);
+
+    if (config.socialEnabled) {
+      if (!config.platformId) {
+        api.logger.warn(
+          "memory: social.enabled is true but platformId is missing — social tools need x-platform-id",
+        );
+      }
+      const social = SocialClient.create({
+        key: config.privateKey,
+        accountId: config.accountId,
+        serverUrl: config.serverUrl,
+        platformId: config.platformId,
+        ownerCoSignKey: config.ownerCoSignKey,
+      });
+      registerSocialTools(api, social, config);
+      api.logger.info("memory: social feed tools registered");
+    }
+
     registerCli(api, client, config);
 
     // Health check service

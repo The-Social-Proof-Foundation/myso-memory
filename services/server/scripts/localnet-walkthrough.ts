@@ -153,7 +153,12 @@ async function main(): Promise<void> {
             accountId,
             publicKey: agent.publicKey,
             label: "walkthrough-agent",
-            capabilities: mods.CAP_MEMORY_READ | mods.CAP_MEMORY_WRITE,
+            capabilities:
+                mods.CAP_MEMORY_READ |
+                mods.CAP_MEMORY_WRITE |
+                mods.CAP_POST_PUBLISH |
+                mods.CAP_COMMENT |
+                mods.CAP_REACT,
             mysoPrivateKey,
             mysoClient,
         });
@@ -219,6 +224,35 @@ async function main(): Promise<void> {
         console.log(`  recalled: "${fullHit.text.slice(0, 80)}..."`);
     } else {
         console.log("[test] skipping full relayer path (set FULL_E2E=1 when File Storage is configured)");
+    }
+
+    if (process.env.SOCIAL_WALKTHROUGH === "1") {
+        const { SocialClient } = await import("@socialproof/social");
+        const platformId = process.env.PLATFORM_OBJECT_ID;
+        if (!platformId) {
+            console.log("[test] skipping social walkthrough (set PLATFORM_OBJECT_ID + bootstrap env on server)");
+        } else {
+            const social = SocialClient.create({
+                key: state.subAgentPrivateKey,
+                accountId: state.accountId,
+                serverUrl: SERVER_URL,
+                platformId,
+            });
+            const content = `Walkthrough social post ${Date.now()}`;
+            console.log("[test] social createPost...");
+            const posted = await social.createPost({ content });
+            console.log(`  digest=${posted.digest} postId=${posted.postId ?? "?"}`);
+            if (posted.postId) {
+                console.log("[test] social reactToPost...");
+                const reacted = await social.reactToPost({
+                    postId: posted.postId,
+                    reaction: "👍",
+                });
+                console.log(`  digest=${reacted.digest}`);
+            }
+        }
+    } else {
+        console.log("[test] skipping social (set SOCIAL_WALKTHROUGH=1 with server bootstrap env)");
     }
 
     console.log("\n✅ Localnet walkthrough passed");

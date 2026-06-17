@@ -48,6 +48,18 @@
         "minimum": 1,
         "maximum": 50,
         "description": "Recent messages window for auto-capture"
+      },
+      "socialEnabled": {
+        "type": "boolean",
+        "description": "Register on-chain social feed tools (post, comment, react, repost)"
+      },
+      "ownerCoSignKey": {
+        "type": "string",
+        "description": "Owner Ed25519 private key (hex) for delete co-sign. Supports ${ENV_VAR}."
+      },
+      "platformId": {
+        "type": "string",
+        "description": "Platform object ID (required when socialEnabled)"
       }
     },
     "required": ["privateKey", "accountId", "serverUrl"]
