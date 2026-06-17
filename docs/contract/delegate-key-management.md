@@ -94,3 +94,12 @@ The relayer resolves sub-agents in this order:
 3. On-chain SubAgent + MemoryAccount verification (capabilities, active, expiry)
 
 Set `SOCIAL_SERVER_URL` (default `http://127.0.0.1:9126`) on the memory server.
+
+## v1 policy defaults
+
+At registration, prefer:
+
+- `approvalRequiredCaps: 0` — relayer does not enforce this field in v1, but on-chain social Move still aborts if social caps require approval
+- `maxActionSpend: null` — relayer does not enforce spend caps in v1
+
+See [sub-agent-v1.md](./sub-agent-v1.md) for the full v1 contract.

@@ -96,10 +96,6 @@ export class SocialClient {
         }
     }
 
-    private isSocialWrite(method: string, path: string): boolean {
-        return path.startsWith("/api/social/");
-    }
-
     private async getPublicKey(): Promise<Uint8Array> {
         if (!this.publicKey) {
             const ed = await getEd();
@@ -142,9 +138,7 @@ export class SocialClient {
             headers["x-platform-id"] = this.platformId;
         }
 
-        const needsOwnerCoSign =
-            options.requireOwnerCoSign ||
-            (this.ownerCoSignKey && this.isSocialWrite(method, path));
+        const needsOwnerCoSign = options.requireOwnerCoSign === true;
         if (needsOwnerCoSign && this.ownerCoSignKey) {
             const ownerSig = await ed.signAsync(msgBytes, this.ownerCoSignKey);
             const ownerPk = await ed.getPublicKeyAsync(this.ownerCoSignKey);

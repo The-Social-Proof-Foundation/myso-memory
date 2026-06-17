@@ -26,8 +26,9 @@ export interface MemoryConfig {
     /** Platform object ID — sent as `x-platform-id` when the sub-agent has `platform_scope`. */
     platformId?: string;
     /**
-     * Owner Ed25519 private key (hex) for co-signing approval-gated writes.
+     * Owner Ed25519 private key for social delete co-sign and on-chain delete tx sender.
      * Signs the same canonical message as the sub-agent (`x-owner-public-key` / `x-owner-signature`).
+     * Not used for memory writes or social creates in v1.
      */
     ownerCoSignKey?: string | Uint8Array;
 }
@@ -327,7 +328,14 @@ interface SubAgentRegistrationFields {
     capabilities?: number;
     delegatableCaps?: number;
     registerScope?: number;
+    /**
+     * @deprecated Relayer does not enforce in v1; on-chain field reserved for v2.
+     * Use `0` for autonomous agents. Non-zero values may still block on-chain social txs.
+     */
     approvalRequiredCaps?: number;
+    /**
+     * @deprecated Relayer does not enforce in v1; on-chain field reserved for v2 spend policy.
+     */
     maxActionSpend?: number | null;
     platformScope?: string | null;
     expiresAt?: number | null;

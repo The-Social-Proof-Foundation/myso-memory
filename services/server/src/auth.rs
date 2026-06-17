@@ -20,8 +20,6 @@ use crate::social::{
 use crate::types::{AppState, AuthInfo};
 
 /// Estimated gas for a sponsored File Storage upload (MIST). Conservative ceiling for max_action_spend checks.
-const ESTIMATED_UPLOAD_SPEND_MIST: u64 = 50_000_000;
-
 async fn constant_time_reject() -> StatusCode {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     StatusCode::UNAUTHORIZED
@@ -212,15 +210,7 @@ pub async fn verify_signature(
     let required_cap = required_capability_for_path(method.as_str(), &path_only);
     let is_write = is_write_route(method.as_str(), &path_only);
 
-    let policy_input = RequestPolicyInput::from_headers(
-        &parts.headers,
-        false,
-        if is_write {
-            ESTIMATED_UPLOAD_SPEND_MIST
-        } else {
-            0
-        },
-    );
+    let policy_input = RequestPolicyInput::from_headers(&parts.headers);
 
     let resolved = match resolve_sub_agent(
         &state,
@@ -423,13 +413,7 @@ async fn resolve_sub_agent(
         _ => false,
     };
 
-    let input = RequestPolicyInput {
-        platform_id: policy_input.platform_id.clone(),
-        owner_co_signed,
-        estimated_spend_mist: policy_input.estimated_spend_mist,
-    };
-
-    validate_agent_policy(&agent, &ancestors, required_cap, &input, is_write)
+    validate_agent_policy(&agent, &ancestors, required_cap, &policy_input)
         .map_err(ResolveError::Policy)?;
 
     let _ = state.db.cache_sub_agent(public_key_hex, &agent, &owner).await;
@@ -437,7 +421,7 @@ async fn resolve_sub_agent(
     Ok(ResolvedSubAgent {
         agent,
         owner,
-        owner_co_signed: input.owner_co_signed,
+        owner_co_signed,
     })
 }
 

@@ -254,6 +254,9 @@ export async function ensureMemoryAccount(
 /**
  * Register a root-level sub-agent on a MemoryAccount (human owner only).
  * Default: delegated AI with memory read + write caps.
+ *
+ * `approvalRequiredCaps` and `maxActionSpend` are accepted for Move ABI compatibility
+ * but are not enforced by the relayer in v1 — prefer defaults (`0` / `null`).
  */
 export async function registerSubAgent(
     opts: RegisterSubAgentOpts,

@@ -1,58 +1,58 @@
 ---
-title: "Ownership & Delegates"
-description: "How memory ownership works in Memory and how delegates enable shared access."
+title: "Ownership & Sub-Agents"
+description: "How memory ownership works in Memory and how sub-agents enable scoped autonomous access."
 ---
 
-Memory enforces strong, cryptographic ownership over memories — and lets owners grant scoped access to others through delegates.
+Memory enforces strong, cryptographic ownership over memories — and lets owners register **sub-agents** (Ed25519 keypairs with on-chain capability bitmaps) for scoped autonomous access.
 
 ## Ownership
 
-Memory content in Memory is stored on File Storage and cryptographically owned by a user identified by their private key. When you pass a `key` to the SDK, it is translated into a MySo wallet address — this address is the owner.
+Memory content is stored on File Storage and cryptographically owned by a user identified by their wallet. A **MemoryAccount** links a social profile to encrypted memory vaults. The human wallet that owns the MemoryAccount is the root authority.
 
 ```ts
 const memory = Memory.create({
-  key: process.env.MEMORY_PRIVATE_KEY!, // delegate private key
+  key: subAgentPrivateKeyHex, // sub-agent key registered on-chain
   accountId: process.env.MEMORY_ACCOUNT_ID!, // MemoryAccount object ID
   serverUrl: process.env.MEMORY_SERVER_URL,
-  namespace: "personal",
+  subLabel: "personal",
 });
 ```
 
-Only the owner (and their authorized delegates) can access their encrypted content or perform privileged actions over their memories. This isn't a policy promise — it's cryptographically enforced onchain.
+Only the MemoryAccount owner (and their authorized sub-agents within granted capabilities) can access encrypted content or perform privileged actions. This is cryptographically enforced on-chain and verified by the relayer on every request.
 
-This strong ownership model opens the door to future capabilities like a memory marketplace, where users could transfer memories or grant specific permissions for others to use their data.
+## Sub-agents (replaces legacy delegates)
 
-## Delegates
+A **sub-agent** is an Ed25519 keypair registered as an on-chain `SubAgent` object with explicit capabilities (`CAP_MEMORY_READ`, `CAP_MEMORY_WRITE`, social caps, etc.). The sub-agent's `derived_address` signs relayer requests and MYDATA session keys.
 
-A delegate is simply a keypair (private key) that gets translated into a MySo wallet address — just like the owner. The difference is that a delegate's access is **granted by the owner** rather than being inherent.
+This enables:
 
-This enables two key use cases:
-
-- **Shared access** — users (human or AI agents) can grant other users access to their memories. An agent could share its knowledge base with another agent, or a user could give a service read access to specific data.
-- **Service delegation** — users can delegate privileges to services that act on their behalf, such as paying for transaction fees or storage costs, without handing over ownership.
+- **Autonomous agents** — AI or backend services act within capability bounds without holding the owner's wallet key
+- **Hierarchy** — parent agents can register child agents via `registerSubAgentDelegated`
+- **Scoped social actions** — post, comment, react, repost with `platform_scope` and expiry optional
 
 ```mermaid
 flowchart TD
     Owner[Owner Wallet]
-    D1[Delegate A<br/>AI Agent]
-    D2[Delegate B<br/>Backend Service]
-    D3[Delegate C<br/>Shared User]
-    Memory[Owner's Memories]
+    A1[Sub-Agent A<br/>Weather Bot]
+    A2[Sub-Agent B<br/>Backend Service]
+    Memory[MemoryAccount Vault]
 
-    Owner -->|grants access| D1
-    Owner -->|grants access| D2
-    Owner -->|grants access| D3
-    D1 -->|reads/writes| Memory
-    D2 -->|pays fees| Memory
-    D3 -->|reads| Memory
+    Owner -->|registers| A1
+    Owner -->|registers| A2
+    A1 -->|CAP_MEMORY_READ/WRITE| Memory
+    A2 -->|CAP_POST_PUBLISH| Memory
 ```
 
-## Access Control Enforcement
+## Access control enforcement
 
-The relationship between owners and delegates is enforced on chain by the MySo smart contract system — not by application logic or database permissions.
+Sub-agent authorization is enforced on-chain by the MySo `memory` module — not by application policy alone.
 
-- The owner's wallet address is the root authority over a Memory account
-- Delegate keys are registered onchain and verified on every request
-- The relayer checks delegate authorization against the contract before executing any operation
+- The owner's wallet registers and revokes sub-agents on the MemoryAccount
+- The relayer resolves `derived_address → SubAgent`, checks capabilities, expiry, ancestry, and platform scope
+- Social **deletes** additionally require the human owner to co-sign HTTP requests and sign the chain transaction
 
-This means access control is tamper-proof and verifiable — no one can bypass it without the owner's explicit onchain approval.
+In v1, `approval_required_caps` and `max_action_spend` exist on-chain but are **not** enforced by the relayer. See [sub-agent-v1.md](../../contract/sub-agent-v1.md).
+
+## Social delete pattern
+
+On-chain post deletion is authorized by `post.owner` (the principal), not the sub-agent address. Clients must supply `ownerCoSignKey` for `deletePost` / `deleteComment` only — not for creates or reactions.

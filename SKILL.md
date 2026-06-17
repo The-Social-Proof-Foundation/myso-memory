@@ -278,7 +278,7 @@ await registerSubAgent({
 
 Or use `@socialproof/social` `SocialClient` directly. See [social-actions.md](docs/relayer/social-actions.md).
 
-Delete post/comment requires **owner co-sign** — sub-agents cannot delete alone on current `post.move`.
+Delete post/comment requires **owner co-sign** (delete only in v1) — sub-agents cannot delete alone on current `post.move`. Relayer v1 does not enforce `approvalRequiredCaps` or `maxActionSpend`; see [sub-agent-v1.md](docs/contract/sub-agent-v1.md).
 
 ---
 

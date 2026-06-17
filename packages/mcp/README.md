@@ -17,6 +17,8 @@ stdio MCP server for [@socialproof/memory](/packages/sdk) — sub-agent authenti
 }
 ```
 
+`ownerCoSignKey` is only required for `social_delete_post` and `social_delete_comment` (not creates or reactions).
+
 ## Tools
 
 | Tool | Description |

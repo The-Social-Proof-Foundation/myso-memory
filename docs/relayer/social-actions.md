@@ -21,7 +21,7 @@ Same Ed25519 signed-request format as memory routes:
 - `x-public-key`, `x-signature`, `x-timestamp`, `x-nonce`, `x-account-id`
 - `x-delegate-key` — sub-agent private key hex (required for social chain execution)
 - `x-platform-id` — must match sub-agent `platform_scope` when set
-- `x-owner-public-key` + `x-owner-signature` — owner co-sign of the same canonical message (required for delete; optional for approval-gated creates)
+- `x-owner-public-key` + `x-owner-signature` — owner co-sign of the same canonical message (**required for delete only**)
 - `x-owner-delegate-key` — owner private key hex (required for delete chain txs)
 
 ## Server env (bootstrap shared objects)
@@ -45,7 +45,7 @@ const social = SocialClient.create({
   accountId: memoryAccountId,
   serverUrl: "https://relayer.testnet.mysocial.network",
   platformId: platformObjectId,
-  ownerCoSignKey: ownerPrivateKeyHex, // optional; required for delete*
+  ownerCoSignKey: ownerPrivateKeyHex, // required for deletePost / deleteComment only
 });
 
 await social.createPost({ content: "Hello from my weather bot" });

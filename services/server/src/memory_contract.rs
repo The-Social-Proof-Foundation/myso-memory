@@ -117,4 +117,26 @@ mod tests {
             Err(E_SUB_AGENT_WRONG_PLATFORM_SCOPE)
         );
     }
+
+    #[test]
+    fn direct_execution_mirror_matches_move_semantics() {
+        assert!(check_direct_execution_allowed(0, CAP_MEMORY_WRITE, false).is_ok());
+        assert_eq!(
+            check_direct_execution_allowed(CAP_MEMORY_WRITE, CAP_MEMORY_WRITE, false),
+            Err(E_SUB_AGENT_APPROVAL_REQUIRED)
+        );
+        assert!(check_direct_execution_allowed(
+            CAP_MEMORY_WRITE,
+            CAP_MEMORY_WRITE,
+            true
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn spend_limit_mirror_matches_move_semantics() {
+        assert!(check_spend_limit(None, 100).is_ok());
+        assert!(check_spend_limit(Some(100), 50).is_ok());
+        assert_eq!(check_spend_limit(Some(10), 50), Err(E_SUB_AGENT_SPEND_EXCEEDED));
+    }
 }

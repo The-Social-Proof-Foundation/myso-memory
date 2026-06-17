@@ -6,7 +6,7 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-pub const RELAYER_API_VERSION: &str = "1.1.0";
+pub const RELAYER_API_VERSION: &str = "1.1.1";
 pub const MIN_TYPESCRIPT_SDK_VERSION: &str = "0.6.0";
 pub const MIN_MCP_PACKAGE_VERSION: &str = "0.1.0";
 
@@ -87,6 +87,7 @@ fn feature_flags() -> BTreeMap<String, bool> {
         ("remember.bulk".to_string(), true),
         ("recall.compositeRanker".to_string(), true),
         ("social.subAgentActions".to_string(), true),
+        ("subAgent.v1PolicyHardening".to_string(), true),
         ("runtime.versionEndpoint".to_string(), true),
     ])
 }
@@ -104,6 +105,24 @@ fn deprecations() -> Vec<DeprecationNotice> {
             deprecated_since: "1.0.0".to_string(),
             removal_api_version: "2.0.0".to_string(),
             guidance: "Use x-mydata-session for relayer-managed MYDATA decrypt flows.".to_string(),
+        },
+        DeprecationNotice {
+            surface: "subAgent.approvalRequiredCaps".to_string(),
+            deprecated_since: "1.1.1".to_string(),
+            removal_api_version: "2.0.0".to_string(),
+            guidance: "Relayer does not enforce approval_required_caps in v1; use 0 for autonomous agents. On-chain social txs still abort if set.".to_string(),
+        },
+        DeprecationNotice {
+            surface: "subAgent.maxActionSpend".to_string(),
+            deprecated_since: "1.1.1".to_string(),
+            removal_api_version: "2.0.0".to_string(),
+            guidance: "Relayer does not enforce max_action_spend in v1; reserved for v2 spend policy.".to_string(),
+        },
+        DeprecationNotice {
+            surface: "social.ownerCoSignForCreates".to_string(),
+            deprecated_since: "1.1.1".to_string(),
+            removal_api_version: "2.0.0".to_string(),
+            guidance: "Owner HTTP co-sign applies to social delete routes only, not creates.".to_string(),
         },
     ]
 }
@@ -163,7 +182,7 @@ mod tests {
         let response = version_response();
 
         assert_eq!(response.relayer_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(response.api_version, "1.1.0");
+        assert_eq!(response.api_version, "1.1.1");
         assert_eq!(
             response.min_supported_sdk.typescript,
             MIN_TYPESCRIPT_SDK_VERSION

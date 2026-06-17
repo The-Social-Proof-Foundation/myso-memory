@@ -1,30 +1,23 @@
 use axum::http::HeaderMap;
 
 use crate::memory_contract::{
-    check_direct_execution_allowed, check_platform_scope, check_spend_limit, has_cap,
-    E_SUB_AGENT_EXPIRED, E_SUB_AGENT_INACTIVE_ANCESTOR, E_SUB_AGENT_MISSING_CAP,
-    E_SUB_AGENT_NOT_ACTIVE, MAX_AGENT_DEPTH,
+    check_platform_scope, has_cap, E_SUB_AGENT_EXPIRED, E_SUB_AGENT_INACTIVE_ANCESTOR,
+    E_SUB_AGENT_MISSING_CAP, E_SUB_AGENT_NOT_ACTIVE, MAX_AGENT_DEPTH,
 };
 use crate::social::SocialSubAgent;
 
 /// Request-scoped policy inputs extracted from headers.
 pub struct RequestPolicyInput {
     pub platform_id: Option<String>,
-    pub owner_co_signed: bool,
-    pub estimated_spend_mist: u64,
 }
 
 impl RequestPolicyInput {
-    pub fn from_headers(headers: &HeaderMap, owner_co_signed: bool, estimated_spend_mist: u64) -> Self {
+    pub fn from_headers(headers: &HeaderMap) -> Self {
         let platform_id = headers
             .get("x-platform-id")
             .and_then(|v| v.to_str().ok())
             .map(String::from);
-        Self {
-            platform_id,
-            owner_co_signed,
-            estimated_spend_mist,
-        }
+        Self { platform_id }
     }
 }
 
@@ -35,8 +28,6 @@ pub enum PolicyError {
     InactiveAncestor,
     MissingCapability { required: u64 },
     WrongPlatformScope,
-    ApprovalRequired,
-    SpendExceeded,
 }
 
 impl PolicyError {
@@ -46,9 +37,9 @@ impl PolicyError {
             PolicyError::ExpiredAgent => E_SUB_AGENT_EXPIRED,
             PolicyError::InactiveAncestor => E_SUB_AGENT_INACTIVE_ANCESTOR,
             PolicyError::MissingCapability { .. } => E_SUB_AGENT_MISSING_CAP,
-            PolicyError::WrongPlatformScope => crate::memory_contract::E_SUB_AGENT_WRONG_PLATFORM_SCOPE,
-            PolicyError::ApprovalRequired => crate::memory_contract::E_SUB_AGENT_APPROVAL_REQUIRED,
-            PolicyError::SpendExceeded => crate::memory_contract::E_SUB_AGENT_SPEND_EXCEEDED,
+            PolicyError::WrongPlatformScope => {
+                crate::memory_contract::E_SUB_AGENT_WRONG_PLATFORM_SCOPE
+            }
         }
     }
 }
@@ -63,8 +54,6 @@ impl std::fmt::Display for PolicyError {
                 write!(f, "sub-agent missing capability bit {}", required)
             }
             PolicyError::WrongPlatformScope => write!(f, "platform scope mismatch"),
-            PolicyError::ApprovalRequired => write!(f, "owner approval required for this action"),
-            PolicyError::SpendExceeded => write!(f, "action spend exceeds max_action_spend"),
         }
     }
 }
@@ -75,7 +64,6 @@ pub fn validate_agent_policy(
     ancestors: &[SocialSubAgent],
     required_cap: u64,
     input: &RequestPolicyInput,
-    is_write: bool,
 ) -> Result<(), PolicyError> {
     if !agent.active || agent.revoked_at_ms.is_some() {
         return Err(PolicyError::InactiveAgent);
@@ -116,21 +104,6 @@ pub fn validate_agent_policy(
     )
     .map_err(|_| PolicyError::WrongPlatformScope)?;
 
-    if is_write {
-        check_direct_execution_allowed(
-            agent.approval_required_caps as u64,
-            required_cap,
-            input.owner_co_signed,
-        )
-        .map_err(|_| PolicyError::ApprovalRequired)?;
-    }
-
-    check_spend_limit(
-        agent.max_action_spend.map(|v| v as u64),
-        input.estimated_spend_mist,
-    )
-    .map_err(|_| PolicyError::SpendExceeded)?;
-
     Ok(())
 }
 
@@ -165,38 +138,32 @@ mod tests {
     }
 
     #[test]
-    fn write_blocked_when_approval_required_without_owner() {
+    fn approval_required_caps_do_not_block_relayer_v1() {
         let agent = sample_agent(3, crate::memory_contract::CAP_MEMORY_WRITE as i64);
         let input = RequestPolicyInput {
             platform_id: None,
-            owner_co_signed: false,
-            estimated_spend_mist: 0,
-        };
-        let err = validate_agent_policy(
-            &agent,
-            &[],
-            crate::memory_contract::CAP_MEMORY_WRITE,
-            &input,
-            true,
-        )
-        .unwrap_err();
-        assert!(matches!(err, PolicyError::ApprovalRequired));
-    }
-
-    #[test]
-    fn write_allowed_with_owner_co_sign() {
-        let agent = sample_agent(3, crate::memory_contract::CAP_MEMORY_WRITE as i64);
-        let input = RequestPolicyInput {
-            platform_id: None,
-            owner_co_signed: true,
-            estimated_spend_mist: 0,
         };
         assert!(validate_agent_policy(
             &agent,
             &[],
             crate::memory_contract::CAP_MEMORY_WRITE,
             &input,
-            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn max_action_spend_does_not_block_relayer_v1() {
+        let mut agent = sample_agent(crate::memory_contract::CAP_MEMORY_WRITE as i64, 0);
+        agent.max_action_spend = Some(1);
+        let input = RequestPolicyInput {
+            platform_id: None,
+        };
+        assert!(validate_agent_policy(
+            &agent,
+            &[],
+            crate::memory_contract::CAP_MEMORY_WRITE,
+            &input,
         )
         .is_ok());
     }
