@@ -4,6 +4,12 @@ use sqlx::PgPool;
 
 use crate::types::{AppError, SearchHit};
 
+/// Cached sub-agent row from PostgreSQL (lookup keys only; full state re-verified on-chain).
+pub struct CachedSubAgent {
+    pub account_id: String,
+    pub agent_object_id: String,
+}
+
 pub struct VectorDb {
     pool: PgPool,
 }
@@ -41,6 +47,12 @@ impl VectorDb {
             .execute(&pool)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to run migration 004: {}", e)))?;
+
+        let migration_005 = include_str!("../migrations/005_sub_agent_cache.sql");
+        sqlx::raw_sql(migration_005)
+            .execute(&pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to run migration 005: {}", e)))?;
 
 
         tracing::info!("database connected and migrations applied");
@@ -171,86 +183,99 @@ impl VectorDb {
     }
 
     // ============================================================
-    // Delegate Key Cache
+    // Sub-Agent Cache
     // ============================================================
 
-    /// Look up cached account info for a delegate public key.
-    /// Returns `Some((account_id, owner))` if found.
-    pub async fn get_cached_account(
+    /// Look up cached sub-agent info for a public key.
+    pub async fn get_cached_sub_agent(
         &self,
         public_key_hex: &str,
-    ) -> Result<Option<(String, String)>, AppError> {
+    ) -> Result<Option<CachedSubAgent>, AppError> {
         let result: Option<(String, String)> = sqlx::query_as(
-            "SELECT account_id, owner FROM delegate_key_cache WHERE public_key = $1 AND expires_at > NOW()",
+            "SELECT account_id, agent_object_id
+             FROM sub_agent_cache
+             WHERE public_key = $1 AND expires_at > NOW()",
         )
         .bind(public_key_hex)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to query cache: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to query sub-agent cache: {}", e)))?;
 
-        Ok(result)
+        Ok(result.map(|(account_id, agent_object_id)| CachedSubAgent {
+            account_id,
+            agent_object_id,
+        }))
     }
 
-    /// Cache a verified delegate key → account mapping.
-    pub async fn cache_delegate_key(
+    /// Cache a verified sub-agent mapping.
+    pub async fn cache_sub_agent(
         &self,
         public_key_hex: &str,
+        derived_address: &str,
         account_id: &str,
+        agent_object_id: &str,
         owner: &str,
+        capabilities: i64,
     ) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO delegate_key_cache (public_key, account_id, owner, expires_at)
-             VALUES ($1, $2, $3, NOW() + INTERVAL '24 hours')
+            "INSERT INTO sub_agent_cache (
+                public_key, derived_address, account_id, agent_object_id, owner, capabilities, expires_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '24 hours')
              ON CONFLICT (public_key)
-             DO UPDATE SET account_id = $2, owner = $3, cached_at = NOW(), expires_at = NOW() + INTERVAL '24 hours'",
+             DO UPDATE SET
+                derived_address = $2,
+                account_id = $3,
+                agent_object_id = $4,
+                owner = $5,
+                capabilities = $6,
+                cached_at = NOW(),
+                expires_at = NOW() + INTERVAL '24 hours'",
         )
         .bind(public_key_hex)
+        .bind(derived_address)
         .bind(account_id)
+        .bind(agent_object_id)
         .bind(owner)
+        .bind(capabilities)
         .execute(&self.pool)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to cache delegate key: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to cache sub-agent: {}", e)))?;
 
-        tracing::debug!("cached delegate key: {} -> account {}", public_key_hex, account_id);
+        tracing::debug!(
+            "cached sub-agent: {} -> account {} agent {}",
+            public_key_hex,
+            account_id,
+            agent_object_id
+        );
         Ok(())
     }
 
-    /// Periodically called to evict expired keys
-    pub async fn evict_expired_delegate_keys(&self) -> Result<u64, AppError> {
-        let result = sqlx::query("DELETE FROM delegate_key_cache WHERE expires_at <= NOW()")
+    /// Periodically evict expired cache rows.
+    pub async fn evict_expired_sub_agents(&self) -> Result<u64, AppError> {
+        let result = sqlx::query("DELETE FROM sub_agent_cache WHERE expires_at <= NOW()")
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to evict expired delegate keys: {}", e)))?;
-        
+            .map_err(|e| AppError::Internal(format!("Failed to evict expired sub-agents: {}", e)))?;
+
         let rows = result.rows_affected();
         if rows > 0 {
-            tracing::info!("Evicted {} expired delegate keys from cache", rows);
+            tracing::info!("Evicted {} expired sub-agent cache rows", rows);
         }
         Ok(rows)
     }
 
-    /// LOW-3 fix: Immediately remove a single stale/revoked delegate key from the cache.
-    ///
-    /// Called when `verify_delegate_key_onchain` returns `Err` for a cached entry,
-    /// meaning the key has been revoked on-chain. Without this, every subsequent
-    /// request with the revoked key would hit the cache, fail the RPC verify, log
-    /// noise, and waste an RPC call — in an infinite loop until TTL expiry.
-    pub async fn delete_cached_key(&self, public_key_hex: &str) -> Result<u64, AppError> {
-        let result =
-            sqlx::query("DELETE FROM delegate_key_cache WHERE public_key = $1")
-                .bind(public_key_hex)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    AppError::Internal(format!("Failed to delete stale cached key: {}", e))
-                })?;
+    /// Remove a stale/revoked sub-agent from the cache.
+    pub async fn delete_cached_sub_agent(&self, public_key_hex: &str) -> Result<u64, AppError> {
+        let result = sqlx::query("DELETE FROM sub_agent_cache WHERE public_key = $1")
+            .bind(public_key_hex)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to delete cached sub-agent: {}", e)))?;
 
         let rows = result.rows_affected();
         if rows > 0 {
-            tracing::info!(
-                "LOW-3: evicted stale/revoked delegate key from cache: {}",
-                public_key_hex
-            );
+            tracing::info!("evicted stale sub-agent from cache: {}", public_key_hex);
         }
         Ok(rows)
     }
@@ -285,27 +310,5 @@ impl VectorDb {
         tx.commit().await.map_err(|e| AppError::Internal(format!("Failed to commit tx: {}", e)))?;
 
         Ok(row.0)
-    }
-
-    // ============================================================
-    // Accounts (populated by v2-indexer)
-    // ============================================================
-
-    /// Find an account by owner address (from indexed accounts table).
-    /// Returns `Some(account_id)` if the owner has a registered account.
-    #[allow(dead_code)]
-    pub async fn find_account_by_owner(
-        &self,
-        owner: &str,
-    ) -> Result<Option<String>, AppError> {
-        let result: Option<(String,)> = sqlx::query_as(
-            "SELECT account_id FROM accounts WHERE owner = $1",
-        )
-        .bind(owner)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to query accounts: {}", e)))?;
-
-        Ok(result.map(|(id,)| id))
     }
 }

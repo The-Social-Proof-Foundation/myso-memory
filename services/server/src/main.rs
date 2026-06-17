@@ -4,8 +4,10 @@ mod rate_limit;
 mod routes;
 mod mydata;
 mod myso;
+mod social;
 mod types;
-mod file-storage;
+#[path = "file-storage.rs"]
+mod file_storage;
 
 use axum::{extract::DefaultBodyLimit, middleware, routing::{get, post}, Router};
 use std::net::SocketAddr;
@@ -35,7 +37,7 @@ async fn main() {
     tracing::info!("starting memory server on port {}", config.port);
     tracing::info!("  MySo RPC: {}", config.myso_rpc_url);
     tracing::info!("  package id: {}", config.package_id);
-    tracing::info!("  registry id: {}", config.registry_id);
+    tracing::info!("  social server: {}", config.social_server_url);
     tracing::info!("  memory account: {}", config.memory_account_id.as_deref().unwrap_or("(from client header)"));
     tracing::info!("  rate limit: burst={}/min, sustained={}/hr, per-key={}/min, quota={}MB/user",
         config.rate_limit.max_requests_per_minute,
@@ -96,12 +98,6 @@ async fn main() {
         .await
         .expect("Failed to connect to PostgreSQL");
 
-    // Initialize File Storage client (SDK wraps Publisher + Aggregator HTTP APIs)
-    let file_storage_client = file_storage_rs::FileStorageClient::new(
-        &config.file_storage_aggregator_url,
-        &config.file_storage_publisher_url,
-    )
-    .expect("Failed to initialize File Storage client (invalid URL?)");
     tracing::info!("  File Storage publisher: {}", config.file_storage_publisher_url);
     tracing::info!("  File Storage aggregator: {}", config.file_storage_aggregator_url);
     // Log upload key pool status
@@ -126,7 +122,6 @@ async fn main() {
         db,
         config: config.clone(),
         http_client,
-        file_storage_client,
         key_pool,
         redis,
         fallback_rate_limit: tokio::sync::Mutex::new(crate::rate_limit::InMemoryFallback::default()),
@@ -139,7 +134,7 @@ async fn main() {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
-            if let Err(e) = evict_state.db.evict_expired_delegate_keys().await {
+            if let Err(e) = evict_state.db.evict_expired_sub_agents().await {
                 tracing::error!("Background eviction failed: {}", e);
             }
         }

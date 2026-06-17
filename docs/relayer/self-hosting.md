@@ -23,7 +23,7 @@ The most common reasons to self-host include:
 ## Data Isolation (Namespaces)
 
 With the current architecture, Memory isolates data strictly by **User (Owner address)** and **Namespace**.
-Because the relayer inherently scopes all vector searches and storage operations by `owner + namespace`, multiple agents or applications can safely share the same relayer deployment simply by using different namespaces or operating under different delegate keys.
+Because the relayer inherently scopes all vector searches and storage operations by `owner + namespace`, multiple agents or applications can safely share the same relayer deployment by using different namespaces or separate sub-agent keys.
 
 ## Horizontal Scaling
 
@@ -41,8 +41,8 @@ A self-hosted Memory backend has:
 |-----------|----------|-------------|
 | **Rust relayer** | `services/server` | Axum HTTP server — auth, routing, embedding, vector search |
 | **TypeScript sidecar** | `services/server/scripts` | MYDATA encrypt/decrypt, File Storage upload, blob query (uses `@socialproof/mydata` and `@socialproof/file-storage`) |
-| **PostgreSQL + pgvector** | External | Vector storage, auth cache, indexer state |
-| **Indexer** (recommended) | `services/indexer` | Polls MySo events, syncs account data into PostgreSQL |
+| **PostgreSQL + pgvector** | External | Vector storage, sub-agent auth cache |
+| **Social server** (recommended) | myso-core | Sub-agent index — `GET /sub-agents/:derivedAddress` |
 
 The Rust relayer starts the TypeScript sidecar as a child process on boot. They communicate over HTTP (`localhost:9000` by default). If the sidecar fails to start within 15 seconds, the relayer exits.
 
@@ -76,7 +76,8 @@ curl http://localhost:8000/health
 
 - `DATABASE_URL`
 - `MEMORY_PACKAGE_ID`
-- `MEMORY_REGISTRY_ID`
+- `MEMORY_REGISTRY_ID` — optional for relayer auth (still used by some sidecar flows)
+- `SOCIAL_SERVER_URL` — social API for sub-agent lookup (default `http://127.0.0.1:9126`)
 - `SERVER_MYSO_PRIVATE_KEY` or `SERVER_MYSO_PRIVATE_KEYS`
 - `MYDATA_KEY_SERVERS` — comma-separated list of MYDATA key server object IDs
 
@@ -91,7 +92,7 @@ By default, the relayer enforces rate limits and storage quotas via Redis to pre
 
 - `RATE_LIMIT_REQUESTS_PER_MINUTE` — max burst weighted-requests per minute per user (default: 60)
 - `RATE_LIMIT_REQUESTS_PER_HOUR` — max sustained weighted-requests per hour per user (default: 500)
-- `RATE_LIMIT_DELEGATE_KEY_PER_MINUTE` — max weighted-requests per minute per delegate key (default: 30)
+- `RATE_LIMIT_DELEGATE_KEY_PER_MINUTE` — max weighted-requests per minute per sub-agent key (default: 30)
 - `RATE_LIMIT_STORAGE_BYTES` — max storage per user in bytes (default: 1 GB, `1073741824`)
 - `REDIS_URL` — required to track sliding windows for rate limits (default: `redis://localhost:6379`)
 
@@ -137,9 +138,7 @@ Using official key server of SDK is recommended.
 The relayer requires PostgreSQL with the `pgvector` extension. The relayer runs migrations automatically on boot, creating these tables:
 
 - `vector_entries` — 1536-dimensional embeddings with HNSW index for cosine similarity search
-- `delegate_key_cache` — auth optimization (delegate key → account mapping)
-- `accounts` — populated by the indexer (account → owner mapping)
-- `indexer_state` — indexer cursor tracking
+- `sub_agent_cache` — auth optimization (public key → account, agent, capabilities)
 
 See [Database Sync](/indexer/database-sync) for the full schema.
 
@@ -147,15 +146,14 @@ See [Database Sync](/indexer/database-sync) for the full schema.
 
 - The server starts the sidecar automatically on boot — if sidecar startup fails, the relayer will exit
 - DB migrations run automatically on boot (`pgvector` must already be installed as a PostgreSQL extension)
-- Connection pool: 10 max connections (relayer), 3 max connections (indexer)
+- Connection pool: 10 max connections (relayer)
 - `/health` is the basic service check, API routes live under `/api/*`
-- The indexer is recommended for fast account lookup in production — without it, the relayer falls back to onchain registry scans
+- Point `SOCIAL_SERVER_URL` at a running social server from myso-core for production auth
 - Without `OPENAI_API_KEY`, the server uses deterministic mock embeddings (hash-based) — useful for local testing but not production
 
 ## Docker
 
 - `services/server/Dockerfile` for the relayer
-- `services/indexer/Dockerfile` for the indexer
 
 ## Read Next
 

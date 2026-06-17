@@ -1,29 +1,32 @@
 ---
 title: "Core Components"
-description: "The six core components that make up the Memory system and how they interact."
+description: "The five core components that make up the Memory system and how they interact."
 ---
 
-Memory is made up of six core components that work together to give your app encrypted, owner-controlled memory.
+Memory is made up of five core components that work together to give your app encrypted, owner-controlled memory.
 
 ```mermaid
 sequenceDiagram
     participant App as Your App
     participant SDK as SDK
     participant Relayer as Relayer
+    participant Social as Social API
     participant Contract as Memory Contract
     participant File Storage as File Storage
-    participant DB as Indexed Database
+    participant DB as Relayer DB
 
     App->>SDK: remember / recall
-    SDK->>Relayer: signed request
-    Relayer->>Contract: verify key (owner or delegate)
+    SDK->>Relayer: signed request (sub-agent key)
+    Relayer->>Social: GET /sub-agents/{derivedAddress}
+    Social-->>Relayer: account + agent + capabilities
+    Relayer->>Contract: verify SubAgent + MemoryAccount
     Contract-->>Relayer: authorized
     Relayer->>File Storage: store / fetch encrypted blob
     Relayer->>DB: store / search vectors
     Relayer-->>SDK: result
     SDK-->>App: response
 
-    Note over Contract,DB: Indexer syncs contract events → DB
+    Note over Social,Contract: Social indexer syncs contract events
 ```
 
 ## SDK
@@ -31,9 +34,10 @@ sequenceDiagram
 The TypeScript SDK is the main entry point for developers. It wraps all Memory operations into a simple client that your app calls directly.
 
 **Responsibilities:**
-- Signs every request with the configured key
+- Signs every request with a registered sub-agent key
 - Sends requests to the relayer
-- Exposes `remember`, `recall`, `analyze`, `ask`, and `restore` methods
+- Exposes `remember`, `recall`, `analyze`, and `restore` methods
+- On-chain helpers: `registerSubAgent`, `generateSubAgentKey`, etc.
 
 ```ts
 const memory = Memory.create({
@@ -42,77 +46,51 @@ const memory = Memory.create({
   serverUrl: process.env.MEMORY_SERVER_URL,
   namespace: "my-app",
 });
-
-await memory.remember("User prefers dark mode.");
 ```
 
 ## Relayer
 
-The relayer is the backend service that processes all SDK requests. It abstracts all Web3 complexity behind a familiar REST API — developers interact with Memory using standard HTTP calls, while the relayer handles blockchain transactions, encryption, and decentralized storage behind the scenes.
-
-This means Web2 developers can integrate Memory without touching wallets, signing transactions, or understanding MySo directly. The relayer can also sponsor transaction fees and storage costs on behalf of users, removing onchain friction entirely.
+The relayer is the backend service that processes all SDK requests. It abstracts Web3 complexity behind a REST API.
 
 **Responsibilities:**
-- Exposes a Web2-friendly REST API for all memory operations
-- Verifies key authorization against the smart contract
-- Generates embeddings for memory content
-- Encrypts and decrypts memory payloads
-- Uploads and downloads blobs to/from File Storage
-- Stores and searches vector metadata in the indexed database
-- Scopes all operations to `owner + namespace` (with MYDATA encryption bound to the app's package ID)
-- Can sponsor transaction and storage fees for user requests
+- Verifies Ed25519 signatures and resolves sub-agents (cache → social API → on-chain)
+- Enforces capability bits (`CAP_MEMORY_READ` / `CAP_MEMORY_WRITE`) per route
+- Generates embeddings, MYDATA encrypt/decrypt (via sidecar), File Storage upload/download
+- Stores and searches vectors in PostgreSQL (pgvector)
+- Scopes operations to `owner + namespace`
 
 <Note>
-Because the relayer handles encryption and plaintext data, you are placing trust in the relayer operator. This is a deliberate trade-off for developer experience. If you need full control over that trust boundary, you can [self-host](/relayer/self-hosting) your own relayer, or use the [manual client flow](/sdk/usage) to handle encryption and embedding entirely on the client side (recommended for Web3-native users). See [Trust & Security Model](/fundamentals/architecture/data-flow-security-model) for details.
+Because the relayer handles encryption and plaintext data, you are placing trust in the relayer operator. You can [self-host](/relayer/self-hosting) or use the [manual client flow](/sdk/usage) for full client-side control.
 </Note>
-
-You can use the [managed relayer](/relayer/public-relayer) to get started, [self-host](/relayer/self-hosting) your own, or use the manual client flow for full client-side control.
 
 ## Memory Smart Contract
 
-The MySo smart contract is the source of truth for ownership and access control.
+The MySo smart contract (`social_contracts::memory`) is the source of truth for ownership and access control.
 
 **Responsibilities:**
-- Defines who owns a Memory account
-- Stores which delegate keys are authorized
-- Enforces access rules on every request (verified by the relayer)
-- Emits events when accounts or delegates change
+- Profile-linked MemoryAccounts (one per human owner)
+- SubAgent registry keyed by `derived_address`
+- Capability-gated MYDATA via `approve_key_policy(id, account, clock, ctx)`
+- Emits lifecycle events indexed by the social stack
 
-The contract doesn't store memory content — it only manages identity and permissions.
+The contract does not store memory content — only identity and permissions.
 
-## Indexer
+## Social Indexer + API
 
-The indexer keeps the backend in sync with onchain state so the relayer doesn't need to query the blockchain on every request.
+The social indexer in **myso-core** indexes memory accounts and sub-agents. The memory relayer calls the social server API for fast lookup — there is no separate memory indexer in this repo.
 
-**Responsibilities:**
-- Listens for Memory contract events (account creation, delegate changes)
-- Syncs account and delegate data into the indexed database
-- Enables fast lookups for the relayer during request verification
+**Relayer env:** `SOCIAL_SERVER_URL` (default `http://127.0.0.1:9126`)
 
 ## File Storage
 
-File Storage is the decentralized storage layer where encrypted memory payloads live.
+Decentralized storage for encrypted memory payloads. Blob metadata includes `memory_namespace`, `memory_owner`, `memory_package_id`, and `memory_agent_id` (SubAgent object ID).
 
-**Responsibilities:**
-- Stores encrypted blobs durably across a decentralized network
-- Returns blobs on demand for decryption and recall
-- Carries blob metadata (including namespace) for discovery during restore
+## Relayer Database
 
-File Storage is an external protocol — Memory uses it as infrastructure, not as something you interact with directly.
+PostgreSQL + pgvector for the relayer only:
 
-## Indexed Database
+- `vector_entries` — embeddings linked to File Storage blob IDs
+- `sub_agent_cache` — auth cache (public key → account, agent, capabilities)
+- Rate limit / quota state (Redis + SQL)
 
-PostgreSQL with the [pgvector](https://github.com/pgvector/pgvector) extension serves as the local search and sync layer.
-
-**Key tables:**
-- `vector_entries` — stores 1536-dimensional embeddings linked to File Storage blob IDs, with an HNSW index for fast cosine similarity search
-- `delegate_key_cache` — caches delegate key → account mappings for fast auth
-- `accounts` — synced by the indexer for account lookups
-- `indexer_state` — tracks the indexer's event polling cursor
-
-**Responsibilities:**
-- Stores vector embeddings for semantic search during recall
-- Caches account and delegate data synced by the indexer
-- Scopes all queries to `owner + namespace` (package ID provides cross-deployment isolation via MYDATA)
-
-This is an operational component — it makes recall fast and keeps onchain lookups efficient, but the encrypted source of truth always lives on File Storage. If the database is lost, the [restore flow](/sdk/usage/memory) can rebuild it from File Storage.
+If the database is lost, [restore](/sdk/usage/memory) can rebuild vectors from File Storage.

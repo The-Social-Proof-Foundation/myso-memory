@@ -55,7 +55,7 @@ pnpm dev:sdk
 
 ## Step 4 — Backend Services (Optional)
 
-The TypeScript apps talk to a managed relayer by default. You only need to run backend services if you're working on the relayer or indexer.
+The TypeScript apps talk to a managed relayer by default. You only need to run backend services if you're working on the relayer.
 
 ### Relayer (`services/server`)
 
@@ -84,14 +84,7 @@ cargo run
 
 For the full relayer setup guide, see [Self-Hosting](/relayer/self-hosting).
 
-### Indexer (`services/indexer`)
-
-```bash
-cd services/indexer
-cargo run
-```
-
-The indexer polls MySo events and syncs account data into PostgreSQL.
+Sub-agent auth requires a social server from myso-core. Set `SOCIAL_SERVER_URL` in `services/server/.env`.
 
 ## Monorepo Structure
 
@@ -107,8 +100,7 @@ Memory/
 │   └── researcher/  # Research assistant demo
 ├── services/
 │   ├── server/      # Rust relayer (Axum)
-│   ├── indexer/     # Rust MySo event indexer
-│   └── contract/    # Move smart contract
+│   └── contract/    # Move smart contract (reference; canonical contract in myso-core)
 ├── docs/            # Mintlify documentation site
 └── SKILL.md         # Agent-first integration guide
 ```

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-E2E test for memory Server — Ed25519 auth + current API contract.
+E2E test for memory Server — Ed25519 sub-agent auth + current API contract.
 
 What this covers:
   1. GET /health is reachable without auth
@@ -8,26 +8,17 @@ What this covers:
   3. Valid-format but wrong-key signatures are rejected (401)
   4. Expired timestamps are rejected (401)
   5. Opt-in: signed /api/remember + /api/recall happy path with a
-     pre-registered delegate key (requires TEST_DELEGATE_KEY + real backend)
+     pre-registered sub-agent key (requires TEST_SUB_AGENT_KEY + real backend)
 
-The happy-path flow needs a pre-registered on-chain MemoryAccount delegate
-key, a real File Storage publisher, MYDATA key servers, MySo RPC, and a funded
-server wallet. This matches the existing pattern in
-`test_rate_limit_redis.py` / `test_analyze_rate_limit.py`. CI runs the
-contract + auth checks by default; setting TEST_DELEGATE_KEY (+ secrets)
-upgrades the run to include the happy path.
+The happy-path flow needs a sub-agent registered on-chain, social server
+indexing that agent, File Storage, MYDATA key servers, MySo RPC, and a
+funded server wallet.
 
 Env vars:
-  TEST_BASE_URL        default "http://localhost:8000"
-  TEST_DELEGATE_KEY    hex-encoded Ed25519 secret (32 bytes → 64 hex chars)
-                       of a delegate key registered on-chain. If unset,
-                       remember/recall is skipped.
-  TEST_ACCOUNT_ID      MemoryAccount object ID (0x... MySo address). Only
-                       used informationally; auth middleware resolves the
-                       account from the delegate key.
-
-Exit status: 0 if all *executed* checks pass, 1 on any failure. Skipped
-checks do not cause failure.
+  TEST_BASE_URL           default "http://localhost:8000"
+  TEST_SUB_AGENT_KEY      hex-encoded Ed25519 secret (32 bytes → 64 hex chars)
+  TEST_DELEGATE_KEY       deprecated alias for TEST_SUB_AGENT_KEY
+  TEST_ACCOUNT_ID         MemoryAccount object ID (optional x-account-id hint)
 """
 
 from __future__ import annotations
@@ -100,18 +91,21 @@ def make_signed_request(
         return json.loads(resp.read())
 
 
-def _load_delegate_key() -> SigningKey | None:
-    """Load TEST_DELEGATE_KEY as a SigningKey, or return None if unset/invalid."""
-    hex_key = os.environ.get("TEST_DELEGATE_KEY", "").strip()
+def _load_sub_agent_key() -> SigningKey | None:
+    """Load TEST_SUB_AGENT_KEY (or legacy TEST_DELEGATE_KEY) as a SigningKey."""
+    hex_key = (
+        os.environ.get("TEST_SUB_AGENT_KEY", "").strip()
+        or os.environ.get("TEST_DELEGATE_KEY", "").strip()
+    )
     if not hex_key:
         return None
     try:
         raw = bytes.fromhex(hex_key)
     except ValueError:
-        print(f"[warn] TEST_DELEGATE_KEY is not valid hex; skipping happy-path checks")
+        print("[warn] TEST_SUB_AGENT_KEY is not valid hex; skipping happy-path checks")
         return None
     if len(raw) != 32:
-        print(f"[warn] TEST_DELEGATE_KEY must be 32 bytes (got {len(raw)}); skipping happy-path checks")
+        print(f"[warn] TEST_SUB_AGENT_KEY must be 32 bytes (got {len(raw)}); skipping happy-path checks")
         return None
     return SigningKey(raw, encoder=RawEncoder)
 
@@ -176,7 +170,7 @@ def test_wrong_signature_rejected() -> None:
 
 def test_expired_timestamp_rejected() -> None:
     # Use a fresh random key — the request is expected to die at the
-    # timestamp check, which runs BEFORE onchain delegate verification.
+    # timestamp check, which runs BEFORE sub-agent resolution.
     signing_key = SigningKey.generate()
     body = {"text": "old", "namespace": "default"}
     body_bytes = json.dumps(body).encode()
@@ -208,11 +202,7 @@ def test_expired_timestamp_rejected() -> None:
 
 
 def test_remember_recall_happy_path(signing_key: SigningKey, account_id: str | None) -> None:
-    """Signed /api/remember → /api/recall with a pre-registered delegate key.
-
-    Requires real File Storage + MYDATA + MySo + funded server wallet + delegate key
-    registered on-chain in the MemoryAccount identified by account_id.
-    """
+    """Signed /api/remember → /api/recall with a pre-registered sub-agent key."""
     remember_body = {
         "text": "The capital of France is Paris.",
         "namespace": "e2e-test",
@@ -243,12 +233,12 @@ def test_remember_recall_happy_path(signing_key: SigningKey, account_id: str | N
 def main() -> int:
     print("=" * 60)
     print(f"  memory Server E2E — target {BASE_URL}")
-    delegate_key = _load_delegate_key()
+    sub_agent_key = _load_sub_agent_key()
     account_id = os.environ.get("TEST_ACCOUNT_ID") or None
-    if delegate_key:
-        print("  happy-path: enabled (TEST_DELEGATE_KEY provided)")
+    if sub_agent_key:
+        print("  happy-path: enabled (TEST_SUB_AGENT_KEY provided)")
     else:
-        print("  happy-path: skipped (set TEST_DELEGATE_KEY to enable)")
+        print("  happy-path: skipped (set TEST_SUB_AGENT_KEY to enable)")
     print("=" * 60)
 
     failures: list[str] = []
@@ -266,14 +256,14 @@ def main() -> int:
             failures.append(f"{name}: {e}")
             print(f"[FAIL] {name}: {e}")
 
-    if delegate_key:
+    if sub_agent_key:
         try:
-            test_remember_recall_happy_path(delegate_key, account_id)
+            test_remember_recall_happy_path(sub_agent_key, account_id)
         except (AssertionError, urllib.error.URLError, urllib.error.HTTPError) as e:
             failures.append(f"remember_recall_happy_path: {e}")
             print(f"[FAIL] remember_recall_happy_path: {e}")
     else:
-        print("[skip] remember_recall_happy_path (no TEST_DELEGATE_KEY)")
+        print("[skip] remember_recall_happy_path (no TEST_SUB_AGENT_KEY)")
 
     print()
     print("=" * 60)

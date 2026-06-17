@@ -1,7 +1,7 @@
 /**
  * memory — Core Types
  *
- * Ed25519 delegate key based SDK that communicates with
+ * Ed25519 sub-agent key based SDK that communicates with
  * the Memory Rust server (TEE).
  */
 
@@ -10,9 +10,9 @@
 // ============================================================
 
 export interface MemoryConfig {
-    /** Ed25519 private key (hex string or Uint8Array). This is the delegate key from app.memory.com */
+    /** Ed25519 private key (hex string or Uint8Array). Sub-agent key registered on-chain. */
     key: string | Uint8Array;
-    /** MemoryAccount object ID on MySo (ensures correct account when delegate key exists in multiple accounts) */
+    /** MemoryAccount object ID on MySo */
     accountId: string;
     /** Server URL (default: http://localhost:8000) */
     serverUrl?: string;
@@ -123,7 +123,7 @@ export interface RestoreResult {
 
 /** Config for MemoryManual (full client-side: MYDATA + File Storage + embedding) */
 export interface MemoryManualConfig {
-    /** Ed25519 delegate private key (hex or Uint8Array) for server auth */
+    /** Ed25519 sub-agent private key (hex or Uint8Array) for server auth */
     key: string | Uint8Array;
     /** Server URL (default: http://localhost:8000) */
     serverUrl?: string;
@@ -209,72 +209,75 @@ export interface RecallManualResult {
 }
 
 // ============================================================
-// Account Management Types
+// Sub-Agent Management Types
 // ============================================================
 
-/** Base options for on-chain account transactions */
-interface AccountTxOpts {
+/** Base options for on-chain memory transactions */
+interface MemoryTxOpts {
     /** Memory contract package ID on MySo */
     packageId: string;
-    /**
-     * MySo private key (bech32 mysoprivkey1...) for signing.
-     * Provide EITHER this OR `walletSigner` — not both.
-     */
     mysoPrivateKey?: string;
-    /**
-     * Connected wallet signer (e.g. from dapp-kit).
-     * Provide EITHER this OR `mysoPrivateKey` — not both.
-     */
     walletSigner?: WalletSigner;
-    /**
-     * Pre-configured MySo client instance.
-     * If omitted, the SDK will create one internally.
-     */
     mysoClient?: any;
-    /** MySo network (default: mainnet) */
     mysoNetwork?: "testnet" | "mainnet";
 }
 
-/** Options for createAccount() */
-export interface CreateAccountOpts extends AccountTxOpts {
+/** Options for ensureMemoryAccount() */
+export interface EnsureMemoryAccountOpts extends MemoryTxOpts {
     /** MemoryRegistry shared object ID */
     registryId: string;
+    /** Profile object ID to link */
+    profileId: string;
 }
 
-/** Result from createAccount() */
-export interface CreateAccountResult {
-    /** Created MemoryAccount object ID */
-    accountId: string;
-    /** Owner MySo address */
-    owner: string;
-    /** Transaction digest */
+/** Result from ensureMemoryAccount() */
+export interface EnsureMemoryAccountResult {
     digest: string;
+    /** MemoryAccount object ID when created in this transaction */
+    accountId: string;
 }
 
-/** Options for addDelegateKey() */
-export interface AddDelegateKeyOpts extends AccountTxOpts {
-    /** MemoryAccount object ID */
+/** Shared sub-agent registration fields */
+interface SubAgentRegistrationFields {
     accountId: string;
-    /** Ed25519 public key (32 bytes Uint8Array or hex string) */
     publicKey: Uint8Array | string;
-    /** Human-readable label (e.g. "MacBook Pro", "Production Server") */
     label: string;
+    identityClass?: number;
+    roleTags?: number;
+    capabilities?: number;
+    delegatableCaps?: number;
+    registerScope?: number;
+    approvalRequiredCaps?: number;
+    maxActionSpend?: number | null;
+    platformScope?: string | null;
+    expiresAt?: number | null;
 }
 
-/** Result from addDelegateKey() */
-export interface AddDelegateKeyResult {
-    /** Transaction digest */
+/** Options for registerSubAgent() */
+export interface RegisterSubAgentOpts extends MemoryTxOpts, SubAgentRegistrationFields {}
+
+/** Options for registerSubAgentDelegated() */
+export interface RegisterSubAgentDelegatedOpts extends MemoryTxOpts, SubAgentRegistrationFields {
+    parentAgentObjectId: string;
+    registerRelation: number;
+}
+
+/** Result from registerSubAgent() / registerSubAgentDelegated() */
+export interface RegisterSubAgentResult {
     digest: string;
-    /** Public key hex */
     publicKey: string;
-    /** Derived MySo address for this delegate key */
-    mysoAddress: string;
+    derivedAddress: string;
+    agentObjectId: string;
 }
 
-/** Options for removeDelegateKey() */
-export interface RemoveDelegateKeyOpts extends AccountTxOpts {
-    /** MemoryAccount object ID */
+/** Options for deactivateSubAgent() */
+export interface DeactivateSubAgentOpts extends MemoryTxOpts {
     accountId: string;
-    /** Ed25519 public key to remove (32 bytes Uint8Array or hex string) */
-    publicKey: Uint8Array | string;
+    agentObjectId: string;
+}
+
+/** Options for revokeSubAgent() */
+export interface RevokeSubAgentOpts extends MemoryTxOpts {
+    accountId: string;
+    agentObjectId: string;
 }

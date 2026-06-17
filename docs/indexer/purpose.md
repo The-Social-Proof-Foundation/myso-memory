@@ -1,53 +1,34 @@
----
-title: "Purpose"
----
+# Indexer Purpose
 
-The indexer keeps the backend in sync with onchain state so the relayer can resolve accounts quickly.
+The **social indexer** in myso-core owns the memory account index. myso-memory does **not** run a separate memory indexer.
 
-## Why It Exists
+## Problem
 
-Without the indexer, every authenticated request would require the relayer to scan the onchain `MemoryRegistry` to find which `MemoryAccount` holds a given delegate key. This involves fetching the registry object, iterating through its dynamic fields, and checking each account — an expensive chain of RPC calls.
+Without an index, every authenticated request would require expensive on-chain lookups to resolve which MemoryAccount and SubAgent belong to a given public key.
 
-The indexer eliminates this by listening to MySo events and syncing account data into PostgreSQL. The relayer can then resolve delegate key ownership with a single database lookup.
+The social indexer listens to `social_contracts::memory` events and exposes them through PostgreSQL and the social server API.
 
-## How It Works
+## What gets indexed
 
-The indexer is a standalone Rust service (`services/indexer`) that:
+| Data | Owner |
+|------|-------|
+| `memory_accounts` | Social indexer |
+| `sub_agents` (by `derived_address`) | Social indexer |
+| Profile ↔ MemoryAccount links | Social indexer |
+| Vector entries, auth cache, rate limits | Memory relayer DB only |
 
-1. Connects to the same PostgreSQL database as the relayer
-2. Polls MySo blockchain events using `mysox_queryEvents`
-3. Filters for `MemoryAccountMigrated` events from the Memory package
-4. Inserts `account_id → owner` mappings into the `accounts` table
-5. Stores its event cursor in `indexer_state` so it can resume after restarts
+## Relayer resolution flow
 
-## Auth Resolution Flow
+When the memory relayer receives a signed request:
 
-When the relayer receives a request, it resolves the delegate key's account using this priority:
+1. Derive `derived_address` from `x-public-key`
+2. Check local `sub_agent_cache` (PostgreSQL)
+3. On miss, call social API: `GET {SOCIAL_SERVER_URL}/sub-agents/{derivedAddress}`
+4. On-chain verify SubAgent + MemoryAccount (capabilities, active, expiry)
+5. Cache result in `sub_agent_cache`
 
-1. **PostgreSQL cache** (`delegate_key_cache`) — fastest, populated lazily by the relayer itself
-2. **Indexed accounts** (`accounts`) — populated by the indexer, enables account discovery without chain scans
-3. **Onchain registry scan** — fallback, scans `MemoryRegistry` dynamic fields via RPC
-4. **Header hint** (`x-account-id`) — client-provided hint, useful during first-time setup
-5. **Config fallback** (`MEMORY_ACCOUNT_ID`) — server-level default
+Configure the relayer with `SOCIAL_SERVER_URL` (default `http://127.0.0.1:9126`).
 
-After successful resolution through any strategy, the mapping is cached in `delegate_key_cache` for future requests.
+## No local memory indexer
 
-## Configuration
-
-The indexer reads these environment variables:
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `DATABASE_URL` | Yes | — | PostgreSQL connection string |
-| `MEMORY_PACKAGE_ID` | Yes | — | Memory contract package ID to filter events |
-| `MYSO_RPC_URL` | No | Mainnet fullnode | MySo RPC endpoint |
-| `POLL_INTERVAL_SECS` | No | `5` | Seconds between event poll cycles |
-
-## Running
-
-```bash
-cd services/indexer
-cargo run
-```
-
-The indexer is recommended for production but optional for development — the relayer can fall back to onchain resolution without it.
+The former `services/indexer/` in this repo has been removed. Do not deploy a duplicate account indexer — use the social stack from myso-core.

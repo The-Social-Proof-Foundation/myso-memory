@@ -1,27 +1,166 @@
+use blake2::Blake2b;
+use blake2::digest::{consts::U32, Digest};
 use serde::Deserialize;
 
-/// Verify that a given public key is registered as a delegate key
-/// in the onchain MemoryAccount object.
-///
-/// Uses MySo JSON-RPC `myso_getObject` to fetch the object and parse
-/// its fields — no full `myso-sdk` dependency needed.
-///
-/// Returns `Ok(owner_address)` if the key is found, `Err` otherwise.
-pub async fn verify_delegate_key_onchain(
+/// Capability bits from `social_contracts::memory`.
+pub const CAP_MEMORY_READ: u64 = 1;
+pub const CAP_MEMORY_WRITE: u64 = 2;
+
+pub fn has_capability(capabilities: u64, required: u64) -> bool {
+    capabilities & required == required
+}
+
+/// Derive a MySo address from an Ed25519 public key (scheme flag 0x00 + blake2b-256).
+pub fn derived_address_from_public_key(public_key_bytes: &[u8; 32]) -> String {
+    let mut input = [0u8; 33];
+    input[0] = 0x00;
+    input[1..].copy_from_slice(public_key_bytes);
+    let hash = Blake2b::<U32>::digest(input);
+    format!("0x{}", hex::encode(&hash[..32]))
+}
+
+pub struct SubAgentVerifyResult {
+    pub owner: String,
+    pub account_id: String,
+    pub agent_object_id: String,
+    pub derived_address: String,
+    pub capabilities: u64,
+}
+
+/// Verify a sub-agent against on-chain SubAgent + MemoryAccount objects.
+pub async fn verify_sub_agent_onchain(
     http_client: &reqwest::Client,
     rpc_url: &str,
     account_object_id: &str,
-    public_key_bytes: &[u8],
+    agent_object_id: &str,
+    public_key_bytes: &[u8; 32],
+    required_cap: u64,
+) -> Result<SubAgentVerifyResult, OnchainVerifyError> {
+    let owner = verify_memory_account_active(http_client, rpc_url, account_object_id).await?;
+    let agent_fields = fetch_object_fields(http_client, rpc_url, agent_object_id).await?;
+
+    let memory_account_id = agent_fields
+        .get("memory_account_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| OnchainVerifyError::RpcError("Missing memory_account_id on SubAgent".into()))?;
+    if memory_account_id != account_object_id {
+        return Err(OnchainVerifyError::RpcError(
+            "SubAgent memory_account_id mismatch".into(),
+        ));
+    }
+
+    let derived_address = agent_fields
+        .get("derived_address")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| OnchainVerifyError::RpcError("Missing derived_address on SubAgent".into()))?
+        .to_string();
+
+    let expected_derived = derived_address_from_public_key(public_key_bytes);
+    if !addresses_equal(&derived_address, &expected_derived) {
+        return Err(OnchainVerifyError::KeyNotFound(
+            "Public key does not match SubAgent derived_address".into(),
+        ));
+    }
+
+    verify_public_key_field(&agent_fields, public_key_bytes)?;
+
+    let active = agent_fields
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !active {
+        return Err(OnchainVerifyError::SubAgentInactive(
+            "SubAgent is deactivated".into(),
+        ));
+    }
+
+    if let Some(expires_at) = agent_fields.get("expires_at").and_then(parse_u64_json) {
+        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+        if now_ms > expires_at {
+            return Err(OnchainVerifyError::SubAgentInactive(
+                "SubAgent has expired".into(),
+            ));
+        }
+    }
+
+    let capabilities = agent_fields
+        .get("capabilities")
+        .and_then(parse_u64_json)
+        .unwrap_or(0);
+    if !has_capability(capabilities, required_cap) {
+        return Err(OnchainVerifyError::MissingCapability(format!(
+            "SubAgent missing required capability bit {}",
+            required_cap
+        )));
+    }
+
+    Ok(SubAgentVerifyResult {
+        owner,
+        account_id: account_object_id.to_string(),
+        agent_object_id: agent_object_id.to_string(),
+        derived_address,
+        capabilities,
+    })
+}
+
+async fn verify_memory_account_active(
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    account_object_id: &str,
 ) -> Result<String, OnchainVerifyError> {
-    // Build JSON-RPC request
+    let fields = fetch_object_fields(http_client, rpc_url, account_object_id).await?;
+
+    let owner = fields
+        .get("owner")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| OnchainVerifyError::RpcError("Missing owner on MemoryAccount".into()))?
+        .to_string();
+
+    let active = fields.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+    if !active {
+        return Err(OnchainVerifyError::MemoryAccountDeactivated(format!(
+            "Account {} has been deactivated",
+            account_object_id
+        )));
+    }
+
+    Ok(owner)
+}
+
+fn verify_public_key_field(
+    fields: &serde_json::Map<String, serde_json::Value>,
+    public_key_bytes: &[u8; 32],
+) -> Result<(), OnchainVerifyError> {
+    let pk_as_numbers: Vec<serde_json::Value> = public_key_bytes
+        .iter()
+        .map(|&b| serde_json::Value::Number(b.into()))
+        .collect();
+
+    let stored_key = fields.get("public_key").ok_or_else(|| {
+        OnchainVerifyError::RpcError("Missing public_key on SubAgent".into())
+    })?;
+
+    if let Some(stored_arr) = stored_key.as_array() {
+        if *stored_arr == pk_as_numbers {
+            return Ok(());
+        }
+    }
+
+    Err(OnchainVerifyError::KeyNotFound(
+        "Public key mismatch on SubAgent object".into(),
+    ))
+}
+
+async fn fetch_object_fields(
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    object_id: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>, OnchainVerifyError> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "myso_getObject",
-        "params": [
-            account_object_id,
-            { "showContent": true }
-        ]
+        "params": [object_id, { "showContent": true }]
     });
 
     let response = http_client
@@ -43,257 +182,27 @@ pub async fn verify_delegate_key_onchain(
         )));
     }
 
-    let result = rpc_response
+    let fields = rpc_response
         .result
-        .ok_or_else(|| OnchainVerifyError::RpcError("No result in RPC response".into()))?;
-
-    let content = result
-        .data
+        .and_then(|r| r.data)
         .and_then(|d| d.content)
-        .ok_or_else(|| OnchainVerifyError::RpcError("Object has no content".into()))?;
-
-    let fields = content
-        .fields
+        .and_then(|c| c.fields)
         .ok_or_else(|| OnchainVerifyError::RpcError("Object has no fields".into()))?;
 
-    // Extract owner address
-    let owner = fields
-        .get("owner")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| OnchainVerifyError::RpcError("Missing 'owner' field".into()))?
-        .to_string();
-
-    // MED-2 fix: Block deactivated accounts.
-    // The onchain MemoryAccount has an `active: bool` field.
-    // If false, reject immediately — even if the delegate key is valid.
-    let active = fields
-        .get("active")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true); // default to true for backward compat with old contract versions
-    if !active {
-        tracing::warn!(
-            "account {} is deactivated — rejecting delegate key auth",
-            account_object_id
-        );
-        return Err(OnchainVerifyError::MemoryAccountDeactivated(format!(
-            "Account {} has been deactivated",
-            account_object_id
-        )));
-    }
-
-    // Extract delegate_keys array
-    let delegate_keys = fields
-        .get("delegate_keys")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| OnchainVerifyError::RpcError("Missing 'delegate_keys' field".into()))?;
-
-    // Convert our public key to the same format as stored onchain (Vec<u8> as JSON array)
-    let pk_as_numbers: Vec<serde_json::Value> = public_key_bytes
-        .iter()
-        .map(|&b| serde_json::Value::Number(b.into()))
-        .collect();
-
-    // Search for matching delegate key
-    for dk in delegate_keys {
-        // Each delegate key is a struct with fields: { public_key, label, created_at }
-        // The onchain representation has a "fields" wrapper
-        let dk_fields = dk
-            .get("fields")
-            .or(Some(dk)); // fallback if no "fields" wrapper
-
-        if let Some(stored_key) = dk_fields.and_then(|f| f.get("public_key")) {
-            // Compare as arrays of numbers
-            if let Some(stored_arr) = stored_key.as_array() {
-                if *stored_arr == pk_as_numbers {
-                    tracing::info!(
-                        "delegate key verified onchain, owner: {}",
-                        owner
-                    );
-                    return Ok(owner);
-                }
-            }
-        }
-    }
-
-    Err(OnchainVerifyError::KeyNotFound(format!(
-        "Public key not found in {} delegate key(s) for account {}",
-        delegate_keys.len(),
-        account_object_id
-    )))
+    Ok(fields)
 }
 
-/// Scan the MemoryRegistry to find which account holds a given delegate key.
-///
-/// Flow:
-/// 1. Fetch the MemoryRegistry object to get the Table's inner object ID
-/// 2. Use `mysox_getDynamicFields` on the Table's inner ID to enumerate accounts
-/// 3. For each account, fetch it and check delegate_keys
-///
-/// Returns `Ok((account_object_id, owner))` if found.
-pub async fn find_account_by_delegate_key(
-    http_client: &reqwest::Client,
-    rpc_url: &str,
-    registry_id: &str,
-    public_key_bytes: &[u8],
-) -> Result<(String, String), OnchainVerifyError> {
-    // Step 1: Fetch registry to get the Table's inner object ID
-    let registry_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "myso_getObject",
-        "params": [registry_id, { "showContent": true }]
-    });
-
-    let registry_resp = http_client
-        .post(rpc_url)
-        .json(&registry_body)
-        .send()
-        .await
-        .map_err(|e| OnchainVerifyError::RpcError(format!("Failed to fetch registry: {}", e)))?;
-
-    let registry_json: serde_json::Value = registry_resp.json().await.map_err(|e| {
-        OnchainVerifyError::RpcError(format!("Failed to parse registry response: {}", e))
-    })?;
-
-    // Extract Table inner ID: result.data.content.fields.accounts.fields.id.id
-    let table_id = registry_json
-        .pointer("/result/data/content/fields/accounts/fields/id/id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            OnchainVerifyError::RpcError("Failed to extract accounts table ID from registry".into())
-        })?
-        .to_string();
-
-    tracing::debug!("registry accounts table inner ID: {}", table_id);
-
-    // Step 2: Scan dynamic fields on the Table's inner ID
-    let mut cursor: Option<String> = None;
-
-    loop {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "mysox_getDynamicFields",
-            "params": [table_id, cursor, 50]
-        });
-
-        let response = http_client
-            .post(rpc_url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OnchainVerifyError::RpcError(format!("HTTP request failed: {}", e)))?;
-
-        let resp_json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| OnchainVerifyError::RpcError(format!("Failed to parse response: {}", e)))?;
-
-        if let Some(error) = resp_json.get("error") {
-            return Err(OnchainVerifyError::RpcError(format!(
-                "RPC error: {}",
-                error
-            )));
-        }
-
-        let result = resp_json
-            .get("result")
-            .ok_or_else(|| OnchainVerifyError::RpcError("No result in response".into()))?;
-
-        let data = result
-            .get("data")
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| OnchainVerifyError::RpcError("No data array in response".into()))?;
-
-        // Each entry is a dynamic field wrapping (address → ID)
-        for field_info in data {
-            let field_obj_id = field_info
-                .get("objectId")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    OnchainVerifyError::RpcError("Missing objectId in dynamic field".into())
-                })?;
-
-            // Fetch the dynamic field to get the account object ID
-            let field_body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "myso_getObject",
-                "params": [field_obj_id, { "showContent": true }]
-            });
-
-            let field_resp = http_client
-                .post(rpc_url)
-                .json(&field_body)
-                .send()
-                .await
-                .map_err(|e| {
-                    OnchainVerifyError::RpcError(format!("Failed to fetch field: {}", e))
-                })?;
-
-            let field_json: serde_json::Value = field_resp.json().await.map_err(|e| {
-                OnchainVerifyError::RpcError(format!("Failed to parse field response: {}", e))
-            })?;
-
-            // Extract the account ID from the dynamic field value
-            let account_id = field_json
-                .pointer("/result/data/content/fields/value")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-
-            if account_id.is_empty() {
-                continue;
-            }
-
-            // Fetch the actual MemoryAccount to check delegate_keys
-            match verify_delegate_key_onchain(
-                http_client,
-                rpc_url,
-                account_id,
-                public_key_bytes,
-            )
-            .await
-            {
-                Ok(owner) => {
-                    tracing::info!(
-                        "found account for delegate key via registry scan: {}",
-                        account_id
-                    );
-                    return Ok((account_id.to_string(), owner));
-                }
-                Err(OnchainVerifyError::KeyNotFound(_)) => {
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            }
-        }
-
-        // Check for next page
-        let next_cursor = result
-            .get("nextCursor")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let has_next = result
-            .get("hasNextPage")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if !has_next || next_cursor.is_none() {
-            break;
-        }
-        cursor = next_cursor;
-    }
-
-    Err(OnchainVerifyError::KeyNotFound(
-        "Delegate key not found in any account in the registry".into(),
-    ))
+fn parse_u64_json(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
 }
 
-// ============================================================
-// Types for JSON-RPC response parsing
-// ============================================================
+fn addresses_equal(a: &str, b: &str) -> bool {
+    a.trim_start_matches("0x")
+        .eq_ignore_ascii_case(b.trim_start_matches("0x"))
+}
 
 #[derive(Debug, Deserialize)]
 struct RpcResponse {
@@ -322,17 +231,13 @@ struct ObjectContent {
     fields: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-// ============================================================
-// Error types
-// ============================================================
-
 #[derive(Debug)]
 pub enum OnchainVerifyError {
     RpcError(String),
     KeyNotFound(String),
-    /// MED-2: Returned when MemoryAccount.active == false.
-    /// Prevents deactivated accounts from authenticating.
     MemoryAccountDeactivated(String),
+    SubAgentInactive(String),
+    MissingCapability(String),
 }
 
 impl std::fmt::Display for OnchainVerifyError {
@@ -341,180 +246,38 @@ impl std::fmt::Display for OnchainVerifyError {
             OnchainVerifyError::RpcError(msg) => write!(f, "MySo RPC error: {}", msg),
             OnchainVerifyError::KeyNotFound(msg) => write!(f, "Key not found: {}", msg),
             OnchainVerifyError::MemoryAccountDeactivated(msg) => write!(f, "Account deactivated: {}", msg),
+            OnchainVerifyError::SubAgentInactive(msg) => write!(f, "Sub-agent inactive: {}", msg),
+            OnchainVerifyError::MissingCapability(msg) => write!(f, "Missing capability: {}", msg),
         }
     }
 }
 
 impl std::error::Error for OnchainVerifyError {}
 
-// ============================================================
-// Unit Tests
-// ============================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ---- MED-2: MemoryAccountDeactivated error variant ----
-
     #[test]
-    fn test_account_deactivated_display() {
-        let err = OnchainVerifyError::MemoryAccountDeactivated("Account 0xabc has been deactivated".into());
-        assert!(err.to_string().contains("deactivated"));
+    fn derived_address_is_deterministic() {
+        let pk = [7u8; 32];
+        let a = derived_address_from_public_key(&pk);
+        let b = derived_address_from_public_key(&pk);
+        assert_eq!(a, b);
+        assert!(a.starts_with("0x"));
+        assert_eq!(a.len(), 66);
     }
 
     #[test]
-    fn test_key_not_found_display() {
-        let err = OnchainVerifyError::KeyNotFound("Key not in 3 delegate key(s)".into());
-        assert!(err.to_string().contains("Key not found"));
+    fn capability_check_requires_all_bits() {
+        assert!(has_capability(3, CAP_MEMORY_READ));
+        assert!(has_capability(3, CAP_MEMORY_WRITE));
+        assert!(!has_capability(CAP_MEMORY_READ, CAP_MEMORY_WRITE));
     }
 
     #[test]
-    fn test_rpc_error_display() {
-        let err = OnchainVerifyError::RpcError("HTTP request failed".into());
-        assert!(err.to_string().contains("MySo RPC error"));
-    }
-
-    #[test]
-    fn test_error_variants_are_distinct() {
-        // Confirm MemoryAccountDeactivated is separate from KeyNotFound
-        // (different auth failure modes → different handling in resolve_account)
-        let deactivated = OnchainVerifyError::MemoryAccountDeactivated("msg".into());
-        let not_found = OnchainVerifyError::KeyNotFound("msg".into());
-        // Both are Err variants but must match differently:
-        assert!(matches!(deactivated, OnchainVerifyError::MemoryAccountDeactivated(_)));
-        assert!(matches!(not_found, OnchainVerifyError::KeyNotFound(_)));
-    }
-
-    // ── MED-2: Deactivated account field parsing ────────────────────────
-
-    #[test]
-    fn test_active_field_parsed_correctly() {
-        // Simulate the JSON field extraction the code does:
-        // fields.get("active").and_then(|v| v.as_bool()).unwrap_or(true)
-
-        // active: true → account is active
-        let fields_active: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"active": true, "owner": "0xabc"}"#).unwrap();
-        let active = fields_active.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-        assert!(active);
-
-        // active: false → account is deactivated
-        let fields_inactive: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"active": false, "owner": "0xabc"}"#).unwrap();
-        let inactive = fields_inactive.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-        assert!(!inactive);
-
-        // active field missing → defaults to true (backward compat)
-        let fields_missing: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"owner": "0xabc"}"#).unwrap();
-        let missing = fields_missing.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-        assert!(missing, "missing 'active' field should default to true");
-
-        // active field is a string (malformed) → defaults to true
-        let fields_string: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"active": "false", "owner": "0xabc"}"#).unwrap();
-        let string_val = fields_string.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
-        assert!(string_val, "string 'false' should not be treated as bool false");
-    }
-
-    // ── Delegate key matching — public key as JSON array ────────────────
-
-    #[test]
-    fn test_public_key_to_json_array_conversion() {
-        // Test the exact conversion done in verify_delegate_key_onchain
-        let pk_bytes: [u8; 32] = [
-            1, 2, 3, 4, 5, 6, 7, 8,
-            9, 10, 11, 12, 13, 14, 15, 16,
-            17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26, 27, 28, 29, 30, 31, 32,
-        ];
-
-        let pk_as_numbers: Vec<serde_json::Value> = pk_bytes
-            .iter()
-            .map(|&b| serde_json::Value::Number(b.into()))
-            .collect();
-
-        assert_eq!(pk_as_numbers.len(), 32);
-        assert_eq!(pk_as_numbers[0], serde_json::json!(1));
-        assert_eq!(pk_as_numbers[31], serde_json::json!(32));
-    }
-
-    #[test]
-    fn test_delegate_key_matching_in_struct() {
-        // Simulate array comparison used in the verification loop
-        let pk_bytes: &[u8] = &[10, 20, 30];
-        let pk_as_numbers: Vec<serde_json::Value> = pk_bytes
-            .iter()
-            .map(|&b| serde_json::Value::Number(b.into()))
-            .collect();
-
-        // Matching stored key
-        let stored_key = serde_json::json!([10, 20, 30]);
-        let stored_arr = stored_key.as_array().unwrap();
-        assert_eq!(*stored_arr, pk_as_numbers, "matching key should be Equal");
-
-        // Non-matching stored key
-        let wrong_key = serde_json::json!([10, 20, 31]);
-        let wrong_arr = wrong_key.as_array().unwrap();
-        assert_ne!(*wrong_arr, pk_as_numbers, "different key should NOT match");
-    }
-
-    #[test]
-    fn test_delegate_key_in_fields_wrapper() {
-        // Test the delegate key extraction with the "fields" wrapper pattern
-        let dk_json = serde_json::json!({
-            "fields": {
-                "public_key": [1, 2, 3],
-                "label": "test-key",
-                "created_at": "123456"
-            }
-        });
-
-        let dk_fields = dk_json.get("fields").or(Some(&dk_json));
-        let stored_key = dk_fields.and_then(|f| f.get("public_key"));
-        assert!(stored_key.is_some());
-        assert_eq!(stored_key.unwrap().as_array().unwrap(), &vec![
-            serde_json::json!(1),
-            serde_json::json!(2),
-            serde_json::json!(3),
-        ]);
-    }
-
-    #[test]
-    fn test_delegate_key_without_fields_wrapper() {
-        // Test the fallback when there's no "fields" wrapper
-        let dk_json = serde_json::json!({
-            "public_key": [4, 5, 6],
-            "label": "test-key"
-        });
-
-        let dk_fields = dk_json.get("fields").or(Some(&dk_json));
-        let stored_key = dk_fields.and_then(|f| f.get("public_key"));
-        assert!(stored_key.is_some());
-        assert_eq!(stored_key.unwrap().as_array().unwrap(), &vec![
-            serde_json::json!(4),
-            serde_json::json!(5),
-            serde_json::json!(6),
-        ]);
-    }
-
-    // ── OnchainVerifyError: Display correctness ─────────────────────────
-
-    #[test]
-    fn test_account_deactivated_display_includes_account_id() {
-        let err = OnchainVerifyError::MemoryAccountDeactivated("Account 0xabc has been deactivated".into());
-        let display = err.to_string();
-        assert!(display.contains("deactivated"));
-        assert!(display.contains("0xabc"));
-    }
-
-    #[test]
-    fn test_error_is_std_error() {
-        // Verify OnchainVerifyError implements std::error::Error
-        let err: Box<dyn std::error::Error> =
-            Box::new(OnchainVerifyError::MemoryAccountDeactivated("test".into()));
-        assert!(err.to_string().contains("deactivated"));
+    fn addresses_equal_ignores_case_and_prefix() {
+        assert!(addresses_equal("0xAbCd", "0xabcd"));
+        assert!(addresses_equal("AbCd", "0xabcd"));
     }
 }
-

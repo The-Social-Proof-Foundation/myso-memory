@@ -26,13 +26,14 @@ All `/api/*` routes require signed headers. The SDK handles this automatically.
 | Header | Description |
 |--------|-------------|
 | `x-account-id` | MemoryAccount object ID hint — speeds up account resolution when not cached |
-| `x-delegate-key` | Delegate private key (hex) — used by the default SDK for MYDATA decrypt flows |
+| `x-delegate-key` | Sub-agent private key (hex) — legacy header for MYDATA decrypt flows |
+| `x-mydata-session` | Preferred MYDATA SessionKey export (base64 JSON) |
 
 ### Signature Format
 
-The signed message is: `{timestamp}.{method}.{path}.{body_sha256}`
+The signed message is: `{timestamp}.{method}.{path}.{body_sha256}.{nonce}.{account_id}`
 
-The relayer verifies the Ed25519 signature, then resolves the owner by looking up the public key in onchain `MemoryAccount.delegate_keys`.
+The relayer verifies the Ed25519 signature, derives `derived_address` from the public key, resolves the sub-agent via `SOCIAL_SERVER_URL` + `sub_agent_cache`, and on-chain verifies capabilities.
 
 ## Public Routes
 

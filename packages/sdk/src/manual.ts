@@ -54,6 +54,8 @@ const DEFAULT_KEY_SERVERS: Record<string, string[]> = {
     ],
 };
 
+const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
+
 // ============================================================
 // MemoryManual Client
 // ============================================================
@@ -374,10 +376,11 @@ export class MemoryManual {
                 );
                 const tx = new Transaction();
                 tx.moveCall({
-                    target: `${this.config.packageId}::account::approve_key_policy`,
+                    target: `${this.config.packageId}::memory::approve_key_policy`,
                     arguments: [
                         tx.pure("vector<u8>", idBytes),
                         tx.object(this.config.accountId),
+                        tx.object(MYSO_CLOCK),
                     ],
                 });
                 const txBytes = await tx.build({ client: mysoClient, onlyTransactionKind: true });

@@ -1,21 +1,35 @@
----
-title: "Onchain Events"
----
+# On-Chain Events
 
-The indexer listens to MySo events emitted by the Memory contract and uses them to update local backend state.
+The social indexer (myso-core `myso-indexer-alt-social`, memory handler) processes events from `social_contracts::memory`.
 
-## Events
+## Sub-agent lifecycle
 
-The Memory contract emits the following events:
+| Event | Meaning | Key fields |
+|-------|---------|------------|
+| `SubAgentRegistered` | New sub-agent | `account_id`, `agent_object_id`, `derived_address`, `capabilities` |
+| `SubAgentUpdated` | Metadata change | `account_id`, `agent_object_id` |
+| `SubAgentDeactivated` | Agent deactivated | `account_id`, `derived_address` |
+| `SubAgentRevoked` | Agent removed | `account_id`, `derived_address` |
+| `SubAgentsClearedOnTransfer` | Bulk revoke on profile transfer | `account_id`, `revoked_count` |
 
-| Event | Emitted when | Fields |
-|-------|-------------|--------|
-| `MemoryAccountMigrated` | A new account is created | `account_id`, `owner` |
-| `MemoryDelegateKeyAdded` | A delegate key is added | `account_id`, `public_key`, `derived_address`, `label` |
-| `MemoryDelegateKeyRemoved` | A delegate key is removed | `account_id`, `public_key` |
-| `MemoryAccountDeactivated` | An account is frozen | `account_id`, `owner` |
-| `MemoryAccountReactivated` | A frozen account is unfrozen | `account_id`, `owner` |
+## Account lifecycle
 
-## Current Coverage
+| Event | Meaning |
+|-------|---------|
+| `MemoryAccountCreated` | Account linked to profile |
+| Account active/deactive events | Account-level enable/disable |
 
-The indexer currently targets the `MemoryAccountMigrated` event flow as its primary sync path. Delegate key events and account activation events are part of the broader design and may be indexed in future iterations.
+## Social API
+
+The social server exposes indexed sub-agents for relayer auth:
+
+```
+GET /sub-agents/:derivedAddress
+→ { agent_object_id, derived_address, account_id, capabilities, active }
+```
+
+The memory relayer uses this endpoint before on-chain verification.
+
+## Cache invalidation
+
+The relayer's `sub_agent_cache` should be evicted when agents are deactivated, revoked, or accounts transfer. Today this uses TTL + on-chain re-verify; webhook or poll-based invalidation is planned for hardening.

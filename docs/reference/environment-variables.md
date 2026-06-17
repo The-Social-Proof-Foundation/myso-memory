@@ -33,9 +33,10 @@ These are not all enforced at boot, but most real deployments need them.
 | `MYSO_NETWORK` | `mainnet` | Picks the fallback RPC URL and network-driven service defaults |
 | `MYSO_RPC_URL` | network default | Override the MySo fullnode URL |
 | `FILE_STORAGE_PUBLISHER_URL` | File Storage mainnet publisher | Override upload endpoint |
+| `SOCIAL_SERVER_URL` | `http://127.0.0.1:9126` | Social API base URL for sub-agent lookup |
 | `FILE_STORAGE_AGGREGATOR_URL` | File Storage mainnet aggregator | Override download endpoint |
 | `SERVER_MYSO_PRIVATE_KEYS` | none | Comma-separated upload key pool. Takes priority over `SERVER_MYSO_PRIVATE_KEY` for uploads |
-| `MEMORY_ACCOUNT_ID` | none | Optional account ID in server config |
+| `MEMORY_ACCOUNT_ID` | none | Optional default MemoryAccount ID in server config |
 | `FILE_STORAGE_PACKAGE_ID` | network default | Override the File Storage on-chain package used by the sidecar |
 | `FILE_STORAGE_UPLOAD_RELAY_URL` | network default | Override the File Storage upload relay used by the sidecar |
 | `ENOKI_API_KEY` | none | Optional Enoki key for sponsored sidecar transactions |

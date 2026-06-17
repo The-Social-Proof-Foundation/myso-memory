@@ -36,8 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # HTTP client (for MySo RPC onchain verification)
 reqwest = { version = "0.12", features = ["json"] }
 
-# File Storage SDK
-file_storage_rs = "0.1"
+# File Storage SDK — downloads use aggregator HTTP directly (see file-storage.rs)
 
 # Async utilities
 futures = "0.3"
@@ -50,3 +49,4 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 base64 = "0.22"
 percent-encoding = "2"
+blake2 = "0.10"

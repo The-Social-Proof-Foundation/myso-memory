@@ -9,28 +9,19 @@ use redis::AsyncCommands;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
-use crate::myso::{find_account_by_delegate_key, verify_delegate_key_onchain};
+use crate::myso::{
+    derived_address_from_public_key, verify_sub_agent_onchain, CAP_MEMORY_READ, CAP_MEMORY_WRITE,
+};
+use crate::social::{fetch_sub_agent_by_derived_address, SocialApiError};
 use crate::types::{AppState, AuthInfo};
 
-/// Ed25519 signature verification + onchain delegate key verification middleware
-///
-/// Expects these headers:
-/// - `x-public-key`: hex-encoded Ed25519 public key (32 bytes)
-/// - `x-signature`: hex-encoded Ed25519 signature (64 bytes)
-/// - `x-timestamp`: Unix timestamp (seconds)
-/// - `x-account-id` (optional): account object ID hint (skips cache/registry lookup)
+/// Sub-agent signature verification + on-chain capability checks.
 ///
 /// Flow:
-/// 1. Verify Ed25519 signature: `{timestamp}.{method}.{path}.{body_sha256}`
-/// 2. Resolve account: cache → indexed accounts → registry scan → header hint → config fallback
-/// 3. Verify onchain: public_key ∈ MemoryAccount.delegate_keys
-/// 4. Cache the mapping for future requests
-/// 5. Store AuthInfo { public_key, owner } in request extensions
-/// LOW-2 fix: Normalize response timing across all auth failure paths.
-/// Returns UNAUTHORIZED after a constant 100 ms delay so that an attacker
-/// cannot distinguish "account does not exist" (fast RPC fail) from
-/// "account exists but key not found" (slow delegate_keys array scan)
-/// by measuring response latency.
+/// 1. Verify Ed25519 signature
+/// 2. Resolve sub-agent: cache → social API → account-id fallback
+/// 3. Verify on-chain SubAgent + MemoryAccount
+/// 4. Cache mapping for future requests
 async fn constant_time_reject() -> StatusCode {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     StatusCode::UNAUTHORIZED
@@ -72,9 +63,8 @@ pub async fn verify_signature(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    // Optional delegate private key (hex) for MYDATA decrypt — legacy path.
-    // Modern clients send `x-mydata-session` instead (ENG-1697).
-    let delegate_key_hex = headers
+    // Optional sub-agent private key (hex) for MYDATA decrypt — legacy header name.
+    let sub_agent_key_hex = headers
         .get("x-delegate-key")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
@@ -88,14 +78,12 @@ pub async fn verify_signature(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    if mydata_session.is_some() && delegate_key_hex.is_some() {
+    if mydata_session.is_some() && sub_agent_key_hex.is_some() {
         tracing::debug!(
             "both x-mydata-session and x-delegate-key present; preferring x-mydata-session"
         );
     }
-    if mydata_session.is_none() && delegate_key_hex.is_some() {
-        // ENG-1697 telemetry: log (without value) so we can count legacy
-        // header usage per SDK version during the deprecation window.
+    if mydata_session.is_none() && sub_agent_key_hex.is_some() {
         tracing::warn!(
             target: "memory::deprecation",
             "request using legacy x-delegate-key header — client should upgrade to SDK v0.4+ (x-mydata-session)"
@@ -231,25 +219,41 @@ pub async fn verify_signature(
         }
     }
 
-    // Step 2: Resolve account — cache → indexed accounts → registry scan → header hint → config fallback
-    // LOW-2: Always use constant_time_reject so that timing of the resolution error
-    // ("account not found" vs "key not in account") cannot be observed by callers.
-    let (account_id, owner) = match resolve_account(&state, &public_key_hex, &pk_array, account_id_hint).await {
-        Ok(pair) => pair,
+    let required_cap = required_capability_for_path(method.as_str(), path.as_str());
+
+    // Step 2: Resolve sub-agent
+    let resolved = match resolve_sub_agent(
+        &state,
+        &public_key_hex,
+        &pk_array,
+        account_id_hint,
+        required_cap,
+    )
+    .await
+    {
+        Ok(info) => info,
         Err(e) => {
-            tracing::warn!("Account resolution failed: {}", e);
+            tracing::warn!("Sub-agent resolution failed: {}", e);
             return Err(constant_time_reject().await);
         }
     };
 
-    tracing::debug!("account resolved: {} (owner: {})", account_id, owner);
+    tracing::debug!(
+        "sub-agent resolved: account={} agent={} owner={}",
+        resolved.account_id,
+        resolved.agent_object_id,
+        resolved.owner
+    );
 
     // Store auth info in request extensions
     parts.extensions.insert(AuthInfo {
         public_key: public_key_hex,
-        owner,
-        account_id,
-        delegate_key: delegate_key_hex,
+        owner: resolved.owner,
+        account_id: resolved.account_id,
+        agent_object_id: resolved.agent_object_id,
+        derived_address: resolved.derived_address,
+        capabilities: resolved.capabilities,
+        sub_agent_key: sub_agent_key_hex,
         mydata_session,
     });
 
@@ -259,86 +263,140 @@ pub async fn verify_signature(
     Ok(next.run(request).await)
 }
 
-/// Resolve a delegate key to its account using multiple strategies:
-/// 1. PostgreSQL cache (fastest)
-/// 2. On-chain registry scan (slower, but auto-discovers)
-/// 3. Header hint or config fallback (manual)
-///
-/// After successful resolution, the mapping is cached for future requests.
-async fn resolve_account(
+struct ResolvedSubAgent {
+    account_id: String,
+    agent_object_id: String,
+    owner: String,
+    derived_address: String,
+    capabilities: u64,
+}
+
+fn required_capability_for_path(method: &str, path: &str) -> u64 {
+    if method != "POST" {
+        return CAP_MEMORY_READ;
+    }
+    if path.starts_with("/api/remember")
+        || path == "/api/analyze"
+        || path == "/api/restore"
+    {
+        CAP_MEMORY_WRITE
+    } else {
+        CAP_MEMORY_READ
+    }
+}
+
+async fn verify_and_cache_sub_agent(
+    state: &AppState,
+    public_key_hex: &str,
+    pk_bytes: &[u8; 32],
+    account_id: &str,
+    agent_object_id: &str,
+    required_cap: u64,
+) -> Result<ResolvedSubAgent, String> {
+    let verified = verify_sub_agent_onchain(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        account_id,
+        agent_object_id,
+        pk_bytes,
+        required_cap,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let _ = state
+        .db
+        .cache_sub_agent(
+            public_key_hex,
+            &verified.derived_address,
+            &verified.account_id,
+            &verified.agent_object_id,
+            &verified.owner,
+            verified.capabilities as i64,
+        )
+        .await;
+
+    Ok(ResolvedSubAgent {
+        account_id: verified.account_id,
+        agent_object_id: verified.agent_object_id,
+        owner: verified.owner,
+        derived_address: verified.derived_address,
+        capabilities: verified.capabilities,
+    })
+}
+
+/// Resolve a sub-agent using cache → social API → account-id fallback.
+async fn resolve_sub_agent(
     state: &AppState,
     public_key_hex: &str,
     pk_bytes: &[u8; 32],
     account_id_hint: Option<String>,
-) -> Result<(String, String), String> {
-    // Strategy 1: Check PostgreSQL cache
-    if let Ok(Some((cached_account_id, _cached_owner))) =
-        state.db.get_cached_account(public_key_hex).await
-    {
-        // Verify the cached mapping is still valid onchain
-        match verify_delegate_key_onchain(
-            &state.http_client,
-            &state.config.myso_rpc_url,
-            &cached_account_id,
+    required_cap: u64,
+) -> Result<ResolvedSubAgent, String> {
+    let derived_address = derived_address_from_public_key(pk_bytes);
+
+    if let Ok(Some(cached)) = state.db.get_cached_sub_agent(public_key_hex).await {
+        match verify_and_cache_sub_agent(
+            state,
+            public_key_hex,
             pk_bytes,
+            &cached.account_id,
+            &cached.agent_object_id,
+            required_cap,
         )
         .await
         {
-            Ok(owner) => {
-                tracing::debug!("account resolved from cache: {}", cached_account_id);
-                return Ok((cached_account_id, owner));
+            Ok(resolved) => {
+                tracing::debug!("sub-agent resolved from cache");
+                return Ok(resolved);
             }
-            Err(_) => {
-                // LOW-3 fix: Key was revoked on-chain. Delete the stale cache row
-                // immediately so subsequent requests don't loop: cache-hit → RPC fail →
-                // fall-through, burning RPC quota and generating log noise on every call.
+            Err(e) => {
                 tracing::warn!(
-                    "delegate key {} revoked on-chain for account {}; evicting from cache",
+                    "cached sub-agent {} invalid on-chain: {}",
                     public_key_hex,
-                    cached_account_id
+                    e
                 );
-                let _ = state.db.delete_cached_key(public_key_hex).await;
+                let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
             }
         }
     }
 
-    // Strategy 2: Scan MemoryRegistry on-chain
-    match find_account_by_delegate_key(
+    match fetch_sub_agent_by_derived_address(
         &state.http_client,
-        &state.config.myso_rpc_url,
-        &state.config.registry_id,
-        pk_bytes,
+        &state.config.social_server_url,
+        &derived_address,
     )
     .await
     {
-        Ok((account_id, owner)) => {
-            // Cache for future requests
-            let _ = state.db.cache_delegate_key(public_key_hex, &account_id, &owner).await;
-            return Ok((account_id, owner));
+        Ok(indexed) => {
+            if !indexed.active {
+                return Err("sub-agent inactive in social index".to_string());
+            }
+            if let Some(ref hint) = account_id_hint {
+                if hint != &indexed.account_id {
+                    return Err("x-account-id does not match indexed sub-agent account".to_string());
+                }
+            }
+            return verify_and_cache_sub_agent(
+                state,
+                public_key_hex,
+                pk_bytes,
+                &indexed.account_id,
+                &indexed.agent_object_id,
+                required_cap,
+            )
+            .await;
+        }
+        Err(SocialApiError::NotFound) => {
+            return Err(format!(
+                "sub-agent not found for derived address {} — register via memory::register_sub_agent",
+                derived_address
+            ));
         }
         Err(e) => {
-            tracing::debug!("registry scan did not find key: {}", e);
+            return Err(format!("social API lookup failed: {}", e));
         }
     }
-
-    // Strategy 3: Use header hint or config fallback
-    let fallback_account_id = account_id_hint
-        .or_else(|| state.config.memory_account_id.clone())
-        .ok_or_else(|| "no account found: not in cache, registry, or header".to_string())?;
-
-    let owner = verify_delegate_key_onchain(
-        &state.http_client,
-        &state.config.myso_rpc_url,
-        &fallback_account_id,
-        pk_bytes,
-    )
-    .await
-    .map_err(|e| format!("fallback account {} verification failed: {}", fallback_account_id, e))?;
-
-    // Cache for future requests
-    let _ = state.db.cache_delegate_key(public_key_hex, &fallback_account_id, &owner).await;
-
-    Ok((fallback_account_id, owner))
 }
 
 // ============================================================
@@ -611,18 +669,47 @@ mod tests {
     // cannot silently re-introduce a requirement on the header.
 
     #[test]
-    fn auth_info_valid_without_delegate_key_for_manual_routes() {
+    fn required_capability_write_routes() {
+        assert_eq!(
+            required_capability_for_path("POST", "/api/remember"),
+            CAP_MEMORY_WRITE
+        );
+        assert_eq!(
+            required_capability_for_path("POST", "/api/analyze"),
+            CAP_MEMORY_WRITE
+        );
+        assert_eq!(
+            required_capability_for_path("POST", "/api/restore"),
+            CAP_MEMORY_WRITE
+        );
+    }
+
+    #[test]
+    fn required_capability_read_routes() {
+        assert_eq!(
+            required_capability_for_path("POST", "/api/recall"),
+            CAP_MEMORY_READ
+        );
+        assert_eq!(
+            required_capability_for_path("GET", "/api/recall"),
+            CAP_MEMORY_READ
+        );
+    }
+
+    #[test]
+    fn auth_info_valid_without_sub_agent_key_for_manual_routes() {
         let auth = AuthInfo {
             public_key: "abcd".to_string(),
             owner: "0xowner".to_string(),
             account_id: "0xaccount".to_string(),
-            delegate_key: None,
+            agent_object_id: "0xagent".to_string(),
+            derived_address: "0xderived".to_string(),
+            capabilities: CAP_MEMORY_READ,
+            sub_agent_key: None,
             mydata_session: None,
         };
-        assert!(auth.delegate_key.is_none());
+        assert!(auth.sub_agent_key.is_none());
         assert!(auth.mydata_session.is_none());
-        // Verify Debug impl still redacts (LOW-5 / ENG-1697) — even in
-        // Manual mode we must never leak any credential material in logs.
         let debug_str = format!("{:?}", auth);
         assert!(debug_str.contains("None"));
         assert!(!debug_str.contains("<redacted>"));

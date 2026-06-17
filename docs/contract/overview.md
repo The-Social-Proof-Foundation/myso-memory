@@ -1,113 +1,53 @@
----
-title: "Smart Contract Overview"
----
+# Memory Contract Overview
 
-The smart contract (`social_contracts::memory`) defines the onchain account model for Memory. It is a Move module deployed on MySo.
+The Memory smart contract lives in `social_contracts::memory` (package `myso-social`). Each human owner has a **MemoryAccount** linked from their **Profile**. Agents access memory through **SubAgents** — shared on-chain objects keyed by `derived_address`.
 
-## Network IDs
+## Core objects
 
-These are the onchain IDs for the current public Memory deployments:
+| Object | Role |
+|--------|------|
+| **MemoryRegistry** | Global registry of MemoryAccounts (creation + lookup) |
+| **MemoryAccount** | One per profile owner; holds an auth mirror of registered sub-agents |
+| **SubAgent** | Shared object per agent; stores public key, capabilities, hierarchy, expiry, `active` |
 
-### Staging (Testnet)
+## Signers
 
-```env
-MYSO_NETWORK=testnet
-MEMORY_PACKAGE_ID=0xcf6ad755a1cdff7217865c796778fabe5aa399cb0cf2eba986f4b582047229c6
-MEMORY_REGISTRY_ID=0xe80f2feec1c139616a86c9f71210152e2a7ca552b20841f2e192f99f75864437
+Sub-agents sign transactions and MYDATA SessionKeys as their **`derived_address`**:
+
+```
+derived_address = Blake2b-256(0x00 || ed25519_public_key_32_bytes)
 ```
 
-### Production (Mainnet)
+This matches `Ed25519PublicKey.toMySoAddress()` in the MySo SDK.
 
-```env
-MYSO_NETWORK=mainnet
-MEMORY_PACKAGE_ID=0xcee7a6fd8de52ce645c38332bde23d4a30fd9426bc4681409733dd50958a24c6
-MEMORY_REGISTRY_ID=0x0da982cefa26864ae834a8a0504b904233d49e20fcc17c373c8bed99c75a7edd
-```
+## Capabilities
 
-For relayer setup and environment variable usage, see [Self-Hosting](/relayer/self-hosting) and [Environment Variables](/reference/environment-variables).
+Memory access is gated by capability bits on each SubAgent:
 
-## What It Manages
+| Bit | Constant | Meaning |
+|-----|----------|---------|
+| 1 | `CAP_MEMORY_READ` | Recall, search, decrypt |
+| 2 | `CAP_MEMORY_WRITE` | Remember, analyze, restore |
 
-- **Ownership** — who owns a Memory account
-- **Delegate keys** — which Ed25519 keys are authorized to act through the relayer
-- **MYDATA access control** — who can decrypt encrypted memories via `approve_key_policy`
-- **Account lifecycle** — activation and deactivation (freeze/unfreeze)
+The relayer checks the required capability for each route after resolving the sub-agent via the social API and on-chain verification.
 
-The contract does not store memory content — it only manages identity, permissions, and access control.
+## MYDATA
 
-## Key Objects
+`approve_key_policy(id, account, clock, ctx)` authorizes MYDATA key release for the owner or an active sub-agent with `CAP_MEMORY_READ`. The **Clock** shared object (`0x6`) is required so expiry checks are deterministic.
 
-### `MemoryRegistry`
+## Account creation
 
-A shared object created at module publish time. It tracks all MemoryAccount objects and prevents duplicate account creation (one account per MySo address).
-
-### `MemoryAccount`
-
-A shared object representing a single user's account. It stores:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `owner` | `address` | The MySo wallet address that owns this account |
-| `delegate_keys` | `vector<MemoryDelegateKey>` | List of authorized Ed25519 delegate keys |
-| `created_at` | `u64` | Timestamp when the account was created (epoch ms) |
-| `active` | `bool` | Whether the account is active (false = frozen) |
-
-### `MemoryDelegateKey`
-
-A struct stored inside `MemoryAccount.delegate_keys`:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `public_key` | `vector<u8>` | Ed25519 public key (32 bytes) |
-| `derived_address` | `address` | MySo address derived from this Ed25519 key |
-| `label` | `String` | Human-readable label (e.g., "MacBook Pro") |
-| `created_at` | `u64` | Timestamp when the key was added (epoch ms) |
-
-## Limits
-
-- **Maximum delegate keys per account**: 20
-
-## Error Codes
-
-| Code | Name | Description |
-|------|------|-------------|
-| 0 | `EDelegateKeyAlreadyExists` | Key already registered in this account |
-| 1 | `EDelegateKeyNotFound` | Key not found when trying to remove |
-| 2 | `ETooManyDelegateKeys` | Account has reached the 20-key limit |
-| 3 | `EAccountAlreadyExists` | Address already has an account |
-| 4 | `ENotOwner` | Caller is not the account owner |
-| 5 | `EInvalidPublicKeyLength` | Public key is not exactly 32 bytes |
-| 6 | `EMemoryAccountDeactivated` | Account is frozen — operation denied |
-| 100 | `ENoAccess` | MYDATA access denied — caller is neither owner nor delegate |
-
-## Entry Functions
-
-| Function | Description |
-|----------|-------------|
-| `create_account(registry, clock)` | Create a new MemoryAccount (one per address) |
-| `add_delegate_key(account, public_key, derived_address, label, clock)` | Add a delegate key (owner only) |
-| `remove_delegate_key(account, public_key)` | Remove a delegate key (owner only) |
-| `deactivate_account(account)` | Freeze the account — MYDATA access denied, keys locked (owner only) |
-| `reactivate_account(account)` | Unfreeze the account (owner only) |
-| `approve_key_policy(id, account)` | MYDATA policy — authorizes owner or delegate key holder to decrypt |
-
-## View Functions
-
-| Function | Description |
-|----------|-------------|
-| `is_delegate(account, public_key)` | Check if a public key is an authorized delegate |
-| `is_delegate_address(account, addr)` | Check if a MySo address is an authorized delegate |
-| `owner(account)` | Get the owner address |
-| `delegate_count(account)` | Get the number of delegate keys |
-| `has_account(registry, addr)` | Check if an address already has an account |
-| `is_active(account)` | Check if the account is active |
+MemoryAccounts are created through the profile flow (`memory::create_account_for_profile`), not a standalone `::account::` module. Legacy profiles can backfill via `profile::ensure_memory_account`.
 
 ## Events
 
-| Event | Emitted when |
-|-------|-------------|
-| `MemoryAccountMigrated` | A new account is created |
-| `MemoryDelegateKeyAdded` | A delegate key is added to an account |
-| `MemoryDelegateKeyRemoved` | A delegate key is removed from an account |
-| `MemoryAccountDeactivated` | An account is frozen |
-| `MemoryAccountReactivated` | A frozen account is unfrozen |
+| Event | When |
+|-------|------|
+| `MemoryAccountCreated` | New account linked to a profile |
+| `SubAgentRegistered` | Sub-agent registered |
+| `SubAgentUpdated` | Label or metadata updated |
+| `SubAgentDeactivated` | Sub-agent deactivated (reversible) |
+| `SubAgentRevoked` | Sub-agent permanently removed |
+| `SubAgentsClearedOnTransfer` | All agents revoked on profile transfer |
+
+See [Sub-Agent Registration](/contract/delegate-key-management) for SDK setup and [Social Indexer](/indexer/purpose) for how account/sub-agent state is indexed.

@@ -1,13 +1,11 @@
 /**
  * memory — SDK Client
  *
- * Ed25519 delegate key based client that communicates with the Memory
- * Rust server (TEE). All data processing (encryption, embedding, FileStorage)
- * happens server-side — the SDK just signs requests and sends text.
+ * Ed25519 sub-agent key client for the Memory Rust server (TEE).
+ * Encryption, embedding, and File Storage happen server-side; the SDK
+ * signs requests with a registered sub-agent key.
  *
- * The SDK only needs a single Ed25519 private key (the "delegate key").
- * The server derives the owner address from the public key via onchain
- * lookup in MemoryAccount.delegate_keys.
+ * The server resolves the sub-agent via social API + on-chain verification.
  *
  * @example
  * ```typescript

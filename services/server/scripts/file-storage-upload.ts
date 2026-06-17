@@ -104,7 +104,7 @@ async function main() {
     });
 
     // Create FileStorageClient with upload relay
-    const FileStorageClient = new FileStorageClient({
+    const fileStorageClient = new FileStorageClient({
         network: MYSO_NETWORK,
         mysoClient: mysoClient as any,
         uploadRelay: {
@@ -114,7 +114,7 @@ async function main() {
     });
 
     // writeBlobFlow is a stateful object — each step stores results internally
-    const flow = FileStorageClient.writeBlobFlow({
+    const flow = fileStorageClient.writeBlobFlow({
         blob: new Uint8Array(data),
     });
 

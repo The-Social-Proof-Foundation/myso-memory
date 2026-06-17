@@ -28,6 +28,7 @@ import { FileStorageClient } from "@socialproof/file-storage";
 // ============================================================
 
 const MYSO_NETWORK = (process.env.MYSO_NETWORK || "mainnet") as "mainnet" | "testnet";
+const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
 
 // MYDATA key server object IDs (comma-separated via env var). Duplicates are
 // ignored — @socialproof/mydata throws InvalidClientOptionsError if any repeat.
@@ -89,7 +90,7 @@ const mydataClient = new MyDataClient({
     verifyKeyServers: true,
 });
 
-const FileStorageClient = new FileStorageClient({
+const fileStorageClient = new FileStorageClient({
     network: MYSO_NETWORK,
     mysoClient: mysoClient as any,
     uploadRelay: {
@@ -457,6 +458,7 @@ app.post("/mydata/decrypt", async (req, res) => {
             arguments: [
                 tx.pure("vector<u8>", idBytes),
                 tx.object(accountId),
+                tx.object(MYSO_CLOCK),
             ],
         });
         const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
@@ -549,6 +551,7 @@ app.post("/mydata/decrypt-batch", express.json({ limit: "8mb" }), async (req, re
                 arguments: [
                     tx.pure("vector<u8>", idBytes),
                     tx.object(accountId),
+                    tx.object(MYSO_CLOCK),
                 ],
             });
         }
@@ -639,7 +642,7 @@ app.post("/file-storage/upload", express.json({ limit: "10mb" }), async (req, re
             const blobData = new Uint8Array(Buffer.from(data, "base64"));
 
             // writeBlobFlow (stateful: encode → register → upload → certify)
-            const flow = FileStorageClient.writeBlobFlow({ blob: blobData });
+            const flow = fileStorageClient.writeBlobFlow({ blob: blobData });
             await flow.encode();
 
             const registerTx = flow.register({

@@ -1,54 +1,61 @@
 /**
- * memory — Account Management
+ * memory — Sub-Agent Management
  *
- * On-chain account operations: create account, add/remove delegate keys.
- * Supports both wallet signing (browser) and private key signing (server-side).
+ * On-chain sub-agent operations against `social_contracts::memory`.
+ * Sub-agents sign as their `derived_address` (= Ed25519PublicKey.toMySoAddress()).
  *
  * @example
  * ```typescript
- * import { createAccount, addDelegateKey, generateDelegateKey } from "@socialproof/memory/account"
+ * import {
+ *   generateSubAgentKey,
+ *   registerSubAgent,
+ *   CAP_MEMORY_READ,
+ *   CAP_MEMORY_WRITE,
+ * } from "@socialproof/memory/account"
  *
- * // Generate a delegate keypair
- * const delegate = await generateDelegateKey()
+ * const agent = await generateSubAgentKey()
  *
- * // Create account (wallet mode — browser)
- * const account = await createAccount({
- *     packageId: "0x...",
- *     registryId: "0x...",
- *     walletSigner,
+ * await registerSubAgent({
+ *   packageId: "0x...",
+ *   accountId: "0x...",
+ *   publicKey: agent.publicKey,
+ *   label: "My Laptop",
+ *   walletSigner,
  * })
  *
- * // Add the delegate key
- * await addDelegateKey({
- *     packageId: "0x...",
- *     accountId: account.accountId,
- *     publicKey: delegate.publicKey,
- *     label: "My Laptop",
- *     walletSigner,
- * })
- *
- * // Now use the delegate key with the SDK
- * const memory = Memory.create({ key: delegate.privateKey, accountId: account.accountId })
+ * const memory = Memory.create({ key: agent.privateKey, accountId: "0x..." })
  * ```
  */
 
 import type {
     WalletSigner,
-    CreateAccountOpts,
-    CreateAccountResult,
-    AddDelegateKeyOpts,
-    AddDelegateKeyResult,
-    RemoveDelegateKeyOpts,
+    EnsureMemoryAccountOpts,
+    EnsureMemoryAccountResult,
+    RegisterSubAgentOpts,
+    RegisterSubAgentResult,
+    RegisterSubAgentDelegatedOpts,
+    DeactivateSubAgentOpts,
+    RevokeSubAgentOpts,
 } from "./types.js";
 import { bytesToHex, hexToBytes } from "./utils.js";
 
 // ============================================================
-// MYSO Clock object (shared, always 0x6)
+// Capability + identity constants (mirror memory.move)
 // ============================================================
+
+export const CAP_MEMORY_READ = 1;
+export const CAP_MEMORY_WRITE = 2;
+
+export const CLASS_DELEGATED_AI = 1;
+
+export const REGISTER_SCOPE_CHILD = 1;
+export const REGISTER_SCOPE_PEER = 2;
+export const REGISTER_SCOPE_BOTH = 3;
+
 const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
 
 // ============================================================
-// Internal: Build MySo client + signer
+// Internal helpers
 // ============================================================
 
 interface TxContext {
@@ -73,7 +80,6 @@ async function buildTxContext(opts: {
 
     const { Transaction } = await import("@socialproof/myso/transactions");
 
-    // Build MySo client
     let mysoClient: any;
     if (opts.mysoClient) {
         mysoClient = opts.mysoClient;
@@ -82,7 +88,7 @@ async function buildTxContext(opts: {
         const MySoClient = (mod as any).MySoClient;
         if (typeof MySoClient !== "function") {
             throw new Error(
-                "MySoClient not found. For @socialproof/myso v2.6.0+, pass mysoClient in opts."
+                "MySoClient not found. For @socialproof/myso v2.6.0+, pass mysoClient in opts.",
             );
         }
         const network = opts.mysoNetwork ?? "mainnet";
@@ -93,7 +99,6 @@ async function buildTxContext(opts: {
         mysoClient = new MySoClient({ url: urls[network] ?? urls.mainnet });
     }
 
-    // Build signer
     if (opts.walletSigner) {
         return {
             mysoClient,
@@ -120,10 +125,12 @@ async function signAndExecute(
     ctx: TxContext,
     tx: any,
 ): Promise<{ digest: string; effects: any }> {
-    if ("signAndExecuteTransaction" in ctx.signer && typeof ctx.signer.signAndExecuteTransaction === "function" && "address" in ctx.signer) {
-        // WalletSigner mode
+    if (
+        "signAndExecuteTransaction" in ctx.signer &&
+        typeof ctx.signer.signAndExecuteTransaction === "function" &&
+        "address" in ctx.signer
+    ) {
         const result = await ctx.signer.signAndExecuteTransaction({ transaction: tx });
-        // Wait for transaction to be confirmed
         const txResult = await ctx.mysoClient.waitForTransaction({
             digest: result.digest,
             options: { showEffects: true, showObjectChanges: true },
@@ -131,7 +138,6 @@ async function signAndExecute(
         return { digest: result.digest, effects: txResult };
     }
 
-    // Keypair mode
     const result = await ctx.mysoClient.signAndExecuteTransaction({
         signer: ctx.signer,
         transaction: tx,
@@ -143,158 +149,228 @@ async function signAndExecute(
     return { digest: result.digest, effects: txResult };
 }
 
+function normalizePublicKey(publicKey: Uint8Array | string): Uint8Array {
+    const pkBytes =
+        typeof publicKey === "string" ? hexToBytes(publicKey) : publicKey;
+    if (pkBytes.length !== 32) {
+        throw new Error(`Invalid Ed25519 public key length: ${pkBytes.length} (expected 32)`);
+    }
+    return pkBytes;
+}
+
+export async function deriveMySoAddressFromPublicKey(
+    publicKey: Uint8Array | string,
+): Promise<string> {
+    const pkBytes = normalizePublicKey(publicKey);
+    const { blake2b } = await import("@noble/hashes/blake2.js");
+    const input = new Uint8Array(33);
+    input[0] = 0x00;
+    input.set(pkBytes, 1);
+    const addressBytes = blake2b(input, { dkLen: 32 });
+    return "0x" + bytesToHex(addressBytes);
+}
+
+function extractSubAgentObjectId(effects: any): string {
+    const objectChanges = effects?.objectChanges ?? [];
+    for (const change of objectChanges) {
+        if (
+            change.type === "created" &&
+            change.objectType?.includes("::memory::SubAgent")
+        ) {
+            return change.objectId;
+        }
+    }
+    return "";
+}
+
+function extractMemoryAccountIdFromProfile(effects: any): string {
+    const objectChanges = effects?.objectChanges ?? [];
+    for (const change of objectChanges) {
+        if (change.type === "mutated" && change.objectType?.includes("::profile::Profile")) {
+            // Profile mutation does not expose fields in objectChanges; caller may need RPC follow-up.
+            break;
+        }
+    }
+    for (const change of objectChanges) {
+        if (
+            change.type === "created" &&
+            change.objectType?.includes("::memory::MemoryAccount")
+        ) {
+            return change.objectId;
+        }
+    }
+    return "";
+}
+
 // ============================================================
-// createAccount
+// ensureMemoryAccount
 // ============================================================
 
 /**
- * Create a new MemoryAccount on-chain.
- *
- * Calls `{packageId}::account::create_account(registry, clock)`.
- * Each address can only create ONE account (enforced by the contract).
- *
- * @returns CreateAccountResult with accountId, owner, and tx digest
+ * Link a MemoryAccount to a profile that was created before Memory integration.
+ * Calls `{packageId}::profile::ensure_memory_account`.
  */
-export async function createAccount(
-    opts: CreateAccountOpts,
-): Promise<CreateAccountResult> {
+export async function ensureMemoryAccount(
+    opts: EnsureMemoryAccountOpts,
+): Promise<EnsureMemoryAccountResult> {
     const ctx = await buildTxContext(opts);
     const { Transaction } = ctx;
 
     const tx = new Transaction();
     tx.moveCall({
-        target: `${opts.packageId}::account::create_account`,
+        target: `${opts.packageId}::profile::ensure_memory_account`,
         arguments: [
             tx.object(opts.registryId),
+            tx.object(opts.profileId),
             tx.object(MYSO_CLOCK),
         ],
     });
 
     const { digest, effects } = await signAndExecute(ctx, tx);
+    const accountId = extractMemoryAccountIdFromProfile(effects);
 
-    // Extract the created MemoryAccount object ID from object changes
-    let accountId = "";
-    const objectChanges = effects?.objectChanges ?? [];
-    for (const change of objectChanges) {
-        if (
-            change.type === "created" &&
-            change.objectType?.includes("::account::MemoryAccount")
-        ) {
-            accountId = change.objectId;
-            break;
-        }
-    }
+    return { digest, accountId };
+}
 
-    if (!accountId) {
-        // Fallback: try to find from effects
-        const created = effects?.effects?.created ?? [];
-        for (const obj of created) {
-            if (obj.owner?.Shared !== undefined) {
-                accountId = obj.reference?.objectId ?? "";
-                break;
-            }
-        }
-    }
+// ============================================================
+// registerSubAgent
+// ============================================================
+
+/**
+ * Register a root-level sub-agent on a MemoryAccount (human owner only).
+ * Default: delegated AI with memory read + write caps.
+ */
+export async function registerSubAgent(
+    opts: RegisterSubAgentOpts,
+): Promise<RegisterSubAgentResult> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+
+    const pkBytes = normalizePublicKey(opts.publicKey);
+    const derivedAddress = await deriveMySoAddressFromPublicKey(pkBytes);
+
+    const identityClass = opts.identityClass ?? CLASS_DELEGATED_AI;
+    const roleTags = opts.roleTags ?? 0;
+    const capabilities =
+        opts.capabilities ?? (CAP_MEMORY_READ | CAP_MEMORY_WRITE);
+    const delegatableCaps = opts.delegatableCaps ?? 0;
+    const registerScope = opts.registerScope ?? REGISTER_SCOPE_BOTH;
+    const approvalRequiredCaps = opts.approvalRequiredCaps ?? 0;
+
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::register_sub_agent`,
+        arguments: [
+            tx.object(opts.accountId),
+            tx.pure("vector<u8>", Array.from(pkBytes)),
+            tx.pure("address", derivedAddress),
+            tx.pure("string", opts.label),
+            tx.pure("u8", identityClass),
+            tx.pure("u64", roleTags),
+            tx.pure("u64", capabilities),
+            tx.pure("u64", delegatableCaps),
+            tx.pure("u8", registerScope),
+            tx.pure("u64", approvalRequiredCaps),
+            tx.pure("option<u64>", opts.maxActionSpend ?? null),
+            tx.pure("option<address>", opts.platformScope ?? null),
+            tx.pure("option<u64>", opts.expiresAt ?? null),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+
+    const { digest, effects } = await signAndExecute(ctx, tx);
+    const agentObjectId = extractSubAgentObjectId(effects);
 
     return {
-        accountId,
-        owner: ctx.address,
         digest,
+        publicKey: bytesToHex(pkBytes),
+        derivedAddress,
+        agentObjectId,
     };
 }
 
 // ============================================================
-// addDelegateKey
+// registerSubAgentDelegated
 // ============================================================
 
-/**
- * Add a delegate key to a MemoryAccount.
- *
- * Calls `{packageId}::account::add_delegate_key(account, public_key, derived_address, label, clock)`.
- * Only the account owner can add delegate keys.
- *
- * @param opts.publicKey - Ed25519 public key (32 bytes Uint8Array or hex string)
- * @param opts.label - Human-readable label (e.g. "MacBook Pro", "Production Server")
- * @returns AddDelegateKeyResult with digest, publicKey hex, and derived mysoAddress
- */
-export async function addDelegateKey(
-    opts: AddDelegateKeyOpts,
-): Promise<AddDelegateKeyResult> {
+export async function registerSubAgentDelegated(
+    opts: RegisterSubAgentDelegatedOpts,
+): Promise<RegisterSubAgentResult> {
     const ctx = await buildTxContext(opts);
     const { Transaction } = ctx;
 
-    // Normalize public key to Uint8Array
-    const pkBytes: Uint8Array =
-        typeof opts.publicKey === "string"
-            ? hexToBytes(opts.publicKey)
-            : opts.publicKey;
-
-    if (pkBytes.length !== 32) {
-        throw new Error(`Invalid Ed25519 public key length: ${pkBytes.length} (expected 32)`);
-    }
-
-    // Derive MySo address from the public key
-    const { blake2b } = await import("@noble/hashes/blake2.js");
-    const input = new Uint8Array(33);
-    input[0] = 0x00; // Ed25519 scheme flag
-    input.set(pkBytes, 1);
-    const addressBytes = blake2b(input, { dkLen: 32 });
-    const mysoAddress = "0x" + bytesToHex(addressBytes);
+    const pkBytes = normalizePublicKey(opts.publicKey);
+    const derivedAddress = await deriveMySoAddressFromPublicKey(pkBytes);
 
     const tx = new Transaction();
     tx.moveCall({
-        target: `${opts.packageId}::account::add_delegate_key`,
+        target: `${opts.packageId}::memory::register_sub_agent_delegated`,
         arguments: [
             tx.object(opts.accountId),
+            tx.object(opts.parentAgentObjectId),
             tx.pure("vector<u8>", Array.from(pkBytes)),
-            tx.pure("address", mysoAddress),
+            tx.pure("address", derivedAddress),
             tx.pure("string", opts.label),
+            tx.pure("u8", opts.identityClass ?? CLASS_DELEGATED_AI),
+            tx.pure("u64", opts.roleTags ?? 0),
+            tx.pure("u64", opts.capabilities ?? (CAP_MEMORY_READ | CAP_MEMORY_WRITE)),
+            tx.pure("u64", opts.delegatableCaps ?? 0),
+            tx.pure("u8", opts.registerScope ?? REGISTER_SCOPE_BOTH),
+            tx.pure("u64", opts.approvalRequiredCaps ?? 0),
+            tx.pure("option<u64>", opts.maxActionSpend ?? null),
+            tx.pure("option<address>", opts.platformScope ?? null),
+            tx.pure("option<u64>", opts.expiresAt ?? null),
+            tx.pure("u8", opts.registerRelation),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+
+    const { digest, effects } = await signAndExecute(ctx, tx);
+    return {
+        digest,
+        publicKey: bytesToHex(pkBytes),
+        derivedAddress,
+        agentObjectId: extractSubAgentObjectId(effects),
+    };
+}
+
+// ============================================================
+// deactivateSubAgent / revokeSubAgent
+// ============================================================
+
+export async function deactivateSubAgent(
+    opts: DeactivateSubAgentOpts,
+): Promise<{ digest: string }> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::deactivate_sub_agent`,
+        arguments: [
+            tx.object(opts.accountId),
+            tx.object(opts.agentObjectId),
             tx.object(MYSO_CLOCK),
         ],
     });
 
     const { digest } = await signAndExecute(ctx, tx);
-
-    return {
-        digest,
-        publicKey: bytesToHex(pkBytes),
-        mysoAddress,
-    };
+    return { digest };
 }
 
-// ============================================================
-// removeDelegateKey
-// ============================================================
-
-/**
- * Remove a delegate key from a MemoryAccount.
- *
- * Calls `{packageId}::account::remove_delegate_key(account, public_key)`.
- * Only the account owner can remove delegate keys.
- *
- * @param opts.publicKey - Ed25519 public key to remove (32 bytes Uint8Array or hex string)
- */
-export async function removeDelegateKey(
-    opts: RemoveDelegateKeyOpts,
+export async function revokeSubAgent(
+    opts: RevokeSubAgentOpts,
 ): Promise<{ digest: string }> {
     const ctx = await buildTxContext(opts);
     const { Transaction } = ctx;
 
-    const pkBytes: Uint8Array =
-        typeof opts.publicKey === "string"
-            ? hexToBytes(opts.publicKey)
-            : opts.publicKey;
-
-    if (pkBytes.length !== 32) {
-        throw new Error(`Invalid Ed25519 public key length: ${pkBytes.length} (expected 32)`);
-    }
-
     const tx = new Transaction();
     tx.moveCall({
-        target: `${opts.packageId}::account::remove_delegate_key`,
+        target: `${opts.packageId}::memory::revoke_sub_agent`,
         arguments: [
             tx.object(opts.accountId),
-            tx.pure("vector<u8>", Array.from(pkBytes)),
+            tx.object(opts.agentObjectId),
+            tx.object(MYSO_CLOCK),
         ],
     });
 
@@ -303,48 +379,27 @@ export async function removeDelegateKey(
 }
 
 // ============================================================
-// generateDelegateKey
+// generateSubAgentKey
 // ============================================================
 
 /**
- * Generate a new Ed25519 delegate keypair.
- *
- * Returns the private key (hex), public key (bytes), and derived MySo address.
- * The private key can be used with `Memory.create({ key })`.
- *
- * @example
- * ```typescript
- * const delegate = await generateDelegateKey()
- * console.log(delegate.privateKey)  // hex string — store securely!
- * console.log(delegate.mysoAddress)  // 0x... — use in addDelegateKey
- *
- * // Use with SDK
- * const memory = Memory.create({ key: delegate.privateKey, accountId: "0x..." })
- * ```
+ * Generate a new Ed25519 sub-agent keypair.
+ * The private key signs relayer requests; the derived address is the on-chain SubAgent signer.
  */
-export async function generateDelegateKey(): Promise<{
+export async function generateSubAgentKey(): Promise<{
     privateKey: string;
     publicKey: Uint8Array;
-    mysoAddress: string;
+    derivedAddress: string;
 }> {
     const ed = await import("@noble/ed25519");
-    const { blake2b } = await import("@noble/hashes/blake2.js");
-
-    // Generate random 32-byte private key
     const privateKeyBytes = new Uint8Array(32);
     globalThis.crypto.getRandomValues(privateKeyBytes);
     const publicKey = await ed.getPublicKeyAsync(privateKeyBytes);
-
-    // Derive MySo address
-    const input = new Uint8Array(33);
-    input[0] = 0x00; // Ed25519 scheme flag
-    input.set(publicKey, 1);
-    const addressBytes = blake2b(input, { dkLen: 32 });
-    const mysoAddress = "0x" + bytesToHex(addressBytes);
+    const derivedAddress = await deriveMySoAddressFromPublicKey(publicKey);
 
     return {
         privateKey: bytesToHex(privateKeyBytes),
         publicKey,
-        mysoAddress,
+        derivedAddress,
     };
 }

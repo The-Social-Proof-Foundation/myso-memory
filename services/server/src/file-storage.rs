@@ -179,43 +179,56 @@ pub async fn query_blobs_by_owner(
     Ok(result.blobs)
 }
 
-/// Download a blob from File Storage via the file_storage_rs SDK (Aggregator HTTP API).
-/// Note: this is already native Rust — no sidecar needed.
-///
-/// Returns `AppError::BlobNotFound` when the blob has expired or doesn't exist
-/// (HTTP 404 from the aggregator). Callers can use this to trigger DB cleanup.
+/// Download a blob from File Storage via the Aggregator HTTP API.
+/// Returns `AppError::BlobNotFound` when the blob has expired or doesn't exist (HTTP 404).
 pub async fn download_blob(
-    file_storage_client: &file_storage_rs::FileStorageClient,
+    client: &reqwest::Client,
+    aggregator_url: &str,
     blob_id: &str,
 ) -> Result<Vec<u8>, AppError> {
-    // Timeout to avoid hanging on broken/slow blobs (File Storage 500s can take 60s+)
-    let download_fut = file_storage_client.read_blob_by_id(blob_id);
-    let bytes = match tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        download_fut,
-    ).await {
-        Ok(Ok(data)) => data,
+    let url = format!(
+        "{}/v1/blobs/{}",
+        aggregator_url.trim_end_matches('/'),
+        blob_id
+    );
+
+    let download_fut = client.get(&url).send();
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(15), download_fut).await {
+        Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
-            let err_str = e.to_string();
-            let is_not_found = err_str.contains("404")
-                || err_str.to_lowercase().contains("not found")
-                || err_str.to_lowercase().contains("blob not found");
-            if is_not_found {
-                return Err(AppError::BlobNotFound(format!("Blob {} expired or not found: {}", blob_id, err_str)));
-            } else {
-                return Err(AppError::Internal(format!("File Storage download failed: {}", err_str)));
-            }
+            return Err(AppError::Internal(format!("File Storage download failed: {}", e)));
         }
         Err(_) => {
-            return Err(AppError::Internal(format!("File Storage download timed out after 10s for blob {}", blob_id)));
+            return Err(AppError::Internal(format!(
+                "File Storage download timed out after 15s for blob {}",
+                blob_id
+            )));
         }
     };
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(AppError::BlobNotFound(format!(
+            "Blob {} expired or not found",
+            blob_id
+        )));
+    }
+
+    if !resp.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "File Storage download failed: status {}",
+            resp.status()
+        )));
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| {
+        AppError::Internal(format!("File Storage download body read failed: {}", e))
+    })?;
 
     tracing::info!(
         "file storage download ok: blob_id={}, {} bytes",
         blob_id,
         bytes.len()
     );
-    Ok(bytes)
+    Ok(bytes.to_vec())
 }
 

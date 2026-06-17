@@ -194,7 +194,7 @@ pub async fn remember(
         key_index,
         namespace,
         &state.config.package_id,
-        Some(&auth.public_key),
+        Some(&auth.agent_object_id),
     )
     .await?;
     let blob_id = upload_result.blob_id;
@@ -277,8 +277,8 @@ pub async fn recall(
     let tasks: Vec<_> = hits
         .iter()
         .map(|hit| {
-            let file_storage_client = &state.file_storage_client;
-            let http_client = &state.http_client;
+            let http_client = state.http_client.clone();
+            let aggregator_url = state.config.file_storage_aggregator_url.clone();
             let sidecar_url = state.config.sidecar_url.clone();
             let sidecar_secret = state.config.sidecar_secret.clone();
             let blob_id = hit.blob_id.clone();
@@ -289,7 +289,11 @@ pub async fn recall(
             let owner_for_cleanup = owner.clone();
             async move {
                 // Download encrypted blob from File Storage (native Rust)
-                let encrypted_data = match file_storage::download_blob(file_storage_client, &blob_id).await {
+                let encrypted_data = match file_storage::download_blob(
+                    &http_client,
+                    &aggregator_url,
+                    &blob_id,
+                ).await {
                     Ok(data) => data,
                     Err(AppError::BlobNotFound(msg)) => {
                         // Blob expired on File Storage — clean up from DB reactively
@@ -304,7 +308,7 @@ pub async fn recall(
                 };
                 // Decrypt using MYDATA (via sidecar HTTP)
                 match mydata::mydata_decrypt(
-                    http_client,
+                    &http_client,
                     &sidecar_url,
                     sidecar_secret.as_deref(),
                     &encrypted_data,
@@ -425,7 +429,7 @@ pub async fn remember_manual(
         key_index,
         namespace,
         &state.config.package_id,
-        Some(&auth.public_key),
+        Some(&auth.agent_object_id),
     )
     .await?;
 
@@ -561,12 +565,12 @@ pub async fn analyze(
     // Step 2: Process all facts concurrently (embed + encrypt → upload → store)
     // Each fact gets its own key from the pool so sidecar can upload them in parallel
     // (different signer addresses bypass the per-signer serialization lock).
-    let auth_pubkey_base = auth.public_key.clone();
+    let auth_agent_id = auth.agent_object_id.clone();
     let tasks: Vec<_> = facts.iter().map(|fact_text| {
         let state = Arc::clone(&state);
         let owner = owner.clone();
         let fact_text = fact_text.clone();
-        let auth_pubkey = auth_pubkey_base.clone();
+        let agent_id = auth_agent_id.clone();
         // Pick the next key in round-robin order at task construction time.
         // Convert to owned String *before* async move so we don't borrow-then-move `state`.
         let key_index: Result<usize, AppError> = state.key_pool.next_index()
@@ -596,7 +600,7 @@ pub async fn analyze(
                 key_index,
                 &namespace,
                 &state.config.package_id,
-                Some(&auth_pubkey),
+                Some(&agent_id),
             ).await?;
 
             // Store in Vector DB with namespace
@@ -1133,8 +1137,8 @@ pub async fn ask(
     let tasks: Vec<_> = hits
         .iter()
         .map(|hit| {
-            let file_storage_client = &state.file_storage_client;
-            let http_client = &state.http_client;
+            let http_client = state.http_client.clone();
+            let aggregator_url = state.config.file_storage_aggregator_url.clone();
             let sidecar_url = state.config.sidecar_url.clone();
             let sidecar_secret = state.config.sidecar_secret.clone();
             let blob_id = hit.blob_id.clone();
@@ -1144,7 +1148,11 @@ pub async fn ask(
             let account_id = auth.account_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
-                let encrypted_data = match file_storage::download_blob(file_storage_client, &blob_id).await {
+                let encrypted_data = match file_storage::download_blob(
+                    &http_client,
+                    &aggregator_url,
+                    &blob_id,
+                ).await {
                     Ok(data) => data,
                     Err(AppError::BlobNotFound(msg)) => {
                         // Blob expired on File Storage — clean up from DB reactively
@@ -1158,7 +1166,7 @@ pub async fn ask(
                     }
                 };
                 match mydata::mydata_decrypt(
-                    http_client,
+                    &http_client,
                     &sidecar_url,
                     sidecar_secret.as_deref(),
                     &encrypted_data,
@@ -1438,11 +1446,12 @@ pub async fn restore(
     let download_tasks: Vec<_> = missing_blob_ids
         .iter()
         .map(|blob_id| {
-            let file_storage_client = &state.file_storage_client;
+            let http_client = state.http_client.clone();
+            let aggregator_url = state.config.file_storage_aggregator_url.clone();
             let blob_id = blob_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
-                match file_storage::download_blob(file_storage_client, &blob_id).await {
+                match file_storage::download_blob(&http_client, &aggregator_url, &blob_id).await {
                     Ok(data) => Some((blob_id, data)),
                     Err(AppError::BlobNotFound(msg)) => {
                         tracing::warn!("restore: blob expired, skipping: {}", msg);
@@ -1507,7 +1516,7 @@ pub async fn restore(
             let account_id = auth.account_id.clone();
             async move {
                 match mydata::mydata_decrypt(
-                    http_client,
+                    &http_client,
                     &sidecar_url,
                     sidecar_secret.as_deref(),
                     &encrypted_data,

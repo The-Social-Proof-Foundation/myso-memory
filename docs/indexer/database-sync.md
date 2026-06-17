@@ -1,82 +1,44 @@
----
-title: "Database Sync"
----
+# Database Sync
 
-The indexer syncs account data into PostgreSQL so the relayer can resolve ownership quickly without hitting the blockchain on every request.
+The memory relayer and the social indexer use **separate concerns** in PostgreSQL.
 
-## Database
+## Social database (myso-core)
 
-Both the relayer and the indexer connect to the same PostgreSQL instance (with the `pgvector` extension enabled). Migrations run automatically on boot.
+Owned by the social indexer — **not** this repo:
 
-## Tables
+- `memory_accounts` — profile-linked accounts
+- `sub_agents` — indexed by `derived_address`
+- Profile ↔ account links
+
+## Memory relayer database (this repo)
+
+Migrations run automatically on server boot. The relayer stores **only relayer state**:
 
 ### `vector_entries`
 
-The primary search table — stores vector embeddings linked to encrypted File Storage blobs.
+Embedding index: owner, namespace, blob_id, vector, optional agent scoping.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `id` | `TEXT` (PK) | UUID for this entry |
-| `owner` | `TEXT` | Owner's MySo address |
-| `namespace` | `TEXT` | Namespace label (default: `"default"`) |
-| `blob_id` | `TEXT` | File Storage blob ID pointing to the encrypted payload |
-| `embedding` | `vector(1536)` | 1536-dimensional vector embedding (pgvector) |
-| `created_at` | `TIMESTAMPTZ` | Insertion timestamp |
+### `sub_agent_cache`
 
-**Indexes:**
-- `idx_vector_entries_owner` — B-tree on `owner`
-- `idx_vector_entries_blob_id` — B-tree on `blob_id`
-- `idx_vector_entries_owner_ns` — composite B-tree on `(owner, namespace)` for scoped queries
-- `idx_vector_entries_embedding` — HNSW on `embedding` using `vector_cosine_ops` for fast similarity search
+Auth optimization — maps public key → account, agent object, capabilities, owner. Replaces the legacy `delegate_key_cache`. TTL-based; re-verified on-chain on use.
 
-### `delegate_key_cache`
+### Rate limits / quotas
 
-Auth optimization — caches the mapping from delegate public key to account, so the relayer doesn't need to scan the onchain registry on every request.
+Redis-backed request limits and per-owner storage quotas.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `public_key` | `TEXT` (PK) | Hex-encoded Ed25519 public key |
-| `account_id` | `TEXT` | MemoryAccount object ID |
-| `owner` | `TEXT` | Owner's MySo address |
-| `cached_at` | `TIMESTAMPTZ` | When this mapping was cached |
+## Removed tables
 
-The cache is populated lazily during auth. If a cached entry becomes stale (key was removed onchain), the relayer re-resolves from the chain and updates the cache.
+The following are **no longer** in the memory server schema:
 
-### `accounts`
+- `accounts` — account index lives in social DB
+- `indexer_state` — no local memory indexer
+- `delegate_key_cache` — replaced by `sub_agent_cache`
 
-Populated by the indexer — maps owner addresses to their MemoryAccount object IDs.
+Migration `005_sub_agent_cache.sql` creates the new cache and drops legacy tables.
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `account_id` | `TEXT` (PK) | MemoryAccount object ID |
-| `owner` | `TEXT` (unique) | Owner's MySo address |
-| `created_at` | `TIMESTAMPTZ` | When this row was indexed |
+## Environment
 
-### `indexer_state`
-
-Tracks the indexer's cursor position so it can resume from where it left off after restarts.
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `key` | `TEXT` (PK) | State key (e.g., `"event_cursor"`) |
-| `value` | `TEXT` | JSON-serialized cursor (`txDigest` + `eventSeq`) |
-
-## How It Helps
-
-- **Constant-time account lookup** — the relayer checks `delegate_key_cache` and `accounts` instead of scanning the onchain registry
-- **Resumable event polling** — the indexer stores its cursor in `indexer_state`, so it picks up where it left off after restarts without re-processing old events
-- **Reactive cleanup** — when File Storage returns 404 for an expired blob during recall, the relayer deletes the corresponding `vector_entries` rows automatically
-
-## Similarity Search
-
-Recall queries use pgvector's cosine distance operator (`<=>`) against the HNSW index:
-
-```sql
-SELECT blob_id, (embedding <=> $1)::float8 AS distance
-FROM vector_entries
-WHERE owner = $2 AND namespace = $3
-ORDER BY embedding <=> $1
-LIMIT $4
-```
-
-The HNSW index provides approximate nearest neighbor search, which is fast enough for interactive recall even with large numbers of stored memories.
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | Memory relayer PostgreSQL |
+| `SOCIAL_SERVER_URL` | Sub-agent lookup API (default `http://127.0.0.1:9126`) |

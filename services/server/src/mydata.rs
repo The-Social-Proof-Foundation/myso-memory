@@ -27,7 +27,7 @@ impl MyDataCredential {
         if let Some(s) = auth.mydata_session.as_deref() {
             return Some(MyDataCredential::Session(s.to_string()));
         }
-        if let Some(k) = auth.delegate_key.as_deref() {
+        if let Some(k) = auth.sub_agent_key.as_deref() {
             return Some(MyDataCredential::MemoryDelegateKey(k.to_string()));
         }
         fallback_private_key.map(|k| MyDataCredential::MemoryDelegateKey(k.to_string()))

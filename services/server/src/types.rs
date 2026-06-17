@@ -13,7 +13,6 @@ pub struct AppState {
     pub db: VectorDb,
     pub config: Config,
     pub http_client: reqwest::Client,
-    pub file_storage_client: file_storage_rs::FileStorageClient,
     /// Round-robin pool of MySo private keys for parallel File Storage uploads
     pub key_pool: KeyPool,
     /// Redis multiplexed connection for rate limiting
@@ -90,7 +89,8 @@ pub struct Config {
     /// falls back to SERVER_MYSO_PRIVATE_KEY as a single-element list).
     pub myso_private_keys: Vec<String>,
     pub package_id: String,
-    pub registry_id: String,
+    /// Social server base URL for sub-agent index lookups
+    pub social_server_url: String,
     /// URL of the MYDATA/File Storage TS sidecar HTTP server
     pub sidecar_url: String,
     /// Shared secret for authenticating Rust→sidecar calls (X-Sidecar-Secret header)
@@ -147,8 +147,8 @@ impl Config {
             },
             package_id: std::env::var("MEMORY_PACKAGE_ID")
                 .expect("MEMORY_PACKAGE_ID must be set"),
-            registry_id: std::env::var("MEMORY_REGISTRY_ID")
-                .expect("MEMORY_REGISTRY_ID must be set"),
+            social_server_url: std::env::var("SOCIAL_SERVER_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:9126".to_string()),
             sidecar_url: std::env::var("SIDECAR_URL")
                 .unwrap_or_else(|_| "http://localhost:9000".to_string()),
             sidecar_secret: std::env::var("SIDECAR_AUTH_TOKEN").ok(),
@@ -422,38 +422,39 @@ pub struct SponsorExecuteRequest {
 // Auth Types
 // ============================================================
 
-/// Headers required for authenticated requests
+/// Authenticated sub-agent context attached to protected requests.
 #[derive(Clone)]
 pub struct AuthInfo {
     #[allow(dead_code)]
     pub public_key: String,
-    /// Owner address from the onchain MemoryAccount (set after onchain verification)
+    /// Principal owner from the on-chain MemoryAccount.
     pub owner: String,
-    /// MemoryAccount object ID (set after onchain verification)
+    /// MemoryAccount object ID.
     pub account_id: String,
-    /// Delegate private key (hex) — legacy path for MYDATA decrypt. Optional;
-    /// modern SDKs send `mydata_session` instead. Retained during the
-    /// transition so older clients keep working.
-    pub delegate_key: Option<String>,
-    /// Exported MYDATA SessionKey (base64-encoded JSON) — replaces the raw
-    /// delegate private key on the wire. When present it is preferred over
-    /// `delegate_key`. TTL-bounded, package-scoped, signed by the delegate
-    /// key on the client; the server never handles private-key material.
+    /// SubAgent shared object ID.
+    pub agent_object_id: String,
+    /// Sub-agent derived MySo address (signer).
+    pub derived_address: String,
+    /// Capability bitmap from on-chain SubAgent.
+    pub capabilities: u64,
+    /// Sub-agent private key (hex) for MYDATA decrypt — legacy path.
+    pub sub_agent_key: Option<String>,
+    /// Exported MYDATA SessionKey (base64 JSON).
     pub mydata_session: Option<String>,
 }
 
-// LOW-5 / ENG-1697: Manual Debug redacts both credential fields so accidental
-// `{:?}` formatting never leaks delegate private key material or session
-// tokens into logs.
 impl std::fmt::Debug for AuthInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthInfo")
             .field("public_key", &self.public_key)
             .field("owner", &self.owner)
             .field("account_id", &self.account_id)
+            .field("agent_object_id", &self.agent_object_id)
+            .field("derived_address", &self.derived_address)
+            .field("capabilities", &self.capabilities)
             .field(
-                "delegate_key",
-                &self.delegate_key.as_ref().map(|_| "<redacted>"),
+                "sub_agent_key",
+                &self.sub_agent_key.as_ref().map(|_| "<redacted>"),
             )
             .field(
                 "mydata_session",
@@ -543,70 +544,47 @@ pub struct SidecarError {
 mod tests {
     use super::*;
 
-    // ── LOW-5: AuthInfo Debug redacts delegate_key ───────────────────────
-
-    #[test]
-    fn auth_info_debug_redacts_delegate_key() {
-        let auth = AuthInfo {
+    fn sample_auth() -> AuthInfo {
+        AuthInfo {
             public_key: "aabbccdd".to_string(),
             owner: "0xowner".to_string(),
             account_id: "0xaccount".to_string(),
-            delegate_key: Some("supersecretprivatekeyinhex1234567890abcdef".to_string()),
+            agent_object_id: "0xagent".to_string(),
+            derived_address: "0xderived".to_string(),
+            capabilities: 3,
+            sub_agent_key: None,
             mydata_session: None,
-        };
+        }
+    }
+
+    #[test]
+    fn auth_info_debug_redacts_sub_agent_key() {
+        let mut auth = sample_auth();
+        auth.sub_agent_key = Some("supersecretprivatekeyinhex1234567890abcdef".to_string());
 
         let debug_str = format!("{:?}", auth);
 
-        // Must contain the redacted marker
-        assert!(
-            debug_str.contains("<redacted>"),
-            "delegate_key must be redacted in Debug output, got: {}",
-            debug_str
-        );
-        // Must NOT contain the actual key
-        assert!(
-            !debug_str.contains("supersecretprivatekeyinhex"),
-            "actual delegate key leaked in Debug output: {}",
-            debug_str
-        );
-        // Public fields are still visible
+        assert!(debug_str.contains("<redacted>"), "got: {}", debug_str);
+        assert!(!debug_str.contains("supersecretprivatekeyinhex"), "got: {}", debug_str);
         assert!(debug_str.contains("aabbccdd"));
         assert!(debug_str.contains("0xowner"));
         assert!(debug_str.contains("0xaccount"));
     }
 
     #[test]
-    fn auth_info_debug_shows_none_when_no_delegate_key() {
-        let auth = AuthInfo {
-            public_key: "aabb".to_string(),
-            owner: "0xowner".to_string(),
-            account_id: "0xaccount".to_string(),
-            delegate_key: None,
-            mydata_session: None,
-        };
-
+    fn auth_info_debug_shows_none_when_no_sub_agent_key() {
+        let auth = sample_auth();
         let debug_str = format!("{:?}", auth);
-
-        // None variant should render as None
         assert!(debug_str.contains("None"), "expected None in debug: {}", debug_str);
         assert!(!debug_str.contains("<redacted>"));
     }
 
-    // ENG-1697: mydata_session must also be redacted in Debug output. While
-    // less catastrophic than the raw private key (bounded TTL, bounded
-    // scope), it is still an authorization token and must not surface in
-    // structured logs.
     #[test]
     fn auth_info_debug_redacts_mydata_session() {
-        let auth = AuthInfo {
-            public_key: "aabbccdd".to_string(),
-            owner: "0xowner".to_string(),
-            account_id: "0xaccount".to_string(),
-            delegate_key: None,
-            mydata_session: Some(
-                "eyJhZGRyZXNzIjoiMHhhYmMiLCJwYWNrYWdlSWQiOiIweGRlZiJ9".to_string(),
-            ),
-        };
+        let mut auth = sample_auth();
+        auth.mydata_session = Some(
+            "eyJhZGRyZXNzIjoiMHhhYmMiLCJwYWNrYWdlSWQiOiIweGRlZiJ9".to_string(),
+        );
 
         let debug_str = format!("{:?}", auth);
         assert!(debug_str.contains("<redacted>"));

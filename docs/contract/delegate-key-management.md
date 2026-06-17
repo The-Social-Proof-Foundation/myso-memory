@@ -1,85 +1,96 @@
----
-title: "Delegate Key Management"
----
+# Sub-Agent Registration
 
-Delegate keys are lightweight Ed25519 keys used for SDK authentication. They are registered onchain in a `MemoryAccount` and verified by the relayer on every request.
+Sub-agents replace the legacy delegate-key model. Each sub-agent is an on-chain object with explicit capabilities, registered against a profile-linked **MemoryAccount**.
 
-## Why They Exist
+## Why sub-agents?
 
-- Apps need a usable key for API calls without exposing the owner wallet
-- Users should not hand over the owner wallet for day-to-day memory access
-- Different apps or devices can each have their own delegate key with a descriptive label
+- **Capability-gated access** — read vs write is enforced on-chain and by the relayer
+- **Social index** — the social server resolves `derived_address → account + agent` without chain scans
+- **MYDATA signing** — SessionKeys must use the sub-agent's `derived_address` as signer address
 
-## Lifecycle
+## Quick start
 
-### 1. Generate a delegate keypair
+### 1. Generate a sub-agent keypair
 
-Use the SDK's `generateDelegateKey()` helper to create a new Ed25519 keypair:
+```typescript
+import { generateSubAgentKey, registerSubAgent } from "@socialproof/memory/account";
 
-```ts
-import { generateDelegateKey } from "@socialproof/memory/account";
-
-const delegate = await generateDelegateKey();
-// delegate.privateKey — hex string, store securely
-// delegate.publicKey — 32-byte Uint8Array
-// delegate.mysoAddress — derived MySo address (0x...)
+const agent = await generateSubAgentKey();
+// agent.privateKey — store securely
+// agent.publicKey — 32-byte Ed25519 public key
+// agent.derivedAddress — on-chain signer address (0x...)
 ```
 
-### 2. Register the public key onchain
+### 2. Register on-chain (owner wallet)
 
-Only the account owner can add delegate keys:
+Only the MemoryAccount owner can register root-level sub-agents:
 
-```ts
-import { addDelegateKey } from "@socialproof/memory/account";
-
-await addDelegateKey({
+```typescript
+await registerSubAgent({
   packageId: "0x...",
-  accountId: "0x...",
-  publicKey: delegate.publicKey,
-  label: "MacBook Pro",
-  mysoPrivateKey: "mysoprivkey1...", // or walletSigner
+  accountId: "0x...", // MemoryAccount object ID
+  publicKey: agent.publicKey,
+  label: "Production Server",
+  walletSigner,
 });
 ```
 
-### 3. Use the private key in the SDK
+Defaults: `CLASS_DELEGATED_AI`, `CAP_MEMORY_READ | CAP_MEMORY_WRITE`, `REGISTER_SCOPE_BOTH`.
 
-```ts
+### 3. Use with the SDK
+
+```typescript
 import { Memory } from "@socialproof/memory";
 
 const memory = Memory.create({
-  key: delegate.privateKey,
+  key: agent.privateKey,
   accountId: "0x...",
 });
 ```
 
-### 4. Revoke the delegate key
+### 4. Deactivate or revoke
 
-Removing a delegate key prevents future relayer access from that key:
+```typescript
+import { deactivateSubAgent, revokeSubAgent } from "@socialproof/memory/account";
 
-```ts
-import { removeDelegateKey } from "@socialproof/memory/account";
-
-await removeDelegateKey({
-  packageId: "0x...",
-  accountId: "0x...",
-  publicKey: delegate.publicKey,
-  mysoPrivateKey: "mysoprivkey1...", // or walletSigner
-});
+await deactivateSubAgent({ packageId, accountId, agentObjectId, walletSigner });
+await revokeSubAgent({ packageId, accountId, agentObjectId, walletSigner });
 ```
+
+## Capability constants
+
+| Export | Value | Use |
+|--------|-------|-----|
+| `CAP_MEMORY_READ` | 1 | Recall / decrypt |
+| `CAP_MEMORY_WRITE` | 2 | Remember / analyze / restore |
 
 ## Limits
 
-- Each account supports up to **20 delegate keys**
-- Each delegate key must be a valid 32-byte Ed25519 public key
-- Duplicate keys are rejected (error code 0)
-- Only the account owner can add or remove delegate keys
+- Sub-agent public keys must be valid 32-byte Ed25519 keys
+- Labels are bounded by the contract (`MAX_LABEL_LENGTH`)
+- Expired or deactivated sub-agents cannot authenticate
 
-## Account Deactivation
+## Profile backfill
 
-An account owner can deactivate (freeze) their account. When deactivated:
+If a profile predates Memory integration:
 
-- MYDATA decryption access is denied for all keys (owner and delegates)
-- Delegate keys cannot be added or removed
-- The owner can reactivate the account at any time
+```typescript
+import { ensureMemoryAccount } from "@socialproof/memory/account";
 
-This is useful as an emergency kill switch if a key is compromised.
+await ensureMemoryAccount({
+  packageId: "0x...",
+  registryId: "0x...",
+  profileId: "0x...",
+  walletSigner,
+});
+```
+
+## Relayer auth
+
+The relayer resolves sub-agents in this order:
+
+1. PostgreSQL `sub_agent_cache` (TTL + on-chain re-verify)
+2. Social API `GET /sub-agents/{derivedAddress}`
+3. On-chain SubAgent + MemoryAccount verification (capabilities, active, expiry)
+
+Set `SOCIAL_SERVER_URL` (default `http://127.0.0.1:9126`) on the memory server.

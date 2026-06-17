@@ -1,23 +1,32 @@
 /**
  * @socialproof/memory/account
  *
- * Account management entry point — on-chain operations.
+ * Sub-agent management entry point — on-chain operations.
  * Requires @socialproof/myso as a peer dependency.
- *
- * @example
- * ```typescript
- * import { createAccount, addDelegateKey, generateDelegateKey } from "@socialproof/memory/account"
- * ```
  */
 
-// Account management (on-chain: create account, add/remove delegate keys)
-export { createAccount, addDelegateKey, removeDelegateKey, generateDelegateKey } from "./account.js";
+export {
+    ensureMemoryAccount,
+    registerSubAgent,
+    registerSubAgentDelegated,
+    deactivateSubAgent,
+    revokeSubAgent,
+    generateSubAgentKey,
+    deriveMySoAddressFromPublicKey,
+    CAP_MEMORY_READ,
+    CAP_MEMORY_WRITE,
+    CLASS_DELEGATED_AI,
+    REGISTER_SCOPE_CHILD,
+    REGISTER_SCOPE_PEER,
+    REGISTER_SCOPE_BOTH,
+} from "./account.js";
 
-// Account-related types
 export type {
-    CreateAccountOpts,
-    CreateAccountResult,
-    AddDelegateKeyOpts,
-    AddDelegateKeyResult,
-    RemoveDelegateKeyOpts,
+    EnsureMemoryAccountOpts,
+    EnsureMemoryAccountResult,
+    RegisterSubAgentOpts,
+    RegisterSubAgentResult,
+    RegisterSubAgentDelegatedOpts,
+    DeactivateSubAgentOpts,
+    RevokeSubAgentOpts,
 } from "./types.js";

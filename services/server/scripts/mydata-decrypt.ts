@@ -32,6 +32,7 @@ import { MyDataClient, SessionKey, EncryptedObject } from "@socialproof/mydata";
 
 // Network config from env vars
 const MYSO_NETWORK = (process.env.MYSO_NETWORK || "mainnet") as "mainnet" | "testnet";
+const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
 const MYDATA_KEY_SERVERS = [
     ...new Set(
         (process.env.MYDATA_KEY_SERVERS || "")
@@ -147,14 +148,14 @@ async function main() {
         mysoClient: mysoClient as any,
     });
 
-    // Step 3: Build approve_key_policy PTB with REAL ID
-    // approve_key_policy(id: vector<u8>, account: &MemoryAccount, ctx: &TxContext)
+    // approve_key_policy(id: vector<u8>, account: &MemoryAccount, clock: &Clock, ctx: &TxContext)
     const tx = new Transaction();
     tx.moveCall({
         target: `${packageId}::memory::approve_key_policy`,
         arguments: [
-            tx.pure("vector<u8>", idBytes), // real ID from encrypted object
-            tx.object(accountId), // MemoryAccount shared object
+            tx.pure("vector<u8>", idBytes),
+            tx.object(accountId),
+            tx.object(MYSO_CLOCK),
         ],
     });
     const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
