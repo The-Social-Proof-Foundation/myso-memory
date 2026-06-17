@@ -1,9 +1,5 @@
 /**
- * memory_store tool — explicit save.
- *
- * Uses analyze() instead of remember() so the server LLM extracts
- * individual facts from the text, producing cleaner, more searchable
- * memories (same approach as Mem0's memory_store).
+ * memory_store tool — explicit save (agent-scoped via sub-agent auth).
  */
 
 import type { Memory } from "@socialproof/memory";
@@ -13,7 +9,6 @@ import { toolError } from "../format.js";
 import type { PluginConfig } from "../types.js";
 import { MIN_STORE_TEXT_LENGTH, MAX_FACT_PREVIEW_COUNT, MAX_TEXT_PREVIEW_LENGTH } from "../constants.js";
 
-/** Register the memory_store agent tool. */
 export function registerStoreTool(api: any, client: Memory, config: PluginConfig): void {
   api.registerTool(
     {
@@ -22,25 +17,21 @@ export function registerStoreTool(api: any, client: Memory, config: PluginConfig
       description:
         "Save important information to encrypted long-term memory. " +
         "Use when the user asks to remember something or when you " +
-        "identify important facts worth preserving. " +
-        "Pass the namespace parameter to store in the current agent's memory.",
+        "identify important facts worth preserving. Scope is automatic via sub-agent auth.",
       parameters: Type.Object({
         text: Type.String({
           description: "Information to store in memory",
         }),
-        namespace: Type.Optional(
+        subLabel: Type.Optional(
           Type.String({
-            description: "Memory namespace to store in (use the namespace from system context)",
+            description: "Optional tag within the agent vault (advanced)",
           }),
         ),
       }),
       async execute(_id: string, params: any) {
-        const { text, namespace } = params;
-        const ns = namespace || config.defaultNamespace;
+        const { text, subLabel } = params;
+        const label = subLabel ?? config.subLabel;
 
-        // Defence in depth: reject injection on write, not just on read.
-        // The recall hook filters on retrieval, but polluted data could
-        // surface through other read paths (memory_search, future tools).
         if (looksLikeInjection(text)) {
           return {
             content: [
@@ -66,10 +57,9 @@ export function registerStoreTool(api: any, client: Memory, config: PluginConfig
         }
 
         try {
-          const result = await client.analyze(text.trim(), ns);
+          const result = await client.analyze(text.trim(), label);
 
           const factCount = result.facts?.length ?? 0;
-          // Show first 3 extracted facts as confirmation, or raw text truncation as fallback
           const preview = result.facts
             ?.map((f: any) => f.text)
             .slice(0, MAX_FACT_PREVIEW_COUNT)
@@ -86,7 +76,6 @@ export function registerStoreTool(api: any, client: Memory, config: PluginConfig
             ],
             details: {
               action: "created",
-              namespace: ns,
               factCount,
               facts: result.facts,
             },

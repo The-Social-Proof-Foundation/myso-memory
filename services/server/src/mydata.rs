@@ -55,6 +55,10 @@ struct MyDataDecryptRequest {
     data: String,
     package_id: String,
     account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform_scope: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -138,6 +142,8 @@ pub async fn mydata_decrypt(
     credential: &MyDataCredential,
     package_id: &str,
     account_id: &str,
+    platform_id: Option<&str>,
+    platform_scope: Option<&str>,
 ) -> Result<Vec<u8>, AppError> {
     let url = format!("{}/mydata/decrypt", sidecar_url);
     let data_b64 = BASE64.encode(encrypted_data);
@@ -148,6 +154,8 @@ pub async fn mydata_decrypt(
             data: data_b64,
             package_id: package_id.to_string(),
             account_id: account_id.to_string(),
+            platform_id: platform_id.map(|s| s.to_string()),
+            platform_scope: platform_scope.map(|s| s.to_string()),
         });
     req = match credential {
         MyDataCredential::Session(s) => req.header("x-mydata-session", s),

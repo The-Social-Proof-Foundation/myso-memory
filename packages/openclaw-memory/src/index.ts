@@ -37,12 +37,13 @@ export default {
       key: config.privateKey,
       accountId: config.accountId,
       serverUrl: config.serverUrl,
+      platformId: config.platformId,
+      subLabel: config.subLabel,
     });
 
     api.logger.info(
       `memory: registered (server: ${config.serverUrl}, ` +
-      `key: ${keyPreview(config.privateKey)}, ` +
-      `namespace: ${config.defaultNamespace})`,
+      `key: ${keyPreview(config.privateKey)})`,
     );
 
     registerHooks(api, client, config);

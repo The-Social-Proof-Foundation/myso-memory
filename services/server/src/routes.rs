@@ -10,6 +10,7 @@ use crate::rate_limit;
 use crate::mydata;
 use crate::types::*;
 use crate::file_storage;
+use crate::vault::ensure_agent_vault;
 
 const MAX_ANALYZE_FACTS: usize = 20;
 const ANALYZE_CONCURRENCY: usize = 5;
@@ -151,16 +152,20 @@ pub async fn remember(
         )));
     }
 
-    // Owner is derived from delegate key via onchain verification (auth middleware)
+    // Owner is derived from delegate key via on-chain verification (auth middleware)
     let owner = &auth.owner;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
     let text = &body.text;
-    let namespace = &body.namespace;
     tracing::info!(
-        "remember: text=\"{}...\" owner={} ns={}",
+        "remember: text=\"{}...\" owner={} agent={} sub_label={:?}",
         truncate_str(text, 50),
         owner,
-        namespace
+        agent_object_id,
+        sub_label
     );
+
+    ensure_agent_vault(&state, &auth).await?;
 
     // Step 1: Embed text + MYDATA encrypt concurrently (they're independent)
     let embed_fut = generate_embedding(&state.http_client, &state.config, text);
@@ -192,26 +197,34 @@ pub async fn remember(
         50,
         owner,
         key_index,
-        namespace,
+        agent_object_id,
         &state.config.package_id,
         Some(&auth.agent_object_id),
     )
     .await?;
     let blob_id = upload_result.blob_id;
 
-    // Step 3: Store {vector, blobId, namespace} in Vector DB
+    // Step 3: Store {vector, blobId, agent_object_id} in Vector DB
     let blob_size = encrypted.len() as i64;
     let id = uuid::Uuid::new_v4().to_string();
     state
         .db
-        .insert_vector(&id, owner, namespace, &blob_id, &vector, blob_size)
+        .insert_vector(
+            &id,
+            owner,
+            agent_object_id,
+            sub_label.as_deref(),
+            &blob_id,
+            &vector,
+            blob_size,
+        )
         .await?;
 
     tracing::info!(
-        "remember complete: blob_id={}, owner={}, ns={}, dims={}",
+        "remember complete: blob_id={}, owner={}, agent={}, dims={}",
         blob_id,
         owner,
-        namespace,
+        agent_object_id,
         vector.len()
     );
 
@@ -219,7 +232,9 @@ pub async fn remember(
         id,
         blob_id,
         owner: owner.clone(),
-        namespace: namespace.clone(),
+        agent_object_id: agent_object_id.clone(),
+        sub_label: sub_label.clone(),
+        namespace: agent_object_id.clone(),
     }))
 }
 
@@ -242,12 +257,14 @@ pub async fn recall(
 
     // Owner is derived from delegate key via onchain verification (auth middleware)
     let owner = &auth.owner;
-    let namespace = &body.namespace;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
     tracing::info!(
-        "recall: query=\"{}...\" owner={} ns={}",
+        "recall: query=\"{}...\" owner={} agent={} sub_label={:?}",
         truncate_str(&body.query, 50),
         owner,
-        namespace
+        agent_object_id,
+        sub_label
     );
 
     // ENG-1697: Prefer the client-built SessionKey (x-mydata-session); fall
@@ -270,7 +287,16 @@ pub async fn recall(
     // MED-3 fix: Cap limit to prevent unbounded DB scans / memory use.
     // Without this, an attacker could send limit=999999 to scan the entire DB.
     let limit = body.limit.min(100);
-    let hits = state.db.search_similar(&query_vector, owner, namespace, limit).await?;
+    let hits = state
+        .db
+        .search_similar(
+            &query_vector,
+            owner,
+            agent_object_id,
+            sub_label.as_deref(),
+            limit,
+        )
+        .await?;
 
     // Step 3: Download + MYDATA decrypt all results concurrently
     let db = &state.db;
@@ -286,9 +312,10 @@ pub async fn recall(
             let credential = credential.clone();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
+            let platform_scope = auth.platform_scope.clone();
+            let platform_id = auth.platform_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
-                // Download encrypted blob from File Storage (native Rust)
                 let encrypted_data = match file_storage::download_blob(
                     &http_client,
                     &aggregator_url,
@@ -315,6 +342,8 @@ pub async fn recall(
                     &credential,
                     &package_id,
                     &account_id,
+                    platform_id.as_deref(),
+                    platform_scope.as_deref(),
                 )
                 .await
                 {
@@ -389,73 +418,90 @@ pub async fn remember_manual(
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RememberManualRequest>,
 ) -> Result<Json<RememberManualResponse>, AppError> {
-    if body.encrypted_data.is_empty() {
-        return Err(AppError::BadRequest(
-            "encrypted_data cannot be empty".into(),
-        ));
-    }
     if body.vector.is_empty() {
         return Err(AppError::BadRequest("vector cannot be empty".into()));
     }
+    if body.blob_id.is_none() && body.encrypted_data.is_empty() {
+        return Err(AppError::BadRequest(
+            "provide blob_id or encrypted_data".into(),
+        ));
+    }
 
     let owner = &auth.owner;
-    let namespace = &body.namespace;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
     tracing::info!(
-        "remember_manual: vector_dims={} owner={} ns={}",
+        "remember_manual: vector_dims={} owner={} agent={} sub_label={:?}",
         body.vector.len(),
         owner,
-        namespace
+        agent_object_id,
+        sub_label
     );
 
-    // Decode base64 → raw MYDATA-encrypted bytes
-    let encrypted_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&body.encrypted_data)
-        .map_err(|e| AppError::BadRequest(format!("encrypted_data is not valid base64: {}", e)))?;
+    let (blob_id, blob_size) = if let Some(ref existing_blob_id) = body.blob_id {
+        if existing_blob_id.is_empty() {
+            return Err(AppError::BadRequest("blob_id cannot be empty".into()));
+        }
+        (existing_blob_id.clone(), 0_i64)
+    } else {
+        let encrypted_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&body.encrypted_data)
+            .map_err(|e| AppError::BadRequest(format!("encrypted_data is not valid base64: {}", e)))?;
 
-    // Check storage quota before upload
-    rate_limit::check_storage_quota(&state, owner, encrypted_bytes.len() as i64).await?;
+        rate_limit::check_storage_quota(&state, owner, encrypted_bytes.len() as i64).await?;
 
-    // Upload encrypted bytes to File Storage via sidecar (pool key pays gas)
-    let key_index = state.key_pool.next_index()
-        .ok_or_else(|| AppError::Internal("No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)".into()))?;
+        let key_index = state.key_pool.next_index().ok_or_else(|| {
+            AppError::Internal(
+                "No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)"
+                    .into(),
+            )
+        })?;
 
-    let upload = file_storage::upload_blob(
-        &state.http_client,
-        &state.config.sidecar_url,
-        state.config.sidecar_secret.as_deref(),
-        &encrypted_bytes,
-        50,
-        owner,
-        key_index,
-        namespace,
-        &state.config.package_id,
-        Some(&auth.agent_object_id),
-    )
-    .await?;
+        let upload = file_storage::upload_blob(
+            &state.http_client,
+            &state.config.sidecar_url,
+            state.config.sidecar_secret.as_deref(),
+            &encrypted_bytes,
+            50,
+            owner,
+            key_index,
+            agent_object_id,
+            &state.config.package_id,
+            Some(&auth.agent_object_id),
+        )
+        .await?;
 
-    let blob_id = upload.blob_id;
-    tracing::info!("remember_manual: file storage upload ok blob_id={}", blob_id);
-
-    // Store {vector, blobId, namespace} in Vector DB
-    let blob_size = encrypted_bytes.len() as i64;
+        tracing::info!("remember_manual: file storage upload ok blob_id={}", upload.blob_id);
+        (upload.blob_id, encrypted_bytes.len() as i64)
+    };
     let id = uuid::Uuid::new_v4().to_string();
     state
         .db
-        .insert_vector(&id, owner, namespace, &blob_id, &body.vector, blob_size)
+        .insert_vector(
+            &id,
+            owner,
+            agent_object_id,
+            sub_label.as_deref(),
+            &blob_id,
+            &body.vector,
+            blob_size,
+        )
         .await?;
 
     tracing::info!(
-        "remember_manual complete: id={}, blob_id={}, ns={}",
+        "remember_manual complete: id={}, blob_id={}, agent={}",
         id,
         blob_id,
-        namespace
+        agent_object_id
     );
 
     Ok(Json(RememberManualResponse {
         id,
         blob_id,
         owner: owner.clone(),
-        namespace: namespace.clone(),
+        agent_object_id: agent_object_id.clone(),
+        sub_label: sub_label.clone(),
+        namespace: agent_object_id.clone(),
     }))
 }
 
@@ -474,26 +520,35 @@ pub async fn recall_manual(
     }
 
     let owner = &auth.owner;
-    let namespace = &body.namespace;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
     tracing::info!(
-        "recall_manual: vector_dims={} limit={} owner={} ns={}",
+        "recall_manual: vector_dims={} limit={} owner={} agent={} sub_label={:?}",
         body.vector.len(),
         body.limit,
         owner,
-        namespace
+        agent_object_id,
+        sub_label
     );
 
-    // Search Vector DB — return blob IDs + distances only
-    // MED-3 fix: Cap limit on recall_manual as well
     let limit = body.limit.min(100);
-    let hits = state.db.search_similar(&body.vector, owner, namespace, limit).await?;
+    let hits = state
+        .db
+        .search_similar(
+            &body.vector,
+            owner,
+            agent_object_id,
+            sub_label.as_deref(),
+            limit,
+        )
+        .await?;
     let total = hits.len();
 
     tracing::info!(
-        "recall_manual complete: {} results for owner={} ns={}",
+        "recall_manual complete: {} results for owner={} agent={}",
         total,
         owner,
-        namespace
+        agent_object_id
     );
 
     Ok(Json(RecallManualResponse {
@@ -518,13 +573,17 @@ pub async fn analyze(
     }
 
     let owner = &auth.owner;
-    let namespace = &body.namespace;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
     tracing::info!(
-        "analyze: text=\"{}...\" owner={} ns={}",
+        "analyze: text=\"{}...\" owner={} agent={} sub_label={:?}",
         truncate_str(&body.text, 50),
         owner,
-        namespace
+        agent_object_id,
+        sub_label
     );
+
+    ensure_agent_vault(&state, &auth).await?;
 
     // Step 1: Extract facts using LLM
     let extracted = extract_facts_llm(&state.http_client, &state.config, &body.text).await?;
@@ -566,19 +625,20 @@ pub async fn analyze(
     // Each fact gets its own key from the pool so sidecar can upload them in parallel
     // (different signer addresses bypass the per-signer serialization lock).
     let auth_agent_id = auth.agent_object_id.clone();
+    let sub_label_for_tasks = sub_label.clone();
     let tasks: Vec<_> = facts.iter().map(|fact_text| {
         let state = Arc::clone(&state);
         let owner = owner.clone();
         let fact_text = fact_text.clone();
         let agent_id = auth_agent_id.clone();
+        let agent_object_id = auth_agent_id.clone();
+        let sub_label = sub_label_for_tasks.clone();
         // Pick the next key in round-robin order at task construction time.
         // Convert to owned String *before* async move so we don't borrow-then-move `state`.
         let key_index: Result<usize, AppError> = state.key_pool.next_index()
             .ok_or_else(|| AppError::Internal("No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)".into()));
-        let namespace = namespace.clone();
         async move {
             let key_index = key_index?;
-            // Embed + MYDATA encrypt concurrently (independent operations)
             let embed_fut = generate_embedding(&state.http_client, &state.config, &fact_text);
             let encrypt_fut = mydata::mydata_encrypt(
                 &state.http_client, &state.config.sidecar_url,
@@ -589,7 +649,6 @@ pub async fn analyze(
             let vector = vector_result?;
             let encrypted = encrypted_result?;
 
-            // Upload to File Storage (via sidecar HTTP)
             let upload_result = file_storage::upload_blob(
                 &state.http_client,
                 &state.config.sidecar_url,
@@ -598,15 +657,22 @@ pub async fn analyze(
                 50,
                 &owner,
                 key_index,
-                &namespace,
+                &agent_object_id,
                 &state.config.package_id,
                 Some(&agent_id),
             ).await?;
 
-            // Store in Vector DB with namespace
             let blob_size = encrypted.len() as i64;
             let id = uuid::Uuid::new_v4().to_string();
-            state.db.insert_vector(&id, &owner, &namespace, &upload_result.blob_id, &vector, blob_size).await?;
+            state.db.insert_vector(
+                &id,
+                &owner,
+                &agent_object_id,
+                sub_label.as_deref(),
+                &upload_result.blob_id,
+                &vector,
+                blob_size,
+            ).await?;
 
             Ok::<AnalyzedFact, AppError>(AnalyzedFact {
                 text: fact_text,
@@ -797,10 +863,41 @@ where
 }
 
 /// GET /health
-pub async fn health() -> Json<HealthResponse> {
+pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let social = match state
+        .http_client
+        .get(format!(
+            "{}/health",
+            state.config.social_server_url.trim_end_matches('/')
+        ))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => Some("ok".into()),
+        _ => Some("degraded".into()),
+    };
+
+    let sidecar = match state
+        .http_client
+        .get(format!("{}/health", state.config.sidecar_url))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => Some("ok".into()),
+        _ => Some("degraded".into()),
+    };
+
+    let status = if social.as_deref() == Some("ok") && sidecar.as_deref() == Some("ok") {
+        "ok"
+    } else {
+        "degraded"
+    };
+
     Json(HealthResponse {
-        status: "ok".to_string(),
+        status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        social_server: social,
+        sidecar,
     })
 }
 
@@ -818,7 +915,7 @@ pub async fn health() -> Json<HealthResponse> {
 /// UX for v0.3.x apps that only passed `{ key, accountId }`.
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
     Json(ConfigResponse {
-        package_id: state.config.package_id.clone(),
+        package_id: crate::memory_contract::normalize_object_id(&state.config.package_id),
         network: state.config.myso_network.clone(),
         myso_rpc_url: state.config.myso_rpc_url.clone(),
     })
@@ -1103,21 +1200,28 @@ pub async fn ask(
     }
 
     let owner = &auth.owner;
-    let namespace = &body.namespace;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
     let limit = body.limit.unwrap_or(5);
     tracing::info!(
-        "ask: question=\"{}...\" owner={} ns={}",
+        "ask: question=\"{}...\" owner={} agent={} sub_label={:?}",
         truncate_str(&body.question, 50),
         owner,
-        namespace
+        agent_object_id,
+        sub_label
     );
 
-    // Step 1: Recall relevant memories
     let query_vector =
         generate_embedding(&state.http_client, &state.config, &body.question).await?;
     let hits = state
         .db
-        .search_similar(&query_vector, owner, namespace, limit)
+        .search_similar(
+            &query_vector,
+            owner,
+            agent_object_id,
+            sub_label.as_deref(),
+            limit,
+        )
         .await?;
 
     // ENG-1697: Prefer the client-built SessionKey; fall back to legacy
@@ -1146,6 +1250,8 @@ pub async fn ask(
             let credential = credential.clone();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
+            let platform_scope = auth.platform_scope.clone();
+            let platform_id = auth.platform_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
                 let encrypted_data = match file_storage::download_blob(
@@ -1173,6 +1279,8 @@ pub async fn ask(
                     &credential,
                     &package_id,
                     &account_id,
+                    platform_id.as_deref(),
+                    platform_scope.as_deref(),
                 )
                 .await
                 {
@@ -1349,14 +1457,17 @@ pub async fn restore(
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RestoreRequest>,
 ) -> Result<Json<RestoreResponse>, AppError> {
-    if body.namespace.is_empty() {
-        return Err(AppError::BadRequest("namespace cannot be empty".into()));
-    }
-
     let owner = &auth.owner;
-    let namespace = &body.namespace;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
     let limit = body.limit;
-    tracing::info!("restore: owner={} ns={} limit={}", owner, namespace, limit);
+    tracing::info!(
+        "restore: owner={} agent={} sub_label={:?} limit={}",
+        owner,
+        agent_object_id,
+        sub_label,
+        limit
+    );
 
     // ENG-1697: Prefer the client-built SessionKey; fall back to legacy
     // delegate key, then to the server's own key for restore operations.
@@ -1372,16 +1483,16 @@ pub async fn restore(
 
     // Step 1: Discover all blob_ids from on-chain (source of truth)
     tracing::info!(
-        "restore: querying chain for blobs owner={} ns={}",
+        "restore: querying chain for blobs owner={} agent={}",
         owner,
-        namespace
+        agent_object_id
     );
     let on_chain_blobs = file_storage::query_blobs_by_owner(
         &state.http_client,
         &state.config.sidecar_url,
         state.config.sidecar_secret.as_deref(),
         owner,
-        Some(namespace),
+        Some(agent_object_id),
         Some(&state.config.package_id),
     )
     .await?;
@@ -1401,13 +1512,14 @@ pub async fn restore(
             restored: 0,
             skipped: 0,
             total: 0,
-            namespace: namespace.clone(),
+            agent_object_id: agent_object_id.clone(),
+            sub_label: sub_label.clone(),
+            namespace: agent_object_id.clone(),
             owner: owner.clone(),
         }));
     }
 
-    // Step 2: Check which blobs already exist in local DB → only restore missing ones
-    let existing_blob_ids = state.db.get_blobs_by_namespace(owner, namespace).await?;
+    let existing_blob_ids = state.db.get_blobs_by_agent(owner, agent_object_id).await?;
     let existing_set: std::collections::HashSet<&str> =
         existing_blob_ids.iter().map(|s| s.as_str()).collect();
     let all_missing: Vec<String> = all_blob_ids
@@ -1423,12 +1535,12 @@ pub async fn restore(
     };
     let skipped = total - missing_blob_ids.len();
     tracing::info!(
-        "restore: total={} on-chain, existing={}, missing={} (limited to {}) for ns={}",
+        "restore: total={} on-chain, existing={}, missing={} (limited to {}) for agent={}",
         total,
         existing_blob_ids.len(),
         missing_blob_ids.len(),
         limit,
-        namespace
+        agent_object_id
     );
 
     if missing_blob_ids.is_empty() {
@@ -1436,7 +1548,9 @@ pub async fn restore(
             restored: 0,
             skipped,
             total,
-            namespace: namespace.clone(),
+            agent_object_id: agent_object_id.clone(),
+            sub_label: sub_label.clone(),
+            namespace: agent_object_id.clone(),
             owner: owner.clone(),
         }));
     }
@@ -1488,7 +1602,9 @@ pub async fn restore(
             restored: 0,
             skipped,
             total,
-            namespace: namespace.clone(),
+            agent_object_id: agent_object_id.clone(),
+            sub_label: sub_label.clone(),
+            namespace: agent_object_id.clone(),
             owner: owner.clone(),
         }));
     }
@@ -1514,6 +1630,8 @@ pub async fn restore(
                 .cloned()
                 .unwrap_or_else(|| state.config.package_id.clone());
             let account_id = auth.account_id.clone();
+            let platform_scope = auth.platform_scope.clone();
+            let platform_id = auth.platform_id.clone();
             async move {
                 match mydata::mydata_decrypt(
                     &http_client,
@@ -1523,6 +1641,8 @@ pub async fn restore(
                     &credential,
                     &package_id,
                     &account_id,
+                    platform_id.as_deref(),
+                    platform_scope.as_deref(),
                 )
                 .await
                 {
@@ -1590,24 +1710,34 @@ pub async fn restore(
         });
         state
             .db
-            .insert_vector(&id, owner, namespace, blob_id, vector, blob_size)
+            .insert_vector(
+                &id,
+                owner,
+                agent_object_id,
+                sub_label.as_deref(),
+                blob_id,
+                vector,
+                blob_size,
+            )
             .await?;
     }
 
     tracing::info!(
-        "restore complete: restored={} skipped={} total={} owner={} ns={}",
+        "restore complete: restored={} skipped={} total={} owner={} agent={}",
         restored,
         skipped,
         total,
         owner,
-        namespace
+        agent_object_id
     );
 
     Ok(Json(RestoreResponse {
         restored,
         skipped,
         total,
-        namespace: namespace.clone(),
+        agent_object_id: agent_object_id.clone(),
+        sub_label: sub_label.clone(),
+        namespace: agent_object_id.clone(),
         owner: owner.clone(),
     }))
 }

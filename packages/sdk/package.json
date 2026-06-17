@@ -1,6 +1,6 @@
 {
     "name": "@socialproof/memory",
-    "version": "0.0.2",
+    "version": "0.5.0",
     "description": "Memory — Privacy-first AI memory SDK with Ed25519 delegate key auth",
     "type": "module",
     "main": "./dist/index.js",

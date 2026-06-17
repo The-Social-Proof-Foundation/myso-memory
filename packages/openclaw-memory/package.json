@@ -1,6 +1,6 @@
 {
   "name": "@socialproof/oc-memory",
-  "version": "0.0.2",
+    "version": "0.5.0",
   "type": "module",
   "description": "NemoClaw/OpenClaw memory plugin — encrypted, decentralized long-term memory via Memory + File Storage",
   "license": "Apache-2.0",

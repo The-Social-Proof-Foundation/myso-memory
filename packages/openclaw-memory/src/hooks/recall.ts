@@ -2,8 +2,7 @@
  * Auto-recall hook — before_prompt_build.
  *
  * Searches Memory for memories relevant to the user's prompt and injects
- * them into the LLM context. Also injects a namespace instruction so
- * tools scope to the correct agent's memory.
+ * them into the LLM context. Scope is automatic via sub-agent authentication.
  */
 
 import type { Memory } from "@socialproof/memory";
@@ -16,58 +15,38 @@ import { MIN_PROMPT_LENGTH } from "../constants.js";
 /** Register the before_prompt_build hook for auto-recall. */
 export function registerRecallHook(api: any, client: Memory, config: PluginConfig): void {
   api.on("before_prompt_build", async (event: any, ctx: any) => {
-    // Skip trivial prompts ("ok", "y") — not worth a server round-trip
     if (!event.prompt || event.prompt.length < MIN_PROMPT_LENGTH) return;
 
-    const { namespace, agentName } = resolveAgent(config.defaultNamespace, ctx?.sessionKey);
-
-    // The LLM doesn't know which agent it is. This instruction guides
-    // memory_search/memory_store tool calls to the correct namespace.
-    // Returned via appendSystemContext in ALL code paths (including errors)
-    // so tools still scope correctly even when recall itself fails.
-    const namespaceInstruction =
-      `When using memory_search or memory_store tools, ` +
-      `pass namespace="${namespace}" to scope operations to the current agent's memory.`;
+    const { subLabel, agentName } = resolveAgent(config, ctx?.sessionKey);
 
     try {
       const result = await client.recall(
         event.prompt,
         config.maxRecallResults,
-        namespace,
+        subLabel,
       );
 
-      if (!result.results?.length) {
-        return { appendSystemContext: namespaceInstruction };
-      }
+      if (!result.results?.length) return;
 
-      // Two filters: relevance threshold (drop noise) and injection
-      // detection (drop memories containing prompt manipulation attempts)
       const relevant = result.results.filter(
         (r: any) =>
           (1 - r.distance) >= config.minRelevance &&
           !looksLikeInjection(r.text),
       );
 
-      if (!relevant.length) {
-        return { appendSystemContext: namespaceInstruction };
-      }
+      if (!relevant.length) return;
 
       api.logger.info(
-        `memory: auto-recall injected ${relevant.length} memories ` +
-        `(agent: ${agentName}, namespace: ${namespace})`,
+        `memory: auto-recall injected ${relevant.length} memories (agent: ${agentName})`,
       );
 
       return {
         prependContext: formatMemoriesForPrompt(
           relevant.map((r: any) => ({ text: r.text })),
         ),
-        appendSystemContext: namespaceInstruction,
       };
     } catch (err) {
-      api.logger.warn(
-        `memory: auto-recall failed: ${String(err)}`,
-      );
-      return { appendSystemContext: namespaceInstruction };
+      api.logger.warn(`memory: auto-recall failed: ${String(err)}`);
     }
   });
 }

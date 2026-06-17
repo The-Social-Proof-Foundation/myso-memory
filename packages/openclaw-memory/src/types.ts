@@ -3,22 +3,21 @@
  */
 
 export interface PluginConfig {
-  /** Ed25519 private key (hex). */
+  /** Ed25519 sub-agent private key (hex). */
   privateKey: string;
   /** MemoryAccount object ID on MySo. */
   accountId: string;
   /** Memory server URL. */
   serverUrl: string;
-  /** Default namespace for memory scoping (default: "default"). */
-  defaultNamespace: string;
-  /** Auto-inject relevant memories before each agent turn. */
+  /** Platform object ID when sub-agent has platform_scope. */
+  platformId?: string;
+  /** @deprecated Use subLabel. Kept for config backward compatibility. */
+  defaultNamespace?: string;
+  /** Optional tag within the authenticated agent vault. */
+  subLabel?: string;
   autoRecall: boolean;
-  /** Auto-extract and store facts after each agent turn. */
   autoCapture: boolean;
-  /** Max memories to inject per auto-recall. */
   maxRecallResults: number;
-  /** Min relevance threshold (0-1) for auto-recall filtering. */
   minRelevance: number;
-  /** Number of recent messages to send for auto-capture. */
   captureMaxMessages: number;
 }

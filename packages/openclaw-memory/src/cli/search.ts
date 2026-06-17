@@ -1,27 +1,27 @@
 /**
  * CLI command — openclaw memory search <query>
- *
- * Semantic search with JSON output, scoped by --agent flag.
  */
 
 import type { Memory } from "@socialproof/memory";
 import { resolveAgent } from "../config.js";
 import type { PluginConfig } from "../types.js";
 
-/** Register the `openclaw memory search` command. */
 export function registerSearchCommand(cmd: any, client: Memory, config: PluginConfig): void {
   cmd
     .command("search")
     .description("Search memories")
     .argument("<query>", "Search query")
     .option("--limit <n>", "Max results", "5")
-    .option("--agent <name>", "Search a specific agent's memory (namespace)")
+    .option("--agent <name>", "Optional sub-label scope for a named agent session")
     .action(async (query: string, opts: any) => {
-      const { namespace } = resolveAgent(config.defaultNamespace, opts.agent ? `agent:${opts.agent}:cli` : undefined);
+      const { subLabel } = resolveAgent(
+        config,
+        opts.agent ? `agent:${opts.agent}:cli` : undefined,
+      );
       const limit = parseInt(opts.limit, 10);
 
       try {
-        const result = await client.recall(query, limit, namespace);
+        const result = await client.recall(query, limit, subLabel);
         const output = result.results.map((r: any) => ({
           text: r.text,
           blob_id: r.blob_id,

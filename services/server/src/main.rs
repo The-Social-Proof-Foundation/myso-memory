@@ -1,11 +1,15 @@
 mod auth;
 mod db;
+mod lifecycle;
+mod memory_contract;
+mod policy;
 mod rate_limit;
 mod routes;
 mod mydata;
 mod myso;
 mod social;
 mod types;
+mod vault;
 #[path = "file-storage.rs"]
 mod file_storage;
 
@@ -127,16 +131,16 @@ async fn main() {
         fallback_rate_limit: tokio::sync::Mutex::new(crate::rate_limit::InMemoryFallback::default()),
     });
 
-    // Spawn background task for cache eviction
+    // Spawn background task for cache eviction + lifecycle sync
     let evict_state = state.clone();
     tokio::spawn(async move {
-        // Run every hour
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             interval.tick().await;
             if let Err(e) = evict_state.db.evict_expired_sub_agents().await {
                 tracing::error!("Background eviction failed: {}", e);
             }
+            lifecycle::run_lifecycle_sync(evict_state.clone()).await;
         }
     });
 

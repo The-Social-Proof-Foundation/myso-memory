@@ -27,8 +27,19 @@ import { FileStorageClient } from "@socialproof/file-storage";
 // Environment-driven network config
 // ============================================================
 
-const MYSO_NETWORK = (process.env.MYSO_NETWORK || "mainnet") as "mainnet" | "testnet";
-const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
+const MYSO_NETWORK_RAW = process.env.MYSO_NETWORK || "mainnet";
+// File Storage SDK only accepts mainnet|testnet; map devnet/localnet to testnet.
+const FILE_STORAGE_NETWORK: "mainnet" | "testnet" =
+    MYSO_NETWORK_RAW === "mainnet" ? "mainnet" : "testnet";
+
+const MYSO_RPC_URL =
+    process.env.MYSO_RPC_URL ||
+    getJsonRpcFullnodeUrl(FILE_STORAGE_NETWORK);
+
+const mysoClient = new MySoJsonRpcClient({
+    url: MYSO_RPC_URL,
+    network: FILE_STORAGE_NETWORK,
+});
 
 // MYDATA key server object IDs (comma-separated via env var). Duplicates are
 // ignored — @socialproof/mydata throws InvalidClientOptionsError if any repeat.
@@ -63,23 +74,18 @@ if (SERVER_MYSO_PRIVATE_KEYS.length === 0) {
 
 // File Storage package ID (for on-chain Move calls: metadata, blob type queries)
 const FILE_STORAGE_PACKAGE_ID = process.env.FILE_STORAGE_PACKAGE_ID || (
-    MYSO_NETWORK === "testnet"
+    FILE_STORAGE_NETWORK === "testnet"
         ? "0xd84704c17fc870b8764832c535aa6b11f21a95cd6f5bb38a9b07d2cf42220c66"
         : "0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77"
 );
 
 const FILE_STORAGE_UPLOAD_RELAY_URL = process.env.FILE_STORAGE_UPLOAD_RELAY_URL || (
-    MYSO_NETWORK === "testnet"
+    FILE_STORAGE_NETWORK === "testnet"
         ? "https://upload-relay.testnet.mysocial.network"
         : "https://upload-relay.mainnet.mysocial.network"
 );
 
-const DEFAULT_FILE_STORAGE_EPOCHS = MYSO_NETWORK === "testnet" ? 50 : 3;
-
-const mysoClient = new MySoJsonRpcClient({
-    url: getJsonRpcFullnodeUrl(MYSO_NETWORK),
-    network: MYSO_NETWORK,
-});
+const DEFAULT_FILE_STORAGE_EPOCHS = FILE_STORAGE_NETWORK === "testnet" ? 50 : 3;
 
 const mydataClient = new MyDataClient({
     mysoClient: mysoClient as any,
@@ -91,13 +97,15 @@ const mydataClient = new MyDataClient({
 });
 
 const fileStorageClient = new FileStorageClient({
-    network: MYSO_NETWORK,
+    network: FILE_STORAGE_NETWORK,
     mysoClient: mysoClient as any,
     uploadRelay: {
         host: FILE_STORAGE_UPLOAD_RELAY_URL,
         sendTip: { max: 10_000_000 },
     },
 });
+
+const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
 
 const COIN_WITH_BALANCE_INTENT = "CoinWithBalance";
 const GAS_INTENT_TYPE = "gas";
@@ -427,9 +435,18 @@ async function resolveSessionKey(
 // ============================================================
 app.post("/mydata/decrypt", async (req, res) => {
     try {
-        const { data, packageId, accountId } = req.body;
+        const { data, packageId, accountId, platformId, platformScope } = req.body;
         if (!data || !packageId || !accountId) {
             return res.status(400).json({ error: "Missing required fields: data, packageId, accountId" });
+        }
+
+        // Defense-in-depth: when caller declares platform_scope, require matching platformId.
+        if (platformScope) {
+            const actionPlatform = platformId ?? req.headers["x-platform-id"];
+            const normalize = (a: string) => a.replace(/^0x/i, "").toLowerCase();
+            if (!actionPlatform || normalize(String(platformScope)) !== normalize(String(actionPlatform))) {
+                return res.status(403).json({ error: "platform scope mismatch" });
+            }
         }
 
         // ENG-1697: resolve credential (x-mydata-session preferred; legacy
@@ -962,6 +979,66 @@ app.post("/file-storage/query-blobs", async (req, res) => {
     }
 });
 
+function keypairFromPool(keyIndex: number): Ed25519Keypair {
+    const privateKey = SERVER_MYSO_PRIVATE_KEYS[keyIndex];
+    if (!privateKey) {
+        throw new Error(`Invalid keyIndex: ${keyIndex}`);
+    }
+    const { secretKey } = decodeMySoPrivateKey(privateKey);
+    return Ed25519Keypair.fromSecretKey(secretKey);
+}
+
+// ============================================================
+// POST /memory/ensure-vault — lazy-create AgentMemoryVault on-chain
+// ============================================================
+app.post("/memory/ensure-vault", async (req, res) => {
+    try {
+        const { accountId, agentObjectId, packageId, keyIndex = 0 } = req.body;
+        if (!accountId || !agentObjectId || !packageId) {
+            return res.status(400).json({
+                error: "Missing required fields: accountId, agentObjectId, packageId",
+            });
+        }
+
+        const keypair = keypairFromPool(Number(keyIndex) || 0);
+        const tx = new Transaction();
+        tx.moveCall({
+            target: `${packageId}::memory::ensure_agent_memory_vault`,
+            arguments: [
+                tx.object(accountId),
+                tx.object(agentObjectId),
+                tx.object(MYSO_CLOCK),
+            ],
+        });
+
+        const result = await mysoClient.signAndExecuteTransaction({
+            signer: keypair,
+            transaction: tx,
+            options: { showEffects: true, showObjectChanges: true },
+        });
+
+        let vaultId: string | undefined;
+        const changes = result.objectChanges ?? [];
+        for (const change of changes) {
+            if (
+                change.type === "created" &&
+                change.objectType?.includes("::memory::AgentMemoryVault")
+            ) {
+                vaultId = change.objectId;
+                break;
+            }
+        }
+
+        console.log(
+            `[memory/ensure-vault] agent=${agentObjectId} vault=${vaultId ?? "existing"} digest=${result.digest}`,
+        );
+        res.json({ vaultId: vaultId ?? null, digest: result.digest });
+    } catch (err: any) {
+        console.error(`[memory/ensure-vault] error: ${err.message || err}`);
+        res.status(500).json({ error: err.message || String(err) });
+    }
+});
+
 // ============================================================
 // POST /sponsor — Create Enoki-sponsored transaction for frontend
 // Frontend sends TransactionKind bytes + sender → returns sponsored { bytes, digest }
@@ -1035,7 +1112,7 @@ app.post("/sponsor/execute", async (req, res) => {
 // Start server
 // ============================================================
 
-const PORT = parseInt(process.env.SIDECAR_PORT || "9000", 10);
+const PORT = parseInt(process.env.SIDECAR_PORT || "9001", 10);
 const HOST = process.env.SIDECAR_HOST || "127.0.0.1";
 app.listen(PORT, HOST, () => {
     console.log(JSON.stringify({

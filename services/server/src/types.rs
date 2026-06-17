@@ -124,7 +124,12 @@ impl Config {
                 .unwrap_or_else(|_| default_rpc.to_string()),
             myso_network: network.clone(),
             memory_account_id: std::env::var("MEMORY_ACCOUNT_ID").ok(),
-            openai_api_key: std::env::var("OPENAI_API_KEY").ok(),
+            openai_api_key: std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|s| {
+                    let t = s.trim();
+                    !t.is_empty() && !t.contains("...")
+                }),
             openai_api_base: std::env::var("OPENAI_API_BASE")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
             file_storage_publisher_url: std::env::var("FILE_STORAGE_PUBLISHER_URL")
@@ -145,12 +150,14 @@ impl Config {
                 let single = std::env::var("SERVER_MYSO_PRIVATE_KEY").ok().map(|k| vec![k]);
                 multi.or(single).unwrap_or_default()
             },
-            package_id: std::env::var("MEMORY_PACKAGE_ID")
-                .expect("MEMORY_PACKAGE_ID must be set"),
+            package_id: crate::memory_contract::normalize_object_id(
+                &std::env::var("MEMORY_PACKAGE_ID")
+                    .expect("MEMORY_PACKAGE_ID must be set"),
+            ),
             social_server_url: std::env::var("SOCIAL_SERVER_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:9126".to_string()),
             sidecar_url: std::env::var("SIDECAR_URL")
-                .unwrap_or_else(|_| "http://localhost:9000".to_string()),
+                .unwrap_or_else(|_| "http://localhost:9001".to_string()),
             sidecar_secret: std::env::var("SIDECAR_AUTH_TOKEN").ok(),
             rate_limit: RateLimitConfig::from_env(),
             sponsor_rate_limit: SponsorRateLimitConfig::from_env(),
@@ -208,8 +215,8 @@ impl SponsorRateLimitConfig {
 #[derive(Debug, Deserialize)]
 pub struct RememberRequest {
     pub text: String,
-    /// Namespace for memory isolation (default: "default")
-    #[serde(default = "default_namespace")]
+    /// Deprecated: use `sub_label`. Optional tag within the authenticated agent vault.
+    #[serde(default, alias = "sub_label")]
     pub namespace: String,
 }
 
@@ -218,6 +225,10 @@ pub struct RememberResponse {
     pub id: String,
     pub blob_id: String,
     pub owner: String,
+    pub agent_object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_label: Option<String>,
+    /// Deprecated alias kept for SDK compatibility.
     pub namespace: String,
 }
 
@@ -228,16 +239,12 @@ fn default_limit() -> usize {
     10
 }
 
-fn default_namespace() -> String {
-    "default".to_string()
-}
-
 #[derive(Debug, Deserialize)]
 pub struct RecallRequest {
     pub query: String,
     #[serde(default = "default_limit")]
     pub limit: usize,
-    #[serde(default = "default_namespace")]
+    #[serde(default, alias = "sub_label")]
     pub namespace: String,
 }
 
@@ -277,7 +284,7 @@ pub struct SearchHit {
 pub struct AnalyzeRequest {
     /// Conversation text to analyze for memorable facts
     pub text: String,
-    #[serde(default = "default_namespace")]
+    #[serde(default, alias = "sub_label")]
     pub namespace: String,
 }
 
@@ -300,9 +307,14 @@ pub struct AnalyzeResponse {
 /// Server uploads to File Storage via sidecar, then stores the vector ↔ blobId mapping.
 #[derive(Debug, Deserialize)]
 pub struct RememberManualRequest {
-    pub encrypted_data: String,  // base64-encoded MYDATA-encrypted bytes
+    /// Pre-uploaded File Storage blob ID (client did encrypt + upload externally).
+    #[serde(default)]
+    pub blob_id: Option<String>,
+    /// Base64 MYDATA-encrypted bytes — server uploads when `blob_id` is absent.
+    #[serde(default)]
+    pub encrypted_data: String,
     pub vector: Vec<f32>,
-    #[serde(default = "default_namespace")]
+    #[serde(default, alias = "sub_label")]
     pub namespace: String,
 }
 
@@ -311,6 +323,9 @@ pub struct RememberManualResponse {
     pub id: String,
     pub blob_id: String,
     pub owner: String,
+    pub agent_object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_label: Option<String>,
     pub namespace: String,
 }
 
@@ -322,7 +337,7 @@ pub struct RecallManualRequest {
     pub vector: Vec<f32>,
     #[serde(default = "default_limit")]
     pub limit: usize,
-    #[serde(default = "default_namespace")]
+    #[serde(default, alias = "sub_label")]
     pub namespace: String,
 }
 
@@ -340,7 +355,7 @@ pub struct AskRequest {
     pub question: String,
     /// Max memories to inject (default: 5)
     pub limit: Option<usize>,
-    #[serde(default = "default_namespace")]
+    #[serde(default, alias = "sub_label")]
     pub namespace: String,
 }
 
@@ -359,6 +374,7 @@ fn default_restore_limit() -> usize {
 
 #[derive(Debug, Deserialize)]
 pub struct RestoreRequest {
+    #[serde(default, alias = "sub_label")]
     pub namespace: String,
     /// Max blobs to restore (default: 50)
     #[serde(default = "default_restore_limit")]
@@ -370,6 +386,9 @@ pub struct RestoreResponse {
     pub restored: usize,
     pub skipped: usize,
     pub total: usize,
+    pub agent_object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_label: Option<String>,
     pub namespace: String,
     pub owner: String,
 }
@@ -379,6 +398,10 @@ pub struct RestoreResponse {
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub social_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidecar: Option<String>,
 }
 
 /// GET /config response (ENG-1697).
@@ -437,10 +460,28 @@ pub struct AuthInfo {
     pub derived_address: String,
     /// Capability bitmap from on-chain SubAgent.
     pub capabilities: u64,
+    pub approval_required_caps: u64,
+    pub max_action_spend: Option<u64>,
+    pub platform_scope: Option<String>,
+    /// `x-platform-id` header from the client request (when present).
+    pub platform_id: Option<String>,
+    pub label: String,
     /// Sub-agent private key (hex) for MYDATA decrypt — legacy path.
     pub sub_agent_key: Option<String>,
     /// Exported MYDATA SessionKey (base64 JSON).
     pub mydata_session: Option<String>,
+    /// True when owner co-signed this request (approval-gated writes).
+    pub owner_co_signed: bool,
+}
+
+/// Parse optional sub_label from deprecated namespace field.
+pub fn parse_sub_label(namespace: &str) -> Option<String> {
+    let trimmed = namespace.trim();
+    if trimmed.is_empty() || trimmed == "default" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 impl std::fmt::Debug for AuthInfo {
@@ -552,8 +593,14 @@ mod tests {
             agent_object_id: "0xagent".to_string(),
             derived_address: "0xderived".to_string(),
             capabilities: 3,
+            approval_required_caps: 0,
+            max_action_spend: None,
+            platform_scope: None,
+            platform_id: None,
+            label: "test".to_string(),
             sub_agent_key: None,
             mydata_session: None,
+            owner_co_signed: false,
         }
     }
 

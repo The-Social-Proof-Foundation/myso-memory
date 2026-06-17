@@ -16,8 +16,20 @@ export interface MemoryConfig {
     accountId: string;
     /** Server URL (default: http://localhost:8000) */
     serverUrl?: string;
-    /** Default namespace for memory isolation (default: "default") */
+    /**
+     * @deprecated Agent isolation is implicit via the authenticated sub-agent.
+     * Use `subLabel` for optional tags within the agent vault.
+     */
     namespace?: string;
+    /** Optional tag within the authenticated agent's vault (maps to server `sub_label`). */
+    subLabel?: string;
+    /** Platform object ID — sent as `x-platform-id` when the sub-agent has `platform_scope`. */
+    platformId?: string;
+    /**
+     * Owner Ed25519 private key (hex) for co-signing approval-gated writes.
+     * Signs the same canonical message as the sub-agent (`x-owner-public-key` / `x-owner-signature`).
+     */
+    ownerCoSignKey?: string | Uint8Array;
 }
 
 // ============================================================
@@ -29,6 +41,9 @@ export interface RememberResult {
     id: string;
     blob_id: string;
     owner: string;
+    agent_object_id: string;
+    sub_label?: string;
+    /** @deprecated Use `agent_object_id` + optional `sub_label`. */
     namespace: string;
 }
 
@@ -82,6 +97,8 @@ export interface RememberManualOptions {
     vector: number[];
     /** Namespace (default: config namespace or "default") */
     namespace?: string;
+    /** Optional sub-label within agent vault */
+    subLabel?: string;
 }
 
 /** Result from rememberManual() */
@@ -100,6 +117,8 @@ export interface RecallManualOptions {
     limit?: number;
     /** Namespace (default: config namespace or "default") */
     namespace?: string;
+    /** Optional sub-label within agent vault */
+    subLabel?: string;
 }
 
 /** A single search hit — raw blobId + distance (no decrypted text) */
@@ -280,4 +299,35 @@ export interface DeactivateSubAgentOpts extends MemoryTxOpts {
 export interface RevokeSubAgentOpts extends MemoryTxOpts {
     accountId: string;
     agentObjectId: string;
+}
+
+/** Options for updateSubAgent() */
+export interface UpdateSubAgentOpts extends MemoryTxOpts, SubAgentRegistrationFields {
+    agentObjectId: string;
+}
+
+/** Options for updateSubAgentLabel() */
+export interface UpdateSubAgentLabelOpts extends MemoryTxOpts {
+    accountId: string;
+    agentObjectId: string;
+    label: string;
+}
+
+/** Options for ensureAgentMemoryVault() */
+export interface EnsureAgentMemoryVaultOpts extends MemoryTxOpts {
+    accountId: string;
+    agentObjectId: string;
+}
+
+/** Result from ensureAgentMemoryVault() */
+export interface EnsureAgentMemoryVaultResult {
+    digest: string;
+    vaultId: string;
+}
+
+/** Options for approveKeyPolicy / approveKeyWritePolicy PTB builders */
+export interface ApproveKeyPolicyOpts extends MemoryTxOpts {
+    accountId: string;
+    /** MYDATA encryption id (hex string) */
+    id: string;
 }

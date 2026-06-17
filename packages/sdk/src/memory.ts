@@ -83,7 +83,11 @@ export class Memory {
     private privateKey: Uint8Array;
     private publicKey: Uint8Array | null = null;
     private serverUrl: string;
+    /** @deprecated Prefer subLabel; kept for backward compatibility. */
     private namespace: string;
+    private subLabel?: string;
+    private platformId?: string;
+    private ownerCoSignKey: Uint8Array | null;
     private accountId: string;
 
     // ENG-1697 state — all internal, never surfaced to user code.
@@ -101,6 +105,16 @@ export class Memory {
         // non-localhost host.
         this.serverUrl = normalizeServerUrl(config.serverUrl ?? "https://memory.mysocial.network/");
         this.namespace = config.namespace ?? "default";
+        this.subLabel = config.subLabel ?? (config.namespace && config.namespace !== "default"
+            ? config.namespace
+            : undefined);
+        this.platformId = config.platformId;
+        this.ownerCoSignKey = config.ownerCoSignKey
+            ? (typeof config.ownerCoSignKey === "string"
+                ? hexToBytes(config.ownerCoSignKey)
+                : config.ownerCoSignKey)
+            : null;
+        this.accountId = config.accountId;
     }
 
     /**
@@ -124,6 +138,9 @@ export class Memory {
         if (this.publicKey) {
             this.publicKey.fill(0);
         }
+        if (this.ownerCoSignKey) {
+            this.ownerCoSignKey.fill(0);
+        }
         // ENG-1697: drop cached session material too — once destroyed the
         // instance must not leak authorization tokens either.
         this.sessionCache = null;
@@ -146,10 +163,10 @@ export class Memory {
      * console.log(result.blob_id) // "TY8mW0yr..."
      * ```
      */
-    async remember(text: string, namespace?: string): Promise<RememberResult> {
+    async remember(text: string, subLabel?: string): Promise<RememberResult> {
         return this.signedRequest<RememberResult>("POST", "/api/remember", {
             text,
-            namespace: namespace ?? this.namespace,
+            ...this.scopeFields(subLabel),
         });
     }
 
@@ -169,14 +186,14 @@ export class Memory {
      * }
      * ```
      */
-    async recall(query: string, limit: number = 10, namespace?: string): Promise<RecallResult> {
+    async recall(query: string, limit: number = 10, subLabel?: string): Promise<RecallResult> {
         const ac = new AbortController();
         const tid = setTimeout(() => ac.abort(), 15000);
         try {
             return await this.signedRequest<RecallResult>("POST", "/api/recall", {
                 query,
                 limit,
-                namespace: namespace ?? this.namespace,
+                ...this.scopeFields(subLabel),
             }, { signal: ac.signal });
         } finally {
             clearTimeout(tid);
@@ -216,41 +233,12 @@ export class Memory {
             {
                 blob_id: opts.blobId,
                 vector: opts.vector,
-                namespace: opts.namespace ?? this.namespace,
+                ...this.scopeFields(opts.namespace ?? opts.subLabel),
             },
             { includeDelegateKey: false },
         );
     }
 
-    /**
-     * Recall (manual mode) — user provides a pre-computed query vector.
-     * Server returns matching blobIds + distances.
-     * User then downloads from File Storage + MYDATA decrypts on their own.
-     *
-     * Trust boundary (ENG-1696): the delegate private key is NOT transmitted on
-     * this request. Server returns blob IDs only; decryption happens entirely
-     * on the client.
-     *
-     * @param opts.vector - Pre-computed query embedding vector
-     * @param opts.limit - Max results (default: 10)
-     * @returns RecallManualResult with blob_id + distance pairs (no decrypted text)
-     *
-     * @example
-     * ```typescript
-     * // 1. User generates query embedding
-     * const queryVector = await myEmbeddingModel.embed("food allergies")
-     *
-     * // 2. Search for similar vectors
-     * const hits = await memory.recallManual({ vector: queryVector })
-     *
-     * // 3. User downloads + decrypts each result
-     * for (const hit of hits.results) {
-     *     const encrypted = await fileStorage.download(hit.blob_id)
-     *     const plaintext = await mydata.decrypt(encrypted)
-     *     console.log(plaintext, hit.distance)
-     * }
-     * ```
-     */
     async recallManual(opts: RecallManualOptions): Promise<RecallManualResult> {
         return this.signedRequest<RecallManualResult>(
             "POST",
@@ -258,7 +246,7 @@ export class Memory {
             {
                 vector: opts.vector,
                 limit: opts.limit ?? 10,
-                namespace: opts.namespace ?? this.namespace,
+                ...this.scopeFields(opts.namespace ?? opts.subLabel),
             },
             { includeDelegateKey: false },
         );
@@ -287,30 +275,20 @@ export class Memory {
      * console.log(result.facts) // ["User loves coffee", "User lives in Tokyo"]
      * ```
      */
-    async analyze(text: string, namespace?: string): Promise<AnalyzeResult> {
+    async analyze(text: string, subLabel?: string): Promise<AnalyzeResult> {
         return this.signedRequest<AnalyzeResult>("POST", "/api/analyze", {
             text,
-            namespace: namespace ?? this.namespace,
+            ...this.scopeFields(subLabel),
         });
     }
 
     /**
-     * Restore a namespace — server downloads all blobs from File Storage,
-     * decrypts with delegate key, re-embeds, and re-indexes.
-     *
-     * @param namespace - Namespace to restore
-     * @returns RestoreResult with count of restored entries
-     *
-     * @example
-     * ```typescript
-     * const result = await memory.restore("my-app")
-     * console.log(`Restored ${result.restored} memories`)
-     * ```
+     * Restore — re-index blobs for the authenticated agent from File Storage.
      */
-    async restore(namespace: string, limit: number = 50): Promise<RestoreResult> {
+    async restore(limit: number = 50, subLabel?: string): Promise<RestoreResult> {
         return this.signedRequest<RestoreResult>("POST", "/api/restore", {
-            namespace,
             limit,
+            ...this.scopeFields(subLabel),
         });
     }
 
@@ -350,6 +328,21 @@ export class Memory {
     // ============================================================
     // Internal: Signed HTTP Requests
     // ============================================================
+
+    private scopeFields(subLabel?: string): { namespace?: string } {
+        const label = subLabel ?? this.subLabel;
+        if (label && label !== "default") {
+            return { namespace: label };
+        }
+        return {};
+    }
+
+    private isWriteRoute(method: string, path: string): boolean {
+        if (method !== "POST") return false;
+        return path.startsWith("/api/remember")
+            || path.startsWith("/api/analyze")
+            || path.startsWith("/api/restore");
+    }
 
     private async getPublicKey(): Promise<Uint8Array> {
         if (!this.publicKey) {
@@ -558,6 +551,15 @@ export class Memory {
             "x-nonce": nonce,           // MED-1: replay protection
             "x-account-id": this.accountId,
         };
+        if (this.platformId) {
+            headers["x-platform-id"] = this.platformId;
+        }
+        if (this.ownerCoSignKey && this.isWriteRoute(method, path)) {
+            const ownerSig = await ed.signAsync(msgBytes, this.ownerCoSignKey);
+            const ownerPk = await ed.getPublicKeyAsync(this.ownerCoSignKey);
+            headers["x-owner-public-key"] = bytesToHex(ownerPk);
+            headers["x-owner-signature"] = bytesToHex(ownerSig);
+        }
         // ENG-1696 / ENG-1697: attach a MYDATA credential only on Relayer-
         // mode routes where the server needs it for server-side MYDATA
         // decrypt. Manual-mode methods (rememberManual, recallManual) opt

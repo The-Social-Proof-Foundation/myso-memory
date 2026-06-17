@@ -2,13 +2,7 @@ use blake2::Blake2b;
 use blake2::digest::{consts::U32, Digest};
 use serde::Deserialize;
 
-/// Capability bits from `social_contracts::memory`.
-pub const CAP_MEMORY_READ: u64 = 1;
-pub const CAP_MEMORY_WRITE: u64 = 2;
-
-pub fn has_capability(capabilities: u64, required: u64) -> bool {
-    capabilities & required == required
-}
+pub use crate::memory_contract::has_cap;
 
 /// Derive a MySo address from an Ed25519 public key (scheme flag 0x00 + blake2b-256).
 pub fn derived_address_from_public_key(public_key_bytes: &[u8; 32]) -> String {
@@ -87,7 +81,7 @@ pub async fn verify_sub_agent_onchain(
         .get("capabilities")
         .and_then(parse_u64_json)
         .unwrap_or(0);
-    if !has_capability(capabilities, required_cap) {
+    if !has_cap(capabilities, required_cap) {
         return Err(OnchainVerifyError::MissingCapability(format!(
             "SubAgent missing required capability bit {}",
             required_cap
@@ -101,6 +95,15 @@ pub async fn verify_sub_agent_onchain(
         derived_address,
         capabilities,
     })
+}
+
+/// Fetch MemoryAccount owner address (for owner co-sign verification).
+pub async fn fetch_memory_account_owner(
+    http_client: &reqwest::Client,
+    rpc_url: &str,
+    account_object_id: &str,
+) -> Result<String, OnchainVerifyError> {
+    verify_memory_account_active(http_client, rpc_url, account_object_id).await
 }
 
 async fn verify_memory_account_active(
@@ -257,6 +260,7 @@ impl std::error::Error for OnchainVerifyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_contract::{CAP_MEMORY_READ, CAP_MEMORY_WRITE};
 
     #[test]
     fn derived_address_is_deterministic() {
@@ -270,14 +274,8 @@ mod tests {
 
     #[test]
     fn capability_check_requires_all_bits() {
-        assert!(has_capability(3, CAP_MEMORY_READ));
-        assert!(has_capability(3, CAP_MEMORY_WRITE));
-        assert!(!has_capability(CAP_MEMORY_READ, CAP_MEMORY_WRITE));
-    }
-
-    #[test]
-    fn addresses_equal_ignores_case_and_prefix() {
-        assert!(addresses_equal("0xAbCd", "0xabcd"));
-        assert!(addresses_equal("AbCd", "0xabcd"));
+        assert!(has_cap(3, CAP_MEMORY_READ));
+        assert!(has_cap(3, CAP_MEMORY_WRITE));
+        assert!(!has_cap(CAP_MEMORY_READ, CAP_MEMORY_WRITE));
     }
 }

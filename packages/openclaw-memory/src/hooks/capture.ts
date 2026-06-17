@@ -1,9 +1,9 @@
 /**
  * Auto-capture hook — agent_end.
  *
- * After the LLM finishes a turn, extracts conversation text, filters
- * for capturable content, and sends to Memory's analyze() endpoint
- * for server-side fact extraction.
+ * After the LLM finishes a turn, extracts conversation text and sends to
+ * Memory's analyze() endpoint for server-side fact extraction.
+ * Scope is automatic via sub-agent authentication.
  */
 
 import type { Memory } from "@socialproof/memory";
@@ -17,12 +17,9 @@ export function registerCaptureHook(api: any, client: Memory, config: PluginConf
   api.on("agent_end", async (event: any, ctx: any) => {
     if (!event.success || !event.messages?.length) return;
 
-    const { namespace, agentName } = resolveAgent(config.defaultNamespace, ctx?.sessionKey);
+    const { subLabel, agentName } = resolveAgent(config, ctx?.sessionKey);
 
     try {
-      // Extract both user and assistant messages — the server LLM on analyze()
-      // decides what's worth keeping. Assistant messages can contain user
-      // commitments, decisions, and summaries that are valuable as memories.
       const texts = extractMessageTexts(
         event.messages,
         config.captureMaxMessages,
@@ -30,7 +27,6 @@ export function registerCaptureHook(api: any, client: Memory, config: PluginConf
 
       if (!texts.length) return;
 
-      // Filter individual messages — skip if none are worth capturing
       const capturable = texts.filter((t) => shouldCapture(t));
       if (!capturable.length) {
         api.logger.debug?.(
@@ -40,26 +36,19 @@ export function registerCaptureHook(api: any, client: Memory, config: PluginConf
         return;
       }
 
-      // Numbered list helps the server LLM distinguish separate messages
-      // during fact extraction (vs one big wall of text)
       const conversation = capturable
         .map((t, i) => `${i + 1}. ${t}`)
         .join("\n\n");
 
-      // analyze() calls the server LLM for fact extraction — retry once
-      // since transient failures are common with remote LLM calls
-      const result = await withRetry(() => client.analyze(conversation, namespace));
+      const result = await withRetry(() => client.analyze(conversation, subLabel));
 
       if (result.facts?.length) {
         api.logger.info(
-          `memory: auto-captured ${result.facts.length} facts ` +
-          `(agent: ${agentName}, namespace: ${namespace})`,
+          `memory: auto-captured ${result.facts.length} facts (agent: ${agentName})`,
         );
       }
     } catch (err) {
-      api.logger.warn(
-        `memory: auto-capture failed: ${String(err)}`,
-      );
+      api.logger.warn(`memory: auto-capture failed: ${String(err)}`);
     }
   });
 }

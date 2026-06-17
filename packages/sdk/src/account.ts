@@ -36,21 +36,33 @@ import type {
     RegisterSubAgentDelegatedOpts,
     DeactivateSubAgentOpts,
     RevokeSubAgentOpts,
+    UpdateSubAgentOpts,
+    UpdateSubAgentLabelOpts,
+    EnsureAgentMemoryVaultOpts,
+    EnsureAgentMemoryVaultResult,
+    ApproveKeyPolicyOpts,
 } from "./types.js";
 import { bytesToHex, hexToBytes } from "./utils.js";
+import {
+    CAP_MEMORY_READ,
+    CAP_MEMORY_WRITE,
+    CLASS_DELEGATED_AI,
+    REGISTER_SCOPE_BOTH,
+} from "./contract.js";
 
-// ============================================================
-// Capability + identity constants (mirror memory.move)
-// ============================================================
-
-export const CAP_MEMORY_READ = 1;
-export const CAP_MEMORY_WRITE = 2;
-
-export const CLASS_DELEGATED_AI = 1;
-
-export const REGISTER_SCOPE_CHILD = 1;
-export const REGISTER_SCOPE_PEER = 2;
-export const REGISTER_SCOPE_BOTH = 3;
+export {
+    CAP_MEMORY_READ,
+    CAP_MEMORY_WRITE,
+    CAP_MYDATA_READ,
+    CLASS_HUMAN,
+    CLASS_DELEGATED_AI,
+    CLASS_ORGANIZATION,
+    REGISTER_SCOPE_CHILD,
+    REGISTER_SCOPE_PEER,
+    REGISTER_SCOPE_BOTH,
+    REGISTER_RELATION_CHILD,
+    REGISTER_RELATION_PEER,
+} from "./contract.js";
 
 const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
 
@@ -402,4 +414,175 @@ export async function generateSubAgentKey(): Promise<{
         publicKey,
         derivedAddress,
     };
+}
+
+// ============================================================
+// updateSubAgent / updateSubAgentLabel
+// ============================================================
+
+export async function updateSubAgent(
+    opts: UpdateSubAgentOpts,
+): Promise<{ digest: string }> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::update_sub_agent`,
+        arguments: [
+            tx.object(opts.accountId),
+            tx.object(opts.agentObjectId),
+            tx.pure("u8", opts.identityClass ?? CLASS_DELEGATED_AI),
+            tx.pure("u64", opts.roleTags ?? 0),
+            tx.pure("u64", opts.capabilities ?? (CAP_MEMORY_READ | CAP_MEMORY_WRITE)),
+            tx.pure("u64", opts.delegatableCaps ?? 0),
+            tx.pure("u8", opts.registerScope ?? REGISTER_SCOPE_BOTH),
+            tx.pure("u64", opts.approvalRequiredCaps ?? 0),
+            tx.pure("option<u64>", opts.maxActionSpend ?? null),
+            tx.pure("option<address>", opts.platformScope ?? null),
+            tx.pure("option<u64>", opts.expiresAt ?? null),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+
+    const { digest } = await signAndExecute(ctx, tx);
+    return { digest };
+}
+
+export async function updateSubAgentLabel(
+    opts: UpdateSubAgentLabelOpts,
+): Promise<{ digest: string }> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::update_sub_agent_label`,
+        arguments: [
+            tx.object(opts.accountId),
+            tx.object(opts.agentObjectId),
+            tx.pure("string", opts.label),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+
+    const { digest } = await signAndExecute(ctx, tx);
+    return { digest };
+}
+
+// ============================================================
+// ensureAgentMemoryVault
+// ============================================================
+
+export async function ensureAgentMemoryVault(
+    opts: EnsureAgentMemoryVaultOpts,
+): Promise<EnsureAgentMemoryVaultResult> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::ensure_agent_memory_vault`,
+        arguments: [
+            tx.object(opts.accountId),
+            tx.object(opts.agentObjectId),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+
+    const { digest, effects } = await signAndExecute(ctx, tx);
+    let vaultId = "";
+    for (const change of effects?.objectChanges ?? []) {
+        if (
+            change.type === "created" &&
+            change.objectType?.includes("::memory::AgentMemoryVault")
+        ) {
+            vaultId = change.objectId;
+            break;
+        }
+    }
+    return { digest, vaultId };
+}
+
+// ============================================================
+// MYDATA policy PTB builders
+// ============================================================
+
+function idHexToBytes(id: string): number[] {
+    const hex = id.startsWith("0x") ? id.slice(2) : id;
+    return Array.from(
+        Uint8Array.from(hex.match(/.{1,2}/g)!.map((b) => parseInt(b, 16))),
+    );
+}
+
+export async function buildApproveKeyPolicyTxBytes(
+    opts: ApproveKeyPolicyOpts,
+): Promise<Uint8Array> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::approve_key_policy`,
+        arguments: [
+            tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.accountId),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+    return tx.build({ client: ctx.mysoClient, onlyTransactionKind: true });
+}
+
+export async function buildApproveKeyWritePolicyTxBytes(
+    opts: ApproveKeyPolicyOpts,
+): Promise<Uint8Array> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::approve_key_write_policy`,
+        arguments: [
+            tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.accountId),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+    return tx.build({ client: ctx.mysoClient, onlyTransactionKind: true });
+}
+
+export async function approveKeyPolicy(
+    opts: ApproveKeyPolicyOpts,
+): Promise<{ digest: string; txBytes: Uint8Array }> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::approve_key_policy`,
+        arguments: [
+            tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.accountId),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+    const txBytes = await tx.build({ client: ctx.mysoClient, onlyTransactionKind: true });
+    const { digest } = await signAndExecute(ctx, tx);
+    return { digest, txBytes: new Uint8Array(txBytes) };
+}
+
+export async function approveKeyWritePolicy(
+    opts: ApproveKeyPolicyOpts,
+): Promise<{ digest: string; txBytes: Uint8Array }> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::approve_key_write_policy`,
+        arguments: [
+            tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.accountId),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+    const txBytes = await tx.build({ client: ctx.mysoClient, onlyTransactionKind: true });
+    const { digest } = await signAndExecute(ctx, tx);
+    return { digest, txBytes: new Uint8Array(txBytes) };
 }

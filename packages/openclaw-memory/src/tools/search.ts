@@ -1,10 +1,5 @@
 /**
- * memory_search tool — semantic recall.
- *
- * Requires tools.allow config to be visible to the LLM.
- * Accepts an optional namespace parameter; the before_prompt_build hook
- * injects the current agent's namespace into the system prompt, guiding
- * the LLM to pass the correct value.
+ * memory_search tool — semantic recall (agent-scoped via sub-agent auth).
  */
 
 import type { Memory } from "@socialproof/memory";
@@ -14,7 +9,6 @@ import { escapeForPrompt, toolError } from "../format.js";
 import type { PluginConfig } from "../types.js";
 import { DEFAULT_SEARCH_LIMIT } from "../constants.js";
 
-/** Register the memory_search agent tool. */
 export function registerSearchTool(api: any, client: Memory, config: PluginConfig): void {
   api.registerTool(
     {
@@ -23,51 +17,43 @@ export function registerSearchTool(api: any, client: Memory, config: PluginConfi
       description:
         "Search long-term memory for relevant past information, facts, " +
         "preferences, and decisions. Returns memories ranked by relevance. " +
-        "Pass the namespace parameter to scope the search to the current agent's memory.",
+        "Scope is automatic via the configured sub-agent.",
       parameters: Type.Object({
         query: Type.String({ description: "Search query" }),
         limit: Type.Optional(
           Type.Number({ description: "Max results (default: 5)" }),
         ),
-        namespace: Type.Optional(
+        subLabel: Type.Optional(
           Type.String({
-            description: "Memory namespace to search (use the namespace from system context)",
+            description: "Optional tag within the agent vault (advanced)",
           }),
         ),
       }),
       async execute(_id: string, params: any) {
-        const { query, limit = DEFAULT_SEARCH_LIMIT, namespace } = params;
-        // LLM may omit namespace (e.g. tools.allow set but hooks disabled) — fall back safely
-        const ns = namespace || config.defaultNamespace;
+        const { query, limit = DEFAULT_SEARCH_LIMIT, subLabel } = params;
+        const label = subLabel ?? config.subLabel;
 
         try {
-          const result = await client.recall(query, limit, ns);
+          const result = await client.recall(query, limit, label);
 
           if (!result.results?.length) {
             return {
-              content: [
-                { type: "text", text: "No relevant memories found." },
-              ],
-              details: { count: 0, namespace: ns },
+              content: [{ type: "text", text: "No relevant memories found." }],
+              details: { count: 0 },
             };
           }
 
-          // Filter out injection attempts and escape text before returning
-          // to the LLM — same protection as the recall hook path
           const safe = result.results.filter(
             (r: any) => !looksLikeInjection(r.text),
           );
 
           if (!safe.length) {
             return {
-              content: [
-                { type: "text", text: "No relevant memories found." },
-              ],
-              details: { count: 0, namespace: ns },
+              content: [{ type: "text", text: "No relevant memories found." }],
+              details: { count: 0 },
             };
           }
 
-          // Memory returns L2 distance — convert to similarity % for readability
           const formatted = safe
             .map((r: any, i: number) => {
               const relevance = Math.round((1 - r.distance) * 100);
@@ -84,7 +70,6 @@ export function registerSearchTool(api: any, client: Memory, config: PluginConfi
             ],
             details: {
               count: safe.length,
-              namespace: ns,
               memories: safe.map((r: any) => ({
                 text: r.text,
                 blob_id: r.blob_id,

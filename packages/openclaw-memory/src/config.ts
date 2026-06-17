@@ -1,28 +1,29 @@
 /**
- * Config parsing, validation, and namespace resolution.
+ * Config parsing, validation, and agent session resolution.
  *
- * Uses Zod for schema validation — all config errors surface at startup
- * with clear messages instead of failing at runtime.
+ * Memory is scoped by the authenticated sub-agent (agent_object_id on-chain).
+ * Namespace-based isolation is deprecated; optional subLabel tags within a vault.
  */
 
 import { z } from "zod";
 import type { PluginConfig } from "./types.js";
 
-// ============================================================================
-// Schema
-// ============================================================================
-
 const ConfigSchema = z.object({
   privateKey: z.string()
     .min(1, "required")
-    .regex(/^[0-9a-fA-F]{64}$/, "must be a 64-character hex string (delegate key)"),
+    .regex(/^[0-9a-fA-F]{64}$/, "must be a 64-character hex string (sub-agent key)"),
   accountId: z.string()
     .min(1, "required")
     .regex(/^0x[0-9a-fA-F]{10,}$/, "must be a MySo object ID (0x...)"),
   serverUrl: z.string()
     .min(1, "required")
     .url("must be a valid URL"),
-  defaultNamespace: z.string().default("default"),
+  platformId: z.string()
+    .regex(/^0x[0-9a-fA-F]{10,}$/, "must be a MySo object ID (0x...)")
+    .optional(),
+  /** @deprecated Agent isolation is via sub-agent auth. Use subLabel for optional tags. */
+  defaultNamespace: z.string().optional(),
+  subLabel: z.string().optional(),
   autoRecall: z.boolean().default(true),
   autoCapture: z.boolean().default(true),
   maxRecallResults: z.number().min(1).max(20).default(5),
@@ -30,11 +31,6 @@ const ConfigSchema = z.object({
   captureMaxMessages: z.number().min(1).max(50).default(10),
 });
 
-// ============================================================================
-// Env Var Resolution
-// ============================================================================
-
-/** Replace ${ENV_VAR} placeholders with process.env values. */
 function resolveEnvVar(value: string): string {
   return value.replace(/\$\{([^}]+)\}/g, (_, name) => {
     const v = process.env[name];
@@ -43,10 +39,6 @@ function resolveEnvVar(value: string): string {
   });
 }
 
-/**
- * Resolve ${ENV_VAR} placeholders in all string fields of a config object.
- * Non-string fields are passed through unchanged.
- */
 function resolveEnvVars(raw: Record<string, unknown>): Record<string, unknown> {
   const resolved: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw)) {
@@ -55,30 +47,12 @@ function resolveEnvVars(raw: Record<string, unknown>): Record<string, unknown> {
   return resolved;
 }
 
-// ============================================================================
-// Config Parser
-// ============================================================================
-
-/**
- * Parse and validate raw plugin config from openclaw.json.
- *
- * Resolves ${ENV_VAR} placeholders in string fields, then validates
- * the full config against the Zod schema. Throws with clear field-level
- * error messages on invalid config.
- *
- * @param raw - Raw config object from `api.pluginConfig`
- * @returns Validated config with all defaults applied
- * @throws {Error} If config is missing, or any field fails validation
- */
 export function parseConfig(raw: unknown): PluginConfig {
   if (!raw || typeof raw !== "object") {
     throw new Error("memory: config is required");
   }
 
-  // Resolve env vars before validation
   const resolved = resolveEnvVars(raw as Record<string, unknown>);
-
-  // Validate with Zod — clear error messages per field
   const result = ConfigSchema.safeParse(resolved);
   if (!result.success) {
     const issues = result.error.issues
@@ -87,42 +61,43 @@ export function parseConfig(raw: unknown): PluginConfig {
     throw new Error(`memory: invalid config:\n${issues}`);
   }
 
-  return result.data;
+  const data = result.data;
+  return {
+    ...data,
+    subLabel: data.subLabel ?? (data.defaultNamespace && data.defaultNamespace !== "default"
+      ? data.defaultNamespace
+      : undefined),
+  };
 }
 
-// ============================================================================
-// Agent + Namespace Resolution
-// ============================================================================
-
 export interface ResolvedAgent {
-  namespace: string;
+  subLabel?: string;
   agentName: string;
 }
 
 /**
- * Resolve agent name and namespace from OpenClaw's sessionKey.
- *
- * Parses agent name from format "agent:\<name\>:\<uuid\>".
- * Each agent gets its own namespace for memory isolation.
- * Falls back to defaultNamespace for main agent or unknown sessions.
- *
- * @param defaultNamespace - Fallback namespace (used for main agent)
- * @param sessionKey - OpenClaw session key, e.g. "agent:researcher:uuid-456"
- * @returns Resolved namespace and human-readable agent name
+ * Resolve optional sub-label from OpenClaw session key.
+ * Primary isolation is the configured sub-agent credentials — not session name.
  */
-export function resolveAgent(defaultNamespace: string, sessionKey?: string): ResolvedAgent {
-  if (!sessionKey) return { namespace: defaultNamespace, agentName: "main" };
+export function resolveAgent(config: PluginConfig, sessionKey?: string): ResolvedAgent {
+  if (!sessionKey) {
+    return { subLabel: config.subLabel, agentName: "main" };
+  }
 
   const match = sessionKey.match(/^agent:([^:]+):/);
   const name = match?.[1];
 
-  if (!name || name === "main") return { namespace: defaultNamespace, agentName: "main" };
-  return { namespace: name, agentName: name };
+  if (!name || name === "main") {
+    return { subLabel: config.subLabel, agentName: "main" };
+  }
+
+  // Per-agent sub-label when no global subLabel configured (legacy namespace mapping).
+  return {
+    subLabel: config.subLabel ?? name,
+    agentName: name,
+  };
 }
 
-/**
- * Format key for safe logging (first 4 + last 4 chars).
- */
 export function keyPreview(key: string): string {
   return key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : "****";
 }
