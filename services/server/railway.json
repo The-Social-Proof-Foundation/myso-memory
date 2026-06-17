@@ -4,9 +4,7 @@
         "builder": "DOCKERFILE",
         "dockerfilePath": "services/server/Dockerfile",
         "watchPatterns": [
-            "services/server/**",
-            "packages/sdk/**",
-            "packages/social/**"
+            "services/server/**"
         ]
     },
     "deploy": {

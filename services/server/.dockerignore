@@ -4,3 +4,5 @@ data/
 .env.*
 !.env.example
 docker-compose.yml
+workspace/**/node_modules/
+workspace/**/dist/

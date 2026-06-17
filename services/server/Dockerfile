@@ -1,7 +1,7 @@
 # ============================================================
 # memory Server — Dockerfile
 # Multi-stage build: Rust binary + Node.js sidecar scripts
-# Build context: repo root (Railway Root Directory = /)
+# Build context: services/server (Railway Root Directory)
 # ============================================================
 
 # ── Stage 1: Build Rust binary ──────────────────────────────
@@ -10,16 +10,16 @@
 # To refresh: docker inspect --format='{{index .RepoDigests 0}}' rust:1.85-bookworm
 FROM rust:1.85-bookworm@sha256:bf7d87666c4da6eace19e06d21bc4859c6e2a5c97a21ac273b0e082112753cf0 AS builder
 
-WORKDIR /app/services/server
+WORKDIR /app
 
 # Cache dependencies — copy manifests first
-COPY services/server/Cargo.toml services/server/Cargo.lock ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release && rm -rf src
 
 # Build real source
-COPY services/server/src/ src/
-COPY services/server/migrations/ migrations/
+COPY src/ src/
+COPY migrations/ migrations/
 # Touch main.rs to invalidate the cache for the actual source
 RUN touch src/main.rs
 RUN cargo build --release
@@ -27,27 +27,19 @@ RUN cargo build --release
 # ── Stage 2: Build TS sidecar scripts ───────────────────────
 FROM node:22-bookworm-slim@sha256:db9a3a15e8e8e2adbaf1e1c3d93dfb04c2e294bdd027490addb2391b8e61cc6a AS scripts-builder
 
-RUN corepack enable && corepack prepare pnpm@9.12.3 --activate
-
 WORKDIR /app
 
-# Install + build workspace packages used by sidecar scripts
-COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
-COPY packages/sdk/package.json ./packages/sdk/
-COPY packages/social/package.json ./packages/social/
-RUN pnpm install --frozen-lockfile --filter @socialproof/memory --filter @socialproof/social
+# Workspace mirror of packages/sdk + packages/social (see scripts/sync-workspace-deps.sh)
+COPY workspace/sdk/ ./workspace/sdk/
+COPY workspace/social/ ./workspace/social/
 
-COPY packages/sdk/ ./packages/sdk/
-COPY packages/social/ ./packages/social/
-RUN pnpm --filter @socialproof/memory build && pnpm --filter @socialproof/social build
+RUN cd workspace/sdk && npm install ai zod && npm run build
+RUN cd workspace/social && npm install && npm run build
 
-# npm cannot resolve workspace:* inside the linked social package
-RUN sed -i 's|"@socialproof/memory": "workspace:\*"|"@socialproof/memory": "file:../sdk"|' packages/social/package.json
-
-WORKDIR /app/services/server/scripts
-COPY services/server/scripts/package.json services/server/scripts/package-lock.json ./
+WORKDIR /app/scripts
+COPY scripts/package.json scripts/package-lock.json ./
 RUN npm ci --omit=dev
-COPY services/server/scripts/*.ts ./
+COPY scripts/*.ts ./
 
 # ── Stage 3: Runtime (Node.js slim) ─────────────────────────
 # LOW-28: pinned by digest for reproducible, supply-chain-safe builds.
@@ -67,13 +59,13 @@ USER appuser
 WORKDIR /app
 
 # Copy Rust binary
-COPY --from=builder --chown=appuser:appuser /app/services/server/target/release/memory-server ./memory-server
+COPY --from=builder --chown=appuser:appuser /app/target/release/memory-server ./memory-server
 
 # Copy built TS sidecar scripts (includes node_modules)
-COPY --from=scripts-builder --chown=appuser:appuser /app/services/server/scripts ./scripts
+COPY --from=scripts-builder --chown=appuser:appuser /app/scripts ./scripts
 
 # Copy migrations (for reference / manual runs)
-COPY --chown=appuser:appuser services/server/migrations/ ./migrations/
+COPY --chown=appuser:appuser migrations/ ./migrations/
 
 # Port config — must match defaults in types.rs + sidecar-server.ts
 ENV PORT=8000

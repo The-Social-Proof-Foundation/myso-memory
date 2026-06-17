@@ -10,7 +10,7 @@
         "@socialproof/mydata": "0.0.4",
         "@socialproof/myso": "0.0.4",
         "@socialproof/file-storage": "0.0.4",
-        "@socialproof/social": "file:../../../packages/social",
+        "@socialproof/social": "file:../workspace/social",
         "express": "5.1.0",
         "tsx": "4.19.0"
     },

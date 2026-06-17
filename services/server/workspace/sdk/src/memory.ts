@@ -1,0 +1,727 @@
+/**
+ * memory — SDK Client
+ *
+ * Ed25519 sub-agent key client for the Memory Rust server (TEE).
+ * Encryption, embedding, and File Storage happen server-side; the SDK
+ * signs requests with a registered sub-agent key.
+ *
+ * The server resolves the sub-agent via social API + on-chain verification.
+ *
+ * @example
+ * ```typescript
+ * import { Memory } from "@socialproof/memory"
+ *
+ * const memory = Memory.create({
+ *     key: process.env.MEMORY_PRIVATE_KEY,  // Ed25519 private key (hex)
+ *     accountId: process.env.MEMORY_ACCOUNT_ID, // MemoryAccount object ID
+ * })
+ *
+ * // Remember — server: verify → embed → encrypt → File Storage → store
+ * await memory.remember("I'm allergic to peanuts")
+ *
+ * // Recall — server: verify → embed query → search → download → decrypt
+ * const result = await memory.recall("food allergies")
+ * console.log(result.results[0].text) // "I'm allergic to peanuts"
+ * ```
+ */
+
+import type {
+    MemoryConfig,
+    RememberAcceptedResponse,
+    RememberJobResult,
+    RememberJobPollOptions,
+    RememberBulkAcceptedResponse,
+    RememberBulkStatusItem,
+    RememberResult,
+    RecallResult,
+    RecallMemory,
+    RecallOptions,
+    EmbedResult,
+    AnalyzeResult,
+    HealthResult,
+    RelayerVersionMetadata,
+    RememberManualOptions,
+    RememberManualResult,
+    RecallManualOptions,
+    RecallManualResult,
+    RestoreResult,
+} from "./types.js";
+import {
+    assertCompatibleRelayer,
+    compatibilityErrorFromStatus,
+    MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
+} from "./compatibility.js";
+import { sha256hex, hexToBytes, bytesToHex, normalizeServerUrl, sanitizeServerError } from "./utils.js";
+
+// ============================================================
+// Ed25519 Signing (lazy-loaded)
+// ============================================================
+
+let _ed: typeof import("@noble/ed25519") | null = null;
+async function getEd() {
+    if (!_ed) {
+        _ed = await import("@noble/ed25519");
+    }
+    return _ed;
+}
+
+// ============================================================
+// Memory Client
+// ============================================================
+
+// ENG-1697: MyData SessionKey cache layout. `bytes` holds the
+// base64(JSON(ExportedSessionKey)) envelope transmitted in the
+// `x-mydata-session` header. `expiresAt` is an absolute epoch-millis
+// deadline with a safety margin applied so we refresh before the MyData
+// key servers observe the session as expired.
+interface SessionCacheEntry {
+    bytes: string;
+    expiresAt: number;
+}
+
+interface ServerConfig {
+    packageId: string;
+    network: string;
+    mysoRpcUrl: string;
+}
+
+const MYDATA_SESSION_TTL_MIN = 5;
+// Refresh 30 seconds before MyData's 5-minute TTL to avoid the window where
+// the client thinks the session is valid but a just-received request hits
+// a key server that sees it as expired.
+const MYDATA_SESSION_SAFETY_MARGIN_MS = 30_000;
+
+export class Memory {
+    private privateKey: Uint8Array;
+    private publicKey: Uint8Array | null = null;
+    private serverUrl: string;
+    /** @deprecated Prefer subLabel; kept for backward compatibility. */
+    private namespace: string;
+    private subLabel?: string;
+    private platformId?: string;
+    private ownerCoSignKey: Uint8Array | null;
+    private accountId: string;
+
+    // ENG-1697 state — all internal, never surfaced to user code.
+    // The public API (`Memory.create({ key, accountId })`) is unchanged.
+    private sessionCache: SessionCacheEntry | null = null;
+    private serverConfig: ServerConfig | null = null;
+    /** Single-flight guard so concurrent requests share one SessionKey build. */
+    private sessionBuildPromise: Promise<string> | null = null;
+    private relayerVersionMetadata: RelayerVersionMetadata | null = null;
+    private compatibilityPromise: Promise<RelayerVersionMetadata> | null = null;
+
+    private constructor(config: MemoryConfig) {
+        this.privateKey = typeof config.key === "string" ? hexToBytes(config.key) : config.key;
+        this.accountId = config.accountId;
+        // LOW-22: default to HTTPS for production usage; normalizeServerUrl
+        // warns (does not throw) if a user passes plain http:// for a
+        // non-localhost host.
+        this.serverUrl = normalizeServerUrl(config.serverUrl ?? "https://memory.mysocial.network/");
+        this.namespace = config.namespace ?? "default";
+        this.subLabel = config.subLabel ?? (config.namespace && config.namespace !== "default"
+            ? config.namespace
+            : undefined);
+        this.platformId = config.platformId;
+        this.ownerCoSignKey = config.ownerCoSignKey
+            ? (typeof config.ownerCoSignKey === "string"
+                ? hexToBytes(config.ownerCoSignKey)
+                : config.ownerCoSignKey)
+            : null;
+        this.accountId = config.accountId;
+    }
+
+    /**
+     * Create a new Memory client instance.
+     *
+     * @param config.key - Ed25519 private key (hex string) — the delegate key
+     * @param config.serverUrl - Server URL (default: https://memory.mysocial.network/)
+     */
+    static create(config: MemoryConfig): Memory {
+        return new Memory(config);
+    }
+
+    /**
+     * Securely wipe the private and public keys from memory.
+     * Prevents key extraction from V8 heap dumps.
+     */
+    destroy(): void {
+        if (this.privateKey) {
+            this.privateKey.fill(0);
+        }
+        if (this.publicKey) {
+            this.publicKey.fill(0);
+        }
+        if (this.ownerCoSignKey) {
+            this.ownerCoSignKey.fill(0);
+        }
+        // ENG-1697: drop cached session material too — once destroyed the
+        // instance must not leak authorization tokens either.
+        this.sessionCache = null;
+        this.serverConfig = null;
+    }
+
+    // ============================================================
+    // Core API
+    // ============================================================
+
+    /**
+     * Enqueue a remember job (returns 202 with job_id). Use rememberAndWait() for sync semantics.
+     */
+    async remember(text: string, subLabel?: string): Promise<RememberAcceptedResponse> {
+        await this.ensureCompatibleRelayer();
+        return this.signedRequest<RememberAcceptedResponse>(
+            "POST",
+            "/api/remember",
+            { text, ...this.scopeFields(subLabel) },
+            { acceptedStatuses: [202] },
+        );
+    }
+
+    async waitForRememberJob(
+        jobId: string,
+        opts: RememberJobPollOptions = {},
+    ): Promise<RememberJobResult> {
+        const intervalMs = opts.intervalMs ?? 1500;
+        const timeoutMs = opts.timeoutMs ?? 120_000;
+        const deadline = Date.now() + timeoutMs;
+
+        while (Date.now() < deadline) {
+            const status = await this.signedRequest<RememberJobResult>(
+                "GET",
+                `/api/remember/${jobId}`,
+                {},
+            );
+            if (status.status === "done" || status.status === "failed") {
+                if (status.status === "failed") {
+                    throw new Error(
+                        status.error ?? `remember job failed (job_id=${jobId})`,
+                    );
+                }
+                return status;
+            }
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+        throw new Error(`remember job timed out after ${timeoutMs}ms (job_id=${jobId})`);
+    }
+
+    async rememberAndWait(
+        text: string,
+        subLabel?: string,
+        opts?: RememberJobPollOptions,
+    ): Promise<RememberJobResult> {
+        const accepted = await this.remember(text, subLabel);
+        return this.waitForRememberJob(accepted.job_id, opts);
+    }
+
+    async rememberBulk(texts: string[], subLabel?: string): Promise<RememberBulkAcceptedResponse> {
+        await this.ensureCompatibleRelayer();
+        return this.signedRequest<RememberBulkAcceptedResponse>(
+            "POST",
+            "/api/remember/bulk",
+            { texts, ...this.scopeFields(subLabel) },
+            { acceptedStatuses: [202] },
+        );
+    }
+
+    async waitForRememberBulk(
+        jobIds: string[],
+        opts: RememberJobPollOptions = {},
+    ): Promise<RememberBulkStatusItem[]> {
+        const intervalMs = opts.intervalMs ?? 1500;
+        const timeoutMs = opts.timeoutMs ?? 120_000;
+        const deadline = Date.now() + timeoutMs;
+
+        while (Date.now() < deadline) {
+            const res = await this.signedRequest<{ jobs: RememberBulkStatusItem[] }>(
+                "POST",
+                "/api/remember/bulk/status",
+                { job_ids: jobIds },
+            );
+            const allDone = res.jobs.every(
+                (j) => j.status === "done" || j.status === "failed",
+            );
+            if (allDone) return res.jobs;
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+        throw new Error("remember bulk jobs timed out");
+    }
+
+    /**
+     * Recall memories similar to a query — server handles:
+     * verify → embed query → search → File Storage download → decrypt → return plaintext
+     *
+     * @param query - Search query
+     * @param limit - Max number of results (default: 10)
+     * @returns RecallResult with decrypted text results
+     *
+     * @example
+     * ```typescript
+     * const result = await memory.recall("food allergies")
+     * for (const memory of result.results) {
+     *     console.log(memory.text, memory.distance)
+     * }
+     * ```
+     */
+    async recall(
+        query: string,
+        limitOrOpts: number | RecallOptions = 10,
+        subLabel?: string,
+    ): Promise<RecallResult> {
+        let limit = 10;
+        let label = subLabel;
+        let scoringWeights: RecallOptions["scoringWeights"];
+        if (typeof limitOrOpts === "object") {
+            limit = limitOrOpts.limit ?? 10;
+            label = limitOrOpts.subLabel ?? label;
+            scoringWeights = limitOrOpts.scoringWeights;
+        } else {
+            limit = limitOrOpts;
+        }
+
+        const ac = new AbortController();
+        const tid = setTimeout(() => ac.abort(), 15000);
+        try {
+            return await this.signedRequest<RecallResult>("POST", "/api/recall", {
+                query,
+                limit,
+                ...this.scopeFields(label),
+                ...(scoringWeights ? { scoring_weights: scoringWeights } : {}),
+            }, { signal: ac.signal });
+        } finally {
+            clearTimeout(tid);
+        }
+    }
+
+    // ============================================================
+    // Manual API (user handles MYDATA + embedding + FileStorage)
+    // ============================================================
+
+    /**
+     * Remember (manual mode) — user handles MYDATA encrypt, embedding,
+     * and File Storage upload externally. Server only stores the vector ↔ blobId mapping.
+     *
+     * Trust boundary (ENG-1696): the delegate private key is NOT transmitted on
+     * this request. Manual-mode handlers on the server never invoke MYDATA
+     * decrypt, so the key stays client-side as the name implies.
+     *
+     * @param opts.blobId - File Storage blob ID (user already uploaded encrypted data)
+     * @param opts.vector - Embedding vector (user already generated, e.g. 1536-dim)
+     * @returns RememberManualResult with id, blob_id, owner
+     *
+     * @example
+     * ```typescript
+     * // 1. User encrypts + uploads + embeds on their own
+     * const blobId = await myFileStorageUpload(mydataEncryptedData)
+     * const vector = await myEmbeddingModel.embed(text)
+     *
+     * // 2. Register vector mapping with server
+     * const result = await memory.rememberManual({ blobId, vector })
+     * ```
+     */
+    async rememberManual(opts: RememberManualOptions): Promise<RememberManualResult> {
+        return this.signedRequest<RememberManualResult>(
+            "POST",
+            "/api/remember/manual",
+            {
+                blob_id: opts.blobId,
+                vector: opts.vector,
+                ...this.scopeFields(opts.namespace ?? opts.subLabel),
+            },
+            { includeDelegateKey: false },
+        );
+    }
+
+    async recallManual(opts: RecallManualOptions): Promise<RecallManualResult> {
+        return this.signedRequest<RecallManualResult>(
+            "POST",
+            "/api/recall/manual",
+            {
+                vector: opts.vector,
+                limit: opts.limit ?? 10,
+                ...this.scopeFields(opts.namespace ?? opts.subLabel),
+            },
+            { includeDelegateKey: false },
+        );
+    }
+
+    /**
+     * Generate an embedding vector for text (no storage).
+     *
+     * @param text - Text to embed
+     * @returns EmbedResult with vector
+     */
+    async embed(text: string): Promise<EmbedResult> {
+        return this.signedRequest<EmbedResult>("POST", "/api/embed", { text });
+    }
+
+    /**
+     * Analyze conversation text — server uses LLM to extract facts, then
+     * stores each one (embed → encrypt → File Storage → store).
+     *
+     * @param text - Conversation text to analyze
+     * @returns AnalyzeResult with extracted and stored facts
+     *
+     * @example
+     * ```typescript
+     * const result = await memory.analyze("I love coffee and live in Tokyo")
+     * console.log(result.facts) // ["User loves coffee", "User lives in Tokyo"]
+     * ```
+     */
+    async analyze(text: string, subLabel?: string): Promise<AnalyzeResult> {
+        return this.signedRequest<AnalyzeResult>("POST", "/api/analyze", {
+            text,
+            ...this.scopeFields(subLabel),
+        });
+    }
+
+    /**
+     * Restore — re-index blobs for the authenticated agent from File Storage.
+     */
+    async restore(limit: number = 50, subLabel?: string): Promise<RestoreResult> {
+        return this.signedRequest<RestoreResult>("POST", "/api/restore", {
+            limit,
+            ...this.scopeFields(subLabel),
+        });
+    }
+
+    /**
+     * Check server health.
+     *
+     * INFO-7: The health endpoint is currently public/unsigned server-side,
+     * but we send the same signed-request envelope as every other call so
+     * that (a) the channel is authenticated whenever the server opts in, and
+     * (b) a MitM cannot trivially forge a "healthy" response for a client
+     * that has no way to tell. If the server ignores the signature headers
+     * on `/health`, this is still a harmless no-op.
+     */
+    async health(): Promise<HealthResult> {
+        try {
+            return await this.signedRequest<HealthResult>("GET", "/health", {});
+        } catch (err) {
+            // Fall back to a plain GET for servers that reject bodies on GET /health.
+            const res = await fetch(`${this.serverUrl}/health`);
+            if (!res.ok) {
+                throw err instanceof Error
+                    ? err
+                    : new Error(`Health check failed: ${res.status}`);
+            }
+            return res.json() as Promise<HealthResult>;
+        }
+    }
+
+    /**
+     * Get the public key (hex string).
+     */
+    async getPublicKeyHex(): Promise<string> {
+        const pk = await this.getPublicKey();
+        return bytesToHex(pk);
+    }
+
+    // ============================================================
+    // Internal: Signed HTTP Requests
+    // ============================================================
+
+    private scopeFields(subLabel?: string): { namespace?: string } {
+        const label = subLabel ?? this.subLabel;
+        if (label && label !== "default") {
+            return { namespace: label };
+        }
+        return {};
+    }
+
+    private isWriteRoute(method: string, path: string): boolean {
+        if (method !== "POST") return false;
+        return path.startsWith("/api/remember")
+            || path.startsWith("/api/analyze")
+            || path.startsWith("/api/restore");
+    }
+
+    private async getPublicKey(): Promise<Uint8Array> {
+        if (!this.publicKey) {
+            const ed = await getEd();
+            this.publicKey = await ed.getPublicKeyAsync(this.privateKey);
+        }
+        return this.publicKey;
+    }
+
+    // ============================================================
+    // ENG-1697: MYDATA SessionKey discovery & build
+    //
+    // The SDK used to transmit the raw delegate private key in
+    // `x-delegate-key` on every request. That credential, once captured,
+    // lets an attacker retroactively decrypt every ciphertext the account
+    // ever produced (until the user rotates on-chain) and sign arbitrary
+    // MySo transactions from the delegate address.
+    //
+    // We now build a MYDATA `SessionKey` on the client (ephemeral, scoped to
+    // a single `packageId`, 5-minute TTL, signed by the delegate key) and
+    // ship only the exported session bytes via `x-mydata-session`. The raw
+    // private key never leaves the client.
+    //
+    // `packageId` is fetched from the server's public `/config` endpoint
+    // the first time it's needed so the user API (`new Memory({ key,
+    // accountId })`) stays unchanged — past users upgrading to v0.4 do not
+    // have to touch their config.
+    //
+    // Requires `@socialproof/mydata` and `@socialproof/myso` peer dependencies.
+    // ============================================================
+
+    private async fetchServerConfig(): Promise<ServerConfig> {
+        if (this.serverConfig) return this.serverConfig;
+        const res = await fetch(`${this.serverUrl}/config`, { method: "GET" });
+        if (!res.ok) {
+            throw new Error(`GET /config returned ${res.status}`);
+        }
+        const body = (await res.json()) as Partial<ServerConfig>;
+        if (!body.packageId || !body.network || !body.mysoRpcUrl) {
+            throw new Error("GET /config response missing packageId / network / mysoRpcUrl");
+        }
+        this.serverConfig = {
+            packageId: body.packageId,
+            network: body.network,
+            mysoRpcUrl: body.mysoRpcUrl,
+        };
+        return this.serverConfig;
+    }
+
+    private async buildMyDataSessionInner(): Promise<string> {
+        const cfg = await this.fetchServerConfig();
+        // @socialproof/myso renamed/moved `MySoClient` between minor versions:
+        //   - pre-2.6:  `MySoClient` in `@socialproof/myso/client`
+        //   - 2.6+:     `MySoJsonRpcClient` in `@socialproof/myso/jsonRpc`
+        // Probe both paths so the SDK works across the supported range.
+        const mydataMod = (await import("@socialproof/mydata")) as any;
+        const ed25519Mod = (await import("@socialproof/myso/keypairs/ed25519")) as any;
+        const SessionKey = mydataMod.SessionKey;
+        const Ed25519Keypair = ed25519Mod.Ed25519Keypair;
+
+        let MySoClient: any = undefined;
+        try {
+            const mod = (await import("@socialproof/myso/client")) as any;
+            MySoClient = mod.MySoClient;
+        } catch {
+            /* not present on this version */
+        }
+        if (typeof MySoClient !== "function") {
+            try {
+                const mod = (await import("@socialproof/myso/jsonRpc")) as any;
+                MySoClient = mod.MySoJsonRpcClient ?? mod.MySoClient;
+            } catch {
+                /* not present on this version either */
+            }
+        }
+        if (typeof MySoClient !== "function" || typeof Ed25519Keypair !== "function") {
+            throw new Error(
+                "MySoClient/MySoJsonRpcClient or Ed25519Keypair not found in @socialproof/myso. " +
+                "Ensure @socialproof/myso >=2.5.0 and @socialproof/mydata >=1.1.0 are installed."
+            );
+        }
+
+        const keypair = Ed25519Keypair.fromSecretKey(this.privateKey);
+        const mysoClient = new MySoClient({ url: cfg.mysoRpcUrl });
+
+        const session = await SessionKey.create({
+            address: keypair.getPublicKey().toMySoAddress(),
+            packageId: cfg.packageId,
+            ttlMin: MYDATA_SESSION_TTL_MIN,
+            signer: keypair,
+            mysoClient: mysoClient as any,
+        });
+
+        // Eagerly sign the personal message so the exported envelope is
+        // fully self-contained. `SessionKey.create()` defers this signing
+        // until first use, which would break the migration: the sidecar
+        // imports without a signer and must be able to get a certificate
+        // from the exported state alone. Calling
+        // setPersonalMessageSignature() here populates the
+        // `personalMessageSignature` field in the subsequent export().
+        const personalMessage = session.getPersonalMessage();
+        const signResult = await keypair.signPersonalMessage(personalMessage);
+        await session.setPersonalMessageSignature(signResult.signature);
+
+        const exported = session.export();
+        // MYDATA intentionally installs a throwing `toJSON` on the
+        // exported object to catch accidental serialization. The
+        // migration to `x-mydata-session` IS the intended on-wire
+        // format, so we project the primitive fields into a fresh
+        // object before stringifying. The sidecar's
+        // `SessionKey.import()` expects this exact shape.
+        const jsonStr = JSON.stringify({
+            address: exported.address,
+            packageId: exported.packageId,
+            mvrName: exported.mvrName,
+            creationTimeMs: exported.creationTimeMs,
+            ttlMin: exported.ttlMin,
+            personalMessageSignature: exported.personalMessageSignature,
+            sessionKey: exported.sessionKey,
+        });
+        const bytes =
+            typeof btoa === "function"
+                ? btoa(jsonStr)
+                : Buffer.from(jsonStr, "utf8").toString("base64");
+
+        this.sessionCache = {
+            bytes,
+            expiresAt:
+                Date.now() +
+                MYDATA_SESSION_TTL_MIN * 60_000 -
+                MYDATA_SESSION_SAFETY_MARGIN_MS,
+        };
+        return bytes;
+    }
+
+    private async buildMyDataSession(): Promise<string> {
+        // Fast path: cached session still fresh.
+        if (this.sessionCache && Date.now() < this.sessionCache.expiresAt) {
+            return this.sessionCache.bytes;
+        }
+        // Single-flight: concurrent requests share one build.
+        if (this.sessionBuildPromise) return this.sessionBuildPromise;
+
+        this.sessionBuildPromise = this.buildMyDataSessionInner().finally(() => {
+            this.sessionBuildPromise = null;
+        });
+        return this.sessionBuildPromise;
+    }
+
+    private async ensureCompatibleRelayer(): Promise<RelayerVersionMetadata> {
+        if (this.relayerVersionMetadata) return this.relayerVersionMetadata;
+        if (this.compatibilityPromise) return this.compatibilityPromise;
+
+        this.compatibilityPromise = this.fetchCompatibilityMetadata().finally(() => {
+            this.compatibilityPromise = null;
+        });
+        return this.compatibilityPromise;
+    }
+
+    private async fetchCompatibilityMetadata(): Promise<RelayerVersionMetadata> {
+        const versionRes = await fetch(`${this.serverUrl}/version`, { method: "GET" });
+        let body: Partial<RelayerVersionMetadata>;
+
+        if (versionRes.ok) {
+            body = (await versionRes.json()) as Partial<RelayerVersionMetadata>;
+        } else {
+            const healthRes = await fetch(`${this.serverUrl}/health`, { method: "GET" });
+            if (!healthRes.ok) {
+                throw new Error(
+                    `Memory compatibility check failed: GET /version returned ${versionRes.status}`,
+                );
+            }
+            body = (await healthRes.json()) as Partial<RelayerVersionMetadata>;
+        }
+
+        assertCompatibleRelayer(body, this.serverUrl);
+        this.relayerVersionMetadata = body;
+        return body;
+    }
+
+    /**
+     * Make a signed request to the server.
+     *
+     * Signature format (LOW-23 updated):
+     *   "{timestamp}.{method}.{path}.{body_sha256}.{nonce}.{account_id}"
+     *
+     * Headers: x-public-key, x-signature, x-timestamp, x-nonce, x-account-id
+     *
+     * The nonce is a UUID v4 generated per-request and tracked server-side
+     * in Redis (TTL=600s) to prevent replay attacks.
+     *
+     * LOW-23: x-account-id is now included in the signed canonical message so
+     * an intermediary cannot swap the account hint without invalidating the
+     * signature. Server-side verification in services/server/src/auth.rs must
+     * use the matching message format.
+     *
+     * ENG-1696: Callers set `includeDelegateKey: false` on Manual-mode routes
+     * so the delegate private key is not transmitted. Manual-mode docstrings
+     * promise the key stays client-side; the server does not need it on those
+     * routes because Manual-mode handlers never invoke MYDATA decrypt.
+     *
+     * ENG-1697: On Relayer-mode routes the SDK builds a MYDATA SessionKey
+     * client-side (emitted via `x-mydata-session`). The SessionKey is ephemeral
+     * (5-min TTL, scoped to the server's `packageId`) so a wire capture has
+     * a bounded blast radius. Requires `@socialproof/mydata` and `@socialproof/myso`.
+     */
+    private async signedRequest<T>(
+        method: string,
+        path: string,
+        body: object,
+        options: {
+            includeDelegateKey?: boolean;
+            signal?: AbortSignal;
+            acceptedStatuses?: number[];
+        } = {},
+    ): Promise<T> {
+        await this.ensureCompatibleRelayer();
+        const ed = await getEd();
+
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const bodyStr = method === "GET" ? "" : JSON.stringify(body);
+        const bodySha256 = await sha256hex(bodyStr);
+
+        // MED-1 fix: Generate per-request nonce (UUID v4) for replay protection
+        const nonce = crypto.randomUUID();
+
+        // LOW-23: Build message to sign — now includes nonce AND account id
+        const message = `${timestamp}.${method}.${path}.${bodySha256}.${nonce}.${this.accountId}`;
+        const msgBytes = new TextEncoder().encode(message);
+
+        // Sign with Ed25519
+        const signature = await ed.signAsync(msgBytes, this.privateKey);
+        const publicKey = await this.getPublicKey();
+
+        // Make HTTP request
+        const url = `${this.serverUrl}${path}`;
+        const headers: Record<string, string> = {
+            "Content-Type": "application/json",
+            "x-public-key": bytesToHex(publicKey),
+            "x-signature": bytesToHex(signature),
+            "x-timestamp": timestamp,
+            "x-nonce": nonce,
+            "x-account-id": this.accountId,
+            "x-sdk-compatibility": MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
+        };
+        if (this.platformId) {
+            headers["x-platform-id"] = this.platformId;
+        }
+        if (this.ownerCoSignKey && this.isWriteRoute(method, path)) {
+            const ownerSig = await ed.signAsync(msgBytes, this.ownerCoSignKey);
+            const ownerPk = await ed.getPublicKeyAsync(this.ownerCoSignKey);
+            headers["x-owner-public-key"] = bytesToHex(ownerPk);
+            headers["x-owner-signature"] = bytesToHex(ownerSig);
+        }
+        // ENG-1696 / ENG-1697: attach a MYDATA credential only on Relayer-
+        // mode routes where the server needs it for server-side MYDATA
+        // decrypt. Manual-mode methods (rememberManual, recallManual) opt
+        // out and transmit no decrypt credential at all.
+        if (options.includeDelegateKey !== false) {
+            headers["x-mydata-session"] = await this.buildMyDataSession();
+        }
+        const res = await fetch(url, {
+            method,
+            headers,
+            body: method === "GET" ? undefined : bodyStr,
+            signal: options.signal,
+        });
+
+        const accepted = options.acceptedStatuses ?? [200];
+        if (!accepted.includes(res.status)) {
+            const raw = await res.text();
+            const compatErr = compatibilityErrorFromStatus(res.status, raw);
+            if (compatErr) throw compatErr;
+
+            const { message, serverCode } = sanitizeServerError(res.status, raw);
+            const err = new Error(message) as Error & {
+                status?: number;
+                serverCode?: string;
+                cause?: string;
+            };
+            err.status = res.status;
+            if (serverCode) err.serverCode = serverCode;
+            err.cause = raw;
+            throw err;
+        }
+
+        return res.json() as Promise<T>;
+    }
+}
