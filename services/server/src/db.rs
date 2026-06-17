@@ -32,6 +32,8 @@ impl VectorDb {
             ("005", include_str!("../migrations/005_sub_agent_cache.sql")),
             ("006", include_str!("../migrations/006_agent_scope.sql")),
             ("007", include_str!("../migrations/007_sub_agent_policy_cache.sql")),
+            ("008", include_str!("../migrations/008_remember_jobs.sql")),
+            ("009", include_str!("../migrations/009_importance.sql")),
         ] {
             sqlx::raw_sql(sql)
                 .execute(&pool)
@@ -54,14 +56,15 @@ impl VectorDb {
         blob_id: &str,
         vector: &[f32],
         blob_size_bytes: i64,
+        importance: f32,
     ) -> Result<(), AppError> {
         let embedding = Vector::from(vector.to_vec());
         let namespace = agent_object_id;
         let label = sub_label.unwrap_or("");
 
         sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, agent_object_id, sub_label, blob_id, embedding, blob_size_bytes)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO vector_entries (id, owner, namespace, agent_object_id, sub_label, blob_id, embedding, blob_size_bytes, importance)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(id)
         .bind(owner)
@@ -71,6 +74,7 @@ impl VectorDb {
         .bind(blob_id)
         .bind(embedding)
         .bind(blob_size_bytes)
+        .bind(importance)
         .execute(&self.pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to insert vector: {}", e)))?;
@@ -87,6 +91,7 @@ impl VectorDb {
     }
 
     /// Search for similar vectors scoped by owner + agent_object_id.
+    /// Fetches up to `candidate_limit` rows for optional re-ranking downstream.
     pub async fn search_similar(
         &self,
         query_vector: &[f32],
@@ -94,45 +99,57 @@ impl VectorDb {
         agent_object_id: &str,
         sub_label: Option<&str>,
         limit: usize,
+        candidate_multiplier: usize,
     ) -> Result<Vec<SearchHit>, AppError> {
         let embedding = Vector::from(query_vector.to_vec());
+        let fetch_limit = (limit * candidate_multiplier.max(1)).min(300) as i64;
 
-        let rows: Vec<(String, f64)> = if let Some(label) = sub_label.filter(|s| !s.is_empty()) {
-            sqlx::query_as(
-                "SELECT blob_id, (embedding <=> $1)::float8 AS distance
+        let rows: Vec<(String, f64, chrono::DateTime<chrono::Utc>, f32)> =
+            if let Some(label) = sub_label.filter(|s| !s.is_empty()) {
+                sqlx::query_as(
+                    "SELECT blob_id, (embedding <=> $1)::float8 AS distance, created_at, importance
                  FROM vector_entries
                  WHERE owner = $2 AND agent_object_id = $3 AND sub_label = $4 AND tombstoned = FALSE
                  ORDER BY embedding <=> $1
                  LIMIT $5",
-            )
-            .bind(embedding)
-            .bind(owner)
-            .bind(agent_object_id)
-            .bind(label)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query_as(
-                "SELECT blob_id, (embedding <=> $1)::float8 AS distance
+                )
+                .bind(&embedding)
+                .bind(owner)
+                .bind(agent_object_id)
+                .bind(label)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await
+            } else {
+                sqlx::query_as(
+                    "SELECT blob_id, (embedding <=> $1)::float8 AS distance, created_at, importance
                  FROM vector_entries
                  WHERE owner = $2 AND agent_object_id = $3 AND tombstoned = FALSE
                  ORDER BY embedding <=> $1
                  LIMIT $4",
-            )
-            .bind(embedding)
-            .bind(owner)
-            .bind(agent_object_id)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await
-        }
-        .map_err(|e| AppError::Internal(format!("Failed to search vectors: {}", e)))?;
+                )
+                .bind(&embedding)
+                .bind(owner)
+                .bind(agent_object_id)
+                .bind(fetch_limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            .map_err(|e| AppError::Internal(format!("Failed to search vectors: {}", e)))?;
 
         Ok(rows
             .into_iter()
-            .map(|(blob_id, distance)| SearchHit { blob_id, distance })
+            .map(|(blob_id, distance, created_at, importance)| SearchHit {
+                blob_id,
+                distance,
+                created_at: Some(created_at),
+                importance,
+            })
             .collect())
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     pub async fn get_blobs_by_agent(

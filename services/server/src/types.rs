@@ -246,6 +246,8 @@ pub struct RecallRequest {
     pub limit: usize,
     #[serde(default, alias = "sub_label")]
     pub namespace: String,
+    #[serde(default)]
+    pub scoring_weights: Option<crate::ranker::ScoringWeights>,
 }
 
 #[derive(Debug, Serialize)]
@@ -267,12 +269,70 @@ pub struct RecallResult {
     pub blob_id: String,
     pub text: String,
     pub distance: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub blob_id: String,
     pub distance: f64,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub importance: f32,
+}
+
+/// POST /api/remember — async job accepted (202)
+#[derive(Debug, Serialize)]
+pub struct RememberAcceptedResponse {
+    pub job_id: String,
+    pub status: String,
+}
+
+/// GET /api/remember/:job_id
+#[derive(Debug, Serialize)]
+pub struct RememberJobStatusResponse {
+    pub job_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub agent_object_id: String,
+}
+
+/// POST /api/remember/bulk
+#[derive(Debug, Deserialize)]
+pub struct RememberBulkRequest {
+    pub texts: Vec<String>,
+    #[serde(default, alias = "sub_label")]
+    pub namespace: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RememberBulkAcceptedResponse {
+    pub job_ids: Vec<String>,
+    pub status: String,
+}
+
+/// POST /api/remember/bulk/status
+#[derive(Debug, Deserialize)]
+pub struct RememberBulkStatusRequest {
+    pub job_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RememberBulkStatusItem {
+    pub job_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RememberBulkStatusResponse {
+    pub jobs: Vec<RememberBulkStatusItem>,
 }
 
 
@@ -357,6 +417,8 @@ pub struct AskRequest {
     pub limit: Option<usize>,
     #[serde(default, alias = "sub_label")]
     pub namespace: String,
+    #[serde(default)]
+    pub scoring_weights: Option<crate::ranker::ScoringWeights>,
 }
 
 #[derive(Debug, Serialize)]

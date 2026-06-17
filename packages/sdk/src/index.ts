@@ -17,12 +17,26 @@ export { Memory } from "./memory.js";
 // Delegate key utilities (no @socialproof/myso dependency)
 export { delegateKeyToMySoAddress, delegateKeyToPublicKey } from "./utils.js";
 
-// Types (server-mode only — no manual types here)
+export {
+    assertCompatibleRelayer,
+    compatibilityErrorFromStatus,
+    MemoryCompatibilityError,
+    MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
+} from "./compatibility.js";
+
 export type {
     MemoryConfig,
+    RememberAcceptedResponse,
+    RememberJobResult,
+    RememberJobPollOptions,
+    RememberBulkAcceptedResponse,
+    RememberBulkStatusItem,
     RememberResult,
     RecallResult,
     RecallMemory,
+    RecallOptions,
+    ScoringWeights,
+    RelayerVersionMetadata,
     EmbedResult,
     AnalyzeResult,
     AnalyzedFact,

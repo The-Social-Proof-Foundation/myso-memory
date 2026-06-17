@@ -95,7 +95,10 @@ const memory = Memory.create({
 
 ```ts
 // Store a memory
-await memory.remember("User prefers dark mode and works in TypeScript.");
+// Async remember (202 + poll) — SDK 0.6.0+
+const accepted = await memory.remember("User prefers dark mode and works in TypeScript.");
+const result = await memory.rememberAndWait("User prefers dark mode and works in TypeScript.");
+console.log(result.blob_id);
 
 // Recall by meaning
 const result = await memory.recall("What are the user's preferences?");
@@ -127,7 +130,10 @@ await memory.health();
 
 | Method | Description | Returns |
 |---|---|---|
-| `remember(text, namespace?)` | Store one memory (relayer embeds, encrypts, uploads) | `{ id, blob_id, owner, namespace }` |
+| `remember(text, subLabel?)` | Enqueue async remember job (202) | `{ job_id, status }` |
+| `rememberAndWait(text, subLabel?)` | Remember and poll until done | `{ job_id, status, blob_id, ... }` |
+| `waitForRememberJob(jobId)` | Poll job status | job result |
+| `rememberBulk(texts[])` | Bulk enqueue (202) | `{ job_ids, status }` |
 | `recall(query, limit?, namespace?)` | Semantic search for memories | `{ results: [{ blob_id, text, distance }], total }` |
 | `analyze(text, namespace?)` | Extract facts via LLM, store each as a memory | `{ facts: [{ text, id, blob_id }], total, owner }` |
 | `restore(namespace, limit?)` | Rebuild missing index entries from File Storage | `{ restored, skipped, total, namespace, owner }` |

@@ -204,9 +204,11 @@ async function main(): Promise<void> {
 
     if (process.env.FULL_E2E === "1") {
         const fact = `Walkthrough fact: favorite color is ultramarine (${Date.now()})`;
-        console.log("[test] remember (full relayer + File Storage)...");
-        const full = await memory.remember(fact);
-        console.log(`  id=${full.id} agent=${full.agent_object_id}`);
+        console.log("[test] remember (full relayer + File Storage, async job)...");
+        const accepted = await memory.remember(fact);
+        console.log(`  job_id=${accepted.job_id} status=${accepted.status}`);
+        const full = await memory.waitForRememberJob(accepted.job_id);
+        console.log(`  done blob_id=${full.blob_id} agent=${full.agent_object_id}`);
 
         console.log("[test] recall (full decrypt path)...");
         const fullRecall = await memory.recall("favorite color ultramarine", 5);

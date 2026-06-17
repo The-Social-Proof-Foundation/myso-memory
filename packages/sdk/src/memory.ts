@@ -27,18 +27,30 @@
 
 import type {
     MemoryConfig,
+    RememberAcceptedResponse,
+    RememberJobResult,
+    RememberJobPollOptions,
+    RememberBulkAcceptedResponse,
+    RememberBulkStatusItem,
     RememberResult,
     RecallResult,
     RecallMemory,
+    RecallOptions,
     EmbedResult,
     AnalyzeResult,
     HealthResult,
+    RelayerVersionMetadata,
     RememberManualOptions,
     RememberManualResult,
     RecallManualOptions,
     RecallManualResult,
     RestoreResult,
 } from "./types.js";
+import {
+    assertCompatibleRelayer,
+    compatibilityErrorFromStatus,
+    MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
+} from "./compatibility.js";
 import { sha256hex, hexToBytes, bytesToHex, normalizeServerUrl, sanitizeServerError } from "./utils.js";
 
 // ============================================================
@@ -96,6 +108,8 @@ export class Memory {
     private serverConfig: ServerConfig | null = null;
     /** Single-flight guard so concurrent requests share one SessionKey build. */
     private sessionBuildPromise: Promise<string> | null = null;
+    private relayerVersionMetadata: RelayerVersionMetadata | null = null;
+    private compatibilityPromise: Promise<RelayerVersionMetadata> | null = null;
 
     private constructor(config: MemoryConfig) {
         this.privateKey = typeof config.key === "string" ? hexToBytes(config.key) : config.key;
@@ -152,22 +166,85 @@ export class Memory {
     // ============================================================
 
     /**
-     * Remember something — server handles: verify → embed → encrypt → File Storage upload → store
-     *
-     * @param text - The text to remember
-     * @returns RememberResult with id, blob_id, owner
-     *
-     * @example
-     * ```typescript
-     * const result = await memory.remember("I'm allergic to peanuts")
-     * console.log(result.blob_id) // "TY8mW0yr..."
-     * ```
+     * Enqueue a remember job (returns 202 with job_id). Use rememberAndWait() for sync semantics.
      */
-    async remember(text: string, subLabel?: string): Promise<RememberResult> {
-        return this.signedRequest<RememberResult>("POST", "/api/remember", {
-            text,
-            ...this.scopeFields(subLabel),
-        });
+    async remember(text: string, subLabel?: string): Promise<RememberAcceptedResponse> {
+        await this.ensureCompatibleRelayer();
+        return this.signedRequest<RememberAcceptedResponse>(
+            "POST",
+            "/api/remember",
+            { text, ...this.scopeFields(subLabel) },
+            { acceptedStatuses: [202] },
+        );
+    }
+
+    async waitForRememberJob(
+        jobId: string,
+        opts: RememberJobPollOptions = {},
+    ): Promise<RememberJobResult> {
+        const intervalMs = opts.intervalMs ?? 1500;
+        const timeoutMs = opts.timeoutMs ?? 120_000;
+        const deadline = Date.now() + timeoutMs;
+
+        while (Date.now() < deadline) {
+            const status = await this.signedRequest<RememberJobResult>(
+                "GET",
+                `/api/remember/${jobId}`,
+                {},
+            );
+            if (status.status === "done" || status.status === "failed") {
+                if (status.status === "failed") {
+                    throw new Error(
+                        status.error ?? `remember job failed (job_id=${jobId})`,
+                    );
+                }
+                return status;
+            }
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+        throw new Error(`remember job timed out after ${timeoutMs}ms (job_id=${jobId})`);
+    }
+
+    async rememberAndWait(
+        text: string,
+        subLabel?: string,
+        opts?: RememberJobPollOptions,
+    ): Promise<RememberJobResult> {
+        const accepted = await this.remember(text, subLabel);
+        return this.waitForRememberJob(accepted.job_id, opts);
+    }
+
+    async rememberBulk(texts: string[], subLabel?: string): Promise<RememberBulkAcceptedResponse> {
+        await this.ensureCompatibleRelayer();
+        return this.signedRequest<RememberBulkAcceptedResponse>(
+            "POST",
+            "/api/remember/bulk",
+            { texts, ...this.scopeFields(subLabel) },
+            { acceptedStatuses: [202] },
+        );
+    }
+
+    async waitForRememberBulk(
+        jobIds: string[],
+        opts: RememberJobPollOptions = {},
+    ): Promise<RememberBulkStatusItem[]> {
+        const intervalMs = opts.intervalMs ?? 1500;
+        const timeoutMs = opts.timeoutMs ?? 120_000;
+        const deadline = Date.now() + timeoutMs;
+
+        while (Date.now() < deadline) {
+            const res = await this.signedRequest<{ jobs: RememberBulkStatusItem[] }>(
+                "POST",
+                "/api/remember/bulk/status",
+                { job_ids: jobIds },
+            );
+            const allDone = res.jobs.every(
+                (j) => j.status === "done" || j.status === "failed",
+            );
+            if (allDone) return res.jobs;
+            await new Promise((r) => setTimeout(r, intervalMs));
+        }
+        throw new Error("remember bulk jobs timed out");
     }
 
     /**
@@ -186,14 +263,30 @@ export class Memory {
      * }
      * ```
      */
-    async recall(query: string, limit: number = 10, subLabel?: string): Promise<RecallResult> {
+    async recall(
+        query: string,
+        limitOrOpts: number | RecallOptions = 10,
+        subLabel?: string,
+    ): Promise<RecallResult> {
+        let limit = 10;
+        let label = subLabel;
+        let scoringWeights: RecallOptions["scoringWeights"];
+        if (typeof limitOrOpts === "object") {
+            limit = limitOrOpts.limit ?? 10;
+            label = limitOrOpts.subLabel ?? label;
+            scoringWeights = limitOrOpts.scoringWeights;
+        } else {
+            limit = limitOrOpts;
+        }
+
         const ac = new AbortController();
         const tid = setTimeout(() => ac.abort(), 15000);
         try {
             return await this.signedRequest<RecallResult>("POST", "/api/recall", {
                 query,
                 limit,
-                ...this.scopeFields(subLabel),
+                ...this.scopeFields(label),
+                ...(scoringWeights ? { scoring_weights: scoringWeights } : {}),
             }, { signal: ac.signal });
         } finally {
             clearTimeout(tid);
@@ -492,6 +585,37 @@ export class Memory {
         return this.sessionBuildPromise;
     }
 
+    private async ensureCompatibleRelayer(): Promise<RelayerVersionMetadata> {
+        if (this.relayerVersionMetadata) return this.relayerVersionMetadata;
+        if (this.compatibilityPromise) return this.compatibilityPromise;
+
+        this.compatibilityPromise = this.fetchCompatibilityMetadata().finally(() => {
+            this.compatibilityPromise = null;
+        });
+        return this.compatibilityPromise;
+    }
+
+    private async fetchCompatibilityMetadata(): Promise<RelayerVersionMetadata> {
+        const versionRes = await fetch(`${this.serverUrl}/version`, { method: "GET" });
+        let body: Partial<RelayerVersionMetadata>;
+
+        if (versionRes.ok) {
+            body = (await versionRes.json()) as Partial<RelayerVersionMetadata>;
+        } else {
+            const healthRes = await fetch(`${this.serverUrl}/health`, { method: "GET" });
+            if (!healthRes.ok) {
+                throw new Error(
+                    `Memory compatibility check failed: GET /version returned ${versionRes.status}`,
+                );
+            }
+            body = (await healthRes.json()) as Partial<RelayerVersionMetadata>;
+        }
+
+        assertCompatibleRelayer(body, this.serverUrl);
+        this.relayerVersionMetadata = body;
+        return body;
+    }
+
     /**
      * Make a signed request to the server.
      *
@@ -522,12 +646,17 @@ export class Memory {
         method: string,
         path: string,
         body: object,
-        options: { includeDelegateKey?: boolean; signal?: AbortSignal } = {},
+        options: {
+            includeDelegateKey?: boolean;
+            signal?: AbortSignal;
+            acceptedStatuses?: number[];
+        } = {},
     ): Promise<T> {
+        await this.ensureCompatibleRelayer();
         const ed = await getEd();
 
         const timestamp = Math.floor(Date.now() / 1000).toString();
-        const bodyStr = JSON.stringify(body);
+        const bodyStr = method === "GET" ? "" : JSON.stringify(body);
         const bodySha256 = await sha256hex(bodyStr);
 
         // MED-1 fix: Generate per-request nonce (UUID v4) for replay protection
@@ -548,8 +677,9 @@ export class Memory {
             "x-public-key": bytesToHex(publicKey),
             "x-signature": bytesToHex(signature),
             "x-timestamp": timestamp,
-            "x-nonce": nonce,           // MED-1: replay protection
+            "x-nonce": nonce,
             "x-account-id": this.accountId,
+            "x-sdk-compatibility": MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
         };
         if (this.platformId) {
             headers["x-platform-id"] = this.platformId;
@@ -570,13 +700,16 @@ export class Memory {
         const res = await fetch(url, {
             method,
             headers,
-            body: bodyStr,
+            body: method === "GET" ? undefined : bodyStr,
             signal: options.signal,
         });
 
-        if (!res.ok) {
-            // LOW-26: sanitize server error bodies before surfacing to callers.
+        const accepted = options.acceptedStatuses ?? [200];
+        if (!accepted.includes(res.status)) {
             const raw = await res.text();
+            const compatErr = compatibilityErrorFromStatus(res.status, raw);
+            if (compatErr) throw compatErr;
+
             const { message, serverCode } = sanitizeServerError(res.status, raw);
             const err = new Error(message) as Error & {
                 status?: number;
@@ -585,7 +718,6 @@ export class Memory {
             };
             err.status = res.status;
             if (serverCode) err.serverCode = serverCode;
-            // Preserve raw body on `cause` for in-process debugging only.
             err.cause = raw;
             throw err;
         }

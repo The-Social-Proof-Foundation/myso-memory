@@ -118,6 +118,13 @@ pub async fn verify_signature(
         return Err(constant_time_reject().await);
     }
 
+    let sdk_compat = headers
+        .get("x-sdk-compatibility")
+        .and_then(|v| v.to_str().ok());
+    if let Err(status) = crate::jobs::check_sdk_compatibility_header(sdk_compat) {
+        return Err(status);
+    }
+
     let timestamp: i64 = timestamp_str
         .parse()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;

@@ -36,7 +36,44 @@ export interface MemoryConfig {
 // API Types
 // ============================================================
 
-/** Result from remember() */
+/** Result from remember() — async job accepted (HTTP 202) */
+export interface RememberAcceptedResponse {
+    job_id: string;
+    status: string;
+}
+
+/** Result from waitForRememberJob() / rememberAndWait() */
+export interface RememberJobResult {
+    job_id: string;
+    status: string;
+    blob_id?: string;
+    error?: string;
+    agent_object_id?: string;
+}
+
+/** Options for remember job polling */
+export interface RememberJobPollOptions {
+    /** Poll interval in ms (default: 1500) */
+    intervalMs?: number;
+    /** Timeout in ms (default: 120000) */
+    timeoutMs?: number;
+}
+
+/** Bulk remember accepted response */
+export interface RememberBulkAcceptedResponse {
+    job_ids: string[];
+    status: string;
+}
+
+/** Bulk status item */
+export interface RememberBulkStatusItem {
+    job_id: string;
+    status: string;
+    blob_id?: string;
+    error?: string;
+}
+
+/** Result from remember() — legacy sync shape (use rememberAndWait for final blob) */
 export interface RememberResult {
     id: string;
     blob_id: string;
@@ -77,6 +114,30 @@ export interface AnalyzeResult {
     facts: AnalyzedFact[];
     total: number;
     owner: string;
+}
+
+/** Runtime compatibility metadata from GET /version */
+export interface RelayerVersionMetadata {
+    relayerVersion: string;
+    apiVersion: string;
+    minSupportedSdk: {
+        typescript: string;
+        mcp?: string;
+    };
+    featureFlags?: Record<string, boolean>;
+}
+
+export interface ScoringWeights {
+    semantic?: number;
+    recency?: number;
+    recency_half_life_days?: number;
+    importance?: number;
+}
+
+export interface RecallOptions {
+    limit?: number;
+    subLabel?: string;
+    scoringWeights?: ScoringWeights;
 }
 
 /** Server health response */

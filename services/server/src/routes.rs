@@ -1,15 +1,20 @@
 use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::Response;
-use axum::{extract::State, Extension, Json};
+use axum::{Extension, Json};
 use base64::Engine as _;
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 
 use crate::db::VectorDb;
-use crate::rate_limit;
-use crate::mydata;
-use crate::types::*;
 use crate::file_storage;
+use crate::jobs;
+use crate::mydata;
+use crate::observability;
+use crate::ranker::{CompositeRanker, ScoringWeights};
+use crate::rate_limit;
+use crate::types::*;
 use crate::vault::ensure_agent_vault;
 
 const MAX_ANALYZE_FACTS: usize = 20;
@@ -17,12 +22,7 @@ const ANALYZE_CONCURRENCY: usize = 5;
 const ANALYZE_MAX_OUTPUT_TOKENS: u32 = 256;
 const MAX_SPONSORED_SIGNATURE_BYTES: usize = 2048;
 
-// LOW-6: Upper bound on plaintext size accepted by /api/remember (and /api/analyze).
-// 64 KiB is well above any realistic single memory / conversation turn and far
-// below the OpenAI embedding token limit (~8k tokens). Anything larger is
-// rejected early so we don't initiate concurrent embed + MYDATA encrypt on
-// payloads that will fail downstream.
-const MAX_REMEMBER_TEXT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_REMEMBER_TEXT_BYTES: usize = 64 * 1024;
 
 /// Truncate a string to at most `max_bytes` bytes without splitting a UTF-8
 /// character.  Falls back to the nearest char boundary when `max_bytes` lands
@@ -61,8 +61,7 @@ struct EmbeddingData {
 }
 
 /// Generate an embedding vector from text.
-/// Uses OpenRouter/OpenAI API when OPENAI_API_KEY is set, mock otherwise.
-async fn generate_embedding(
+pub(crate) async fn generate_embedding(
     client: &reqwest::Client,
     config: &Config,
     text: &str,
@@ -129,22 +128,15 @@ async fn generate_embedding(
 // Routes
 // ============================================================
 
-/// POST /api/remember
-///
-/// Full TEE flow:
-/// 1. Verify auth (middleware) → get owner from delegate key onchain lookup
-/// 2. Embed text + Encrypt text concurrently (independent operations)
-/// 3. Upload encrypted blob → File Storage → blobId
-/// 4. Store {vector, blobId} in Vector DB
+/// POST /api/remember — enqueue async job, return 202 Accepted
 pub async fn remember(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RememberRequest>,
-) -> Result<Json<RememberResponse>, AppError> {
+) -> Result<(StatusCode, Json<RememberAcceptedResponse>), AppError> {
     if body.text.is_empty() {
         return Err(AppError::BadRequest("Text cannot be empty".into()));
     }
-    // LOW-6: Reject oversize plaintext before spending embed + encrypt compute.
     if body.text.len() > MAX_REMEMBER_TEXT_BYTES {
         return Err(AppError::BadRequest(format!(
             "Text exceeds maximum length of {} bytes",
@@ -152,90 +144,128 @@ pub async fn remember(
         )));
     }
 
-    // Owner is derived from delegate key via on-chain verification (auth middleware)
     let owner = &auth.owner;
     let agent_object_id = &auth.agent_object_id;
     let sub_label = parse_sub_label(&body.namespace);
-    let text = &body.text;
-    tracing::info!(
-        "remember: text=\"{}...\" owner={} agent={} sub_label={:?}",
-        truncate_str(text, 50),
+    let label_str = sub_label.clone().unwrap_or_default();
+
+    let job_id = jobs::create_remember_job(
+        &state,
         owner,
         agent_object_id,
-        sub_label
-    );
-
-    ensure_agent_vault(&state, &auth).await?;
-
-    // Step 1: Embed text + MYDATA encrypt concurrently (they're independent)
-    let embed_fut = generate_embedding(&state.http_client, &state.config, text);
-    let encrypt_fut = mydata::mydata_encrypt(
-        &state.http_client,
-        &state.config.sidecar_url,
-        state.config.sidecar_secret.as_deref(),
-        text.as_bytes(),
-        owner,
-        &state.config.package_id,
-    );
-    let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
-    let vector = vector_result?;
-    let encrypted = encrypted_result?;
-
-    // LOW-11: Quota is stored using encrypted blob size (blob_size_bytes), so check
-    // quota against ciphertext length — not plaintext — to avoid under-counting
-    // the MYDATA framing overhead that is actually persisted.
-    rate_limit::check_storage_quota(&state, owner, encrypted.len() as i64).await?;
-
-    // Step 2: Upload encrypted blob → File Storage (via sidecar)
-    let key_index = state.key_pool.next_index()
-        .ok_or_else(|| AppError::Internal("No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)".into()))?;
-    let upload_result = file_storage::upload_blob(
-        &state.http_client,
-        &state.config.sidecar_url,
-        state.config.sidecar_secret.as_deref(),
-        &encrypted,
-        50,
-        owner,
-        key_index,
-        agent_object_id,
-        &state.config.package_id,
-        Some(&auth.agent_object_id),
+        &label_str,
     )
     .await?;
-    let blob_id = upload_result.blob_id;
 
-    // Step 3: Store {vector, blobId, agent_object_id} in Vector DB
-    let blob_size = encrypted.len() as i64;
-    let id = uuid::Uuid::new_v4().to_string();
-    state
-        .db
-        .insert_vector(
-            &id,
-            owner,
-            agent_object_id,
-            sub_label.as_deref(),
-            &blob_id,
-            &vector,
-            blob_size,
-        )
-        .await?;
-
-    tracing::info!(
-        "remember complete: blob_id={}, owner={}, agent={}, dims={}",
-        blob_id,
-        owner,
-        agent_object_id,
-        vector.len()
+    let _span = observability::remember_job_span(&job_id, agent_object_id);
+    jobs::spawn_remember_job(
+        state.clone(),
+        job_id.clone(),
+        body.text,
+        auth.clone(),
+        sub_label,
     );
 
-    Ok(Json(RememberResponse {
-        id,
-        blob_id,
-        owner: owner.clone(),
-        agent_object_id: agent_object_id.clone(),
-        sub_label: sub_label.clone(),
-        namespace: agent_object_id.clone(),
+    tracing::info!(
+        "remember accepted: job_id={} owner={} agent={}",
+        job_id,
+        owner,
+        agent_object_id
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RememberAcceptedResponse {
+            job_id,
+            status: "running".to_string(),
+        }),
+    ))
+}
+
+/// GET /api/remember/:job_id — poll job status
+pub async fn remember_status(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Path(job_id): Path<String>,
+) -> Result<Json<RememberJobStatusResponse>, AppError> {
+    let row = jobs::get_remember_job_status(&state, &job_id, &auth.owner)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Job not found".into()))?;
+
+    Ok(Json(RememberJobStatusResponse {
+        job_id: row.job_id,
+        status: row.status,
+        blob_id: row.blob_id,
+        error: row.error_msg,
+        agent_object_id: row.agent_object_id,
     }))
+}
+
+/// POST /api/remember/bulk
+pub async fn remember_bulk(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(body): Json<RememberBulkRequest>,
+) -> Result<(StatusCode, Json<RememberBulkAcceptedResponse>), AppError> {
+    if body.texts.is_empty() {
+        return Err(AppError::BadRequest("texts cannot be empty".into()));
+    }
+    if body.texts.len() > MAX_ANALYZE_FACTS {
+        return Err(AppError::BadRequest(format!(
+            "Maximum {} texts per bulk request",
+            MAX_ANALYZE_FACTS
+        )));
+    }
+
+    let owner = &auth.owner;
+    let agent_object_id = &auth.agent_object_id;
+    let sub_label = parse_sub_label(&body.namespace);
+    let label_str = sub_label.clone().unwrap_or_default();
+
+    let job_ids = jobs::create_bulk_remember_jobs(
+        &state,
+        owner,
+        agent_object_id,
+        &label_str,
+        body.texts.len(),
+    )
+    .await?;
+
+    jobs::spawn_bulk_remember_jobs(
+        state.clone(),
+        job_ids.clone(),
+        body.texts,
+        auth,
+        sub_label,
+    );
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RememberBulkAcceptedResponse {
+            job_ids,
+            status: "running".to_string(),
+        }),
+    ))
+}
+
+/// POST /api/remember/bulk/status
+pub async fn remember_bulk_status(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(body): Json<RememberBulkStatusRequest>,
+) -> Result<Json<RememberBulkStatusResponse>, AppError> {
+    let mut jobs_out = Vec::new();
+    for job_id in &body.job_ids {
+        if let Some(row) = jobs::get_remember_job_status(&state, job_id, &auth.owner).await? {
+            jobs_out.push(RememberBulkStatusItem {
+                job_id: row.job_id,
+                status: row.status,
+                blob_id: row.blob_id,
+                error: row.error_msg,
+            });
+        }
+    }
+    Ok(Json(RememberBulkStatusResponse { jobs: jobs_out }))
 }
 
 /// POST /api/recall
@@ -287,6 +317,12 @@ pub async fn recall(
     // MED-3 fix: Cap limit to prevent unbounded DB scans / memory use.
     // Without this, an attacker could send limit=999999 to scan the entire DB.
     let limit = body.limit.min(100);
+    let weights = body
+        .scoring_weights
+        .clone()
+        .unwrap_or_default();
+    let _rank_span = observability::recall_rank_span(limit);
+
     let hits = state
         .db
         .search_similar(
@@ -295,12 +331,16 @@ pub async fn recall(
             agent_object_id,
             sub_label.as_deref(),
             limit,
+            3,
         )
         .await?;
 
+    let ranked = CompositeRanker::rank(hits, &weights, chrono::Utc::now());
+    let hits_to_fetch: Vec<_> = ranked.into_iter().take(limit).collect();
+
     // Step 3: Download + MYDATA decrypt all results concurrently
     let db = &state.db;
-    let tasks: Vec<_> = hits
+    let tasks: Vec<_> = hits_to_fetch
         .iter()
         .map(|hit| {
             let http_client = state.http_client.clone();
@@ -309,6 +349,7 @@ pub async fn recall(
             let sidecar_secret = state.config.sidecar_secret.clone();
             let blob_id = hit.blob_id.clone();
             let distance = hit.distance;
+            let score = hit.score;
             let credential = credential.clone();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
@@ -352,10 +393,11 @@ pub async fn recall(
                             blob_id,
                             text,
                             distance,
+                            score,
                         }),
                         Err(e) => {
                             tracing::warn!("Invalid UTF-8 in decrypted data: {}", e);
-                            None
+                            return None;
                         }
                     },
                     Err(e) => {
@@ -485,6 +527,7 @@ pub async fn remember_manual(
             &blob_id,
             &body.vector,
             blob_size,
+            0.5,
         )
         .await?;
 
@@ -540,6 +583,7 @@ pub async fn recall_manual(
             agent_object_id,
             sub_label.as_deref(),
             limit,
+            1,
         )
         .await?;
     let total = hits.len();
@@ -672,6 +716,7 @@ pub async fn analyze(
                 &upload_result.blob_id,
                 &vector,
                 blob_size,
+                0.5,
             ).await?;
 
             Ok::<AnalyzedFact, AppError>(AnalyzedFact {
@@ -862,6 +907,11 @@ where
         .collect()
 }
 
+/// GET /version — public compatibility metadata
+pub async fn version() -> Json<crate::compatibility::VersionResponse> {
+    Json(crate::compatibility::version_response())
+}
+
 /// GET /health
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let social = match state
@@ -1049,6 +1099,7 @@ mod tests {
             blob_id: "blob123".into(),
             text: "User likes coffee".into(),
             distance: 0.1,
+            score: None,
         }];
 
         let lines: Vec<String> = memories
@@ -1221,8 +1272,16 @@ pub async fn ask(
             agent_object_id,
             sub_label.as_deref(),
             limit,
+            3,
         )
         .await?;
+
+    let weights = body
+        .scoring_weights
+        .clone()
+        .unwrap_or_default();
+    let ranked = CompositeRanker::rank(hits, &weights, chrono::Utc::now());
+    let hits_to_fetch: Vec<_> = ranked.into_iter().take(limit).collect();
 
     // ENG-1697: Prefer the client-built SessionKey; fall back to legacy
     // delegate key, then to the server's own key.
@@ -1238,7 +1297,7 @@ pub async fn ask(
 
     // Download + MYDATA decrypt all memories concurrently
     let db = &state.db;
-    let tasks: Vec<_> = hits
+    let tasks: Vec<_> = hits_to_fetch
         .iter()
         .map(|hit| {
             let http_client = state.http_client.clone();
@@ -1247,6 +1306,7 @@ pub async fn ask(
             let sidecar_secret = state.config.sidecar_secret.clone();
             let blob_id = hit.blob_id.clone();
             let distance = hit.distance;
+            let score = hit.score;
             let credential = credential.clone();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
@@ -1289,6 +1349,7 @@ pub async fn ask(
                             blob_id,
                             text,
                             distance,
+                            score,
                         }),
                         Err(e) => {
                             tracing::warn!("Invalid UTF-8: {}", e);
@@ -1718,6 +1779,7 @@ pub async fn restore(
                 blob_id,
                 vector,
                 blob_size,
+                0.5,
             )
             .await?;
     }

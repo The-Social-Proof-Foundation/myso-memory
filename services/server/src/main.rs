@@ -1,12 +1,16 @@
 mod auth;
+mod compatibility;
 mod db;
+mod jobs;
 mod lifecycle;
 mod memory_contract;
-mod policy;
-mod rate_limit;
-mod routes;
 mod mydata;
 mod myso;
+mod observability;
+mod policy;
+mod ranker;
+mod rate_limit;
+mod routes;
 mod social;
 mod types;
 mod vault;
@@ -151,6 +155,9 @@ async fn main() {
     // auth + rate-limit middleware even sees the request.
     let protected_routes = Router::new()
         .route("/api/remember", post(routes::remember))
+        .route("/api/remember/:job_id", get(routes::remember_status))
+        .route("/api/remember/bulk", post(routes::remember_bulk))
+        .route("/api/remember/bulk/status", post(routes::remember_bulk_status))
         .route("/api/recall", post(routes::recall))
         .route("/api/remember/manual", post(routes::remember_manual))
         .route("/api/recall/manual", post(routes::recall_manual))
@@ -193,6 +200,7 @@ async fn main() {
     // the user adding packageId to MemoryConfig.
     let public_routes = Router::new()
         .route("/health", get(routes::health).layer(DefaultBodyLimit::max(16 * 1024)))
+        .route("/version", get(routes::version).layer(DefaultBodyLimit::max(16 * 1024)))
         .route("/config", get(routes::get_config).layer(DefaultBodyLimit::max(16 * 1024)))
         .merge(sponsor_routes);
 
