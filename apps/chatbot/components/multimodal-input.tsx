@@ -28,10 +28,9 @@ import {
   ModelSelectorTrigger,
 } from "@/components/ai-elements/model-selector";
 import {
-  chatModels,
   DEFAULT_CHAT_MODEL,
-  modelsByProvider,
 } from "@/lib/ai/models";
+import { groupModelsByProvider, useChatModels } from "@/lib/ai/use-chat-models";
 import type { Attachment, ChatMessage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import {
@@ -498,11 +497,13 @@ function PureModelSelectorCompact({
   onModelChange?: (modelId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const { models: chatModelsList } = useChatModels();
+  const modelsByProvider = groupModelsByProvider(chatModelsList);
 
   const selectedModel =
-    chatModels.find((m) => m.id === selectedModelId) ??
-    chatModels.find((m) => m.id === DEFAULT_CHAT_MODEL) ??
-    chatModels[0];
+    chatModelsList.find((m) => m.id === selectedModelId) ??
+    chatModelsList.find((m) => m.id === DEFAULT_CHAT_MODEL) ??
+    chatModelsList[0];
   const [provider] = selectedModel.id.split("/");
 
   // Provider display names

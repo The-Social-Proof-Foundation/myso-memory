@@ -25,6 +25,12 @@ pub struct OnChainBlob {
     /// Memory package ID from on-chain metadata
     #[serde(rename = "packageId", default)]
     pub package_id: String,
+    /// Visibility tier from blob metadata (0 private, 1 org, 2 account). Legacy blobs omit this.
+    #[serde(rename = "memoryVisibility", default)]
+    pub memory_visibility: Option<i16>,
+    /// Organization id for org-visible blobs. Legacy blobs omit this.
+    #[serde(rename = "memoryOrgId", default)]
+    pub memory_org_id: Option<String>,
 }
 
 /// Response from sidecar query-blobs endpoint
@@ -46,6 +52,11 @@ struct FileStorageUploadRequest {
     epochs: u64,
     #[serde(rename = "agentId", skip_serializing_if = "Option::is_none")]
     agent_id: Option<String>,
+    /// Memory visibility tier stored as blob metadata (0 private, 1 org, 2 account).
+    /// Additive: older sidecars ignore unknown fields; restores default to private.
+    visibility: i16,
+    #[serde(rename = "organizationId", skip_serializing_if = "Option::is_none")]
+    organization_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -75,6 +86,8 @@ pub async fn upload_blob(
     namespace: &str,
     package_id: &str,
     agent_id: Option<&str>,
+    visibility: i16,
+    organization_id: Option<&str>,
 ) -> Result<UploadResult, AppError> {
     let url = format!("{}/file-storage/upload", sidecar_url);
     let data_b64 = BASE64.encode(data);
@@ -89,6 +102,8 @@ pub async fn upload_blob(
             package_id: package_id.to_string(),
             epochs,
             agent_id: agent_id.map(|s| s.to_string()),
+            visibility,
+            organization_id: organization_id.map(|s| s.to_string()),
         });
     if let Some(secret) = sidecar_secret {
         req = req.header("authorization", format!("Bearer {}", secret));

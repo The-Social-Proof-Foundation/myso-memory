@@ -2,6 +2,8 @@ use blake2::Blake2b;
 use blake2::digest::{consts::U32, Digest};
 use serde::Deserialize;
 
+use crate::memory_contract::E_ACCOUNT_DEACTIVATED;
+
 pub use crate::memory_contract::has_cap;
 
 /// Derive a MySo address from an Ed25519 public key (scheme flag 0x00 + blake2b-256).
@@ -122,8 +124,8 @@ async fn verify_memory_account_active(
     let active = fields.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
     if !active {
         return Err(OnchainVerifyError::MemoryAccountDeactivated(format!(
-            "Account {} has been deactivated",
-            account_object_id
+            "Account {} has been deactivated (code={})",
+            account_object_id, E_ACCOUNT_DEACTIVATED
         )));
     }
 
@@ -260,7 +262,7 @@ impl std::error::Error for OnchainVerifyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_contract::{CAP_MEMORY_READ, CAP_MEMORY_WRITE};
+    use crate::memory_contract::{CAP_AI_SPEND, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MYDATA_READ, has_cap};
 
     #[test]
     fn derived_address_is_deterministic() {
@@ -277,5 +279,20 @@ mod tests {
         assert!(has_cap(3, CAP_MEMORY_READ));
         assert!(has_cap(3, CAP_MEMORY_WRITE));
         assert!(!has_cap(CAP_MEMORY_READ, CAP_MEMORY_WRITE));
+    }
+
+    #[test]
+    fn sub_agent_verify_result_fields_are_populated() {
+        let verified = SubAgentVerifyResult {
+            owner: "0xowner".into(),
+            account_id: "0xaccount".into(),
+            agent_object_id: "0xagent".into(),
+            derived_address: "0xderived".into(),
+            capabilities: CAP_MEMORY_READ | CAP_MYDATA_READ,
+        };
+        assert_eq!(verified.account_id, "0xaccount");
+        assert_eq!(verified.agent_object_id, "0xagent");
+        assert_eq!(verified.derived_address, "0xderived");
+        assert!(has_cap(verified.capabilities, CAP_MYDATA_READ));
     }
 }

@@ -37,6 +37,8 @@ pub struct RankedHit {
     pub score: Option<f64>,
     pub created_at: Option<DateTime<Utc>>,
     pub importance: f32,
+    pub source_agent_object_id: Option<String>,
+    pub visibility: i16,
 }
 
 pub struct CompositeRanker;
@@ -56,6 +58,8 @@ impl CompositeRanker {
                     score: None,
                     created_at: h.created_at,
                     importance: h.importance,
+                    source_agent_object_id: h.source_agent_object_id,
+                    visibility: h.visibility,
                 })
                 .collect();
         }
@@ -70,6 +74,8 @@ impl CompositeRanker {
                     score: Some(score),
                     created_at: h.created_at,
                     importance: h.importance,
+                    source_agent_object_id: h.source_agent_object_id,
+                    visibility: h.visibility,
                 }
             })
             .collect();
@@ -123,16 +129,45 @@ mod tests {
                 distance: 0.1,
                 created_at: None,
                 importance: 0.5,
+                source_agent_object_id: Some("0xagent".into()),
+                visibility: 0,
             },
             SearchHit {
                 blob_id: "b".into(),
                 distance: 0.3,
                 created_at: None,
                 importance: 0.5,
+                source_agent_object_id: Some("0xagent".into()),
+                visibility: 0,
             },
         ];
         let ranked = CompositeRanker::rank(hits, &ScoringWeights::default(), Utc::now());
         assert_eq!(ranked[0].blob_id, "a");
         assert!(ranked[0].score.is_none());
+        assert_eq!(ranked[0].importance, 0.5);
+        assert!(ranked[0].created_at.is_none());
+    }
+
+    #[test]
+    fn active_weights_use_importance_and_recency() {
+        let now = Utc::now();
+        let hits = vec![SearchHit {
+            blob_id: "recent".into(),
+            distance: 0.2,
+            created_at: Some(now),
+            importance: 0.9,
+            source_agent_object_id: None,
+            visibility: 1,
+        }];
+        let weights = ScoringWeights {
+            semantic: 1.0,
+            recency: 0.5,
+            recency_half_life_days: 7.0,
+            importance: 0.3,
+        };
+        let ranked = CompositeRanker::rank(hits, &weights, now);
+        assert!(ranked[0].score.unwrap() > 0.0);
+        assert_eq!(ranked[0].importance, 0.9);
+        assert!(ranked[0].created_at.is_some());
     }
 }

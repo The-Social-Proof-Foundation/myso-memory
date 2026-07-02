@@ -392,6 +392,7 @@ mod tests {
             approval_required_caps: 0,
             max_action_spend: None,
             platform_scope: None,
+            organization_id: None,
             platform_id: None,
             label: "test".into(),
             sub_agent_key: None,

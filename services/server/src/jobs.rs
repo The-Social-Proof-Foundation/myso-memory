@@ -12,12 +12,17 @@ use crate::types::{AppError, AppState, AuthInfo};
 use crate::vault::ensure_agent_vault;
 
 /// Shared remember pipeline used by async jobs and synchronous analyze paths.
+/// `visibility`/`organization_id` must already be authorized by the caller
+/// (see `org_perms::authorize_write_visibility`).
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_remember_text(
     state: &Arc<AppState>,
     auth: &AuthInfo,
     text: &str,
     sub_label: Option<&str>,
     importance: f32,
+    visibility: i16,
+    organization_id: Option<&str>,
 ) -> Result<(String, String, String), AppError> {
     if text.is_empty() {
         return Err(AppError::BadRequest("Text cannot be empty".into()));
@@ -34,6 +39,17 @@ pub async fn execute_remember_text(
 
     ensure_agent_vault(state, auth).await?;
 
+    if let Err(code) = crate::memory_contract::check_spend_limit(
+        auth.max_action_spend,
+        crate::auth::ESTIMATED_FILE_STORAGE_UPLOAD_MIST,
+    ) {
+        return Err(AppError::Forbidden(format!(
+            "max_action_spend exceeded (code={code})"
+        )));
+    }
+
+    crate::ai_spend::preflight_remember(state, auth, text).await?;
+
     let embed_fut = crate::routes::generate_embedding(&state.http_client, &state.config, text);
     let encrypt_fut = mydata::mydata_encrypt(
         &state.http_client,
@@ -46,6 +62,14 @@ pub async fn execute_remember_text(
     let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
     let vector = vector_result?;
     let encrypted = encrypted_result?;
+
+    crate::ai_spend::record_embedding_usage(
+        state,
+        auth,
+        crate::ai_spend::DEFAULT_EMBED_MODEL,
+        ((text.len() as u64 + 3) / 4).max(1),
+    )
+    .await?;
 
     rate_limit::check_storage_quota(state, owner, encrypted.len() as i64).await?;
 
@@ -69,6 +93,8 @@ pub async fn execute_remember_text(
         agent_object_id,
         &state.config.package_id,
         Some(&auth.agent_object_id),
+        visibility,
+        organization_id,
     )
     .await?;
     let blob_id = upload_result.blob_id;
@@ -86,8 +112,25 @@ pub async fn execute_remember_text(
             &vector,
             blob_size,
             importance,
+            visibility,
+            organization_id,
         )
         .await?;
+
+    if visibility == crate::types::VISIBILITY_ORG {
+        crate::audit_push::spawn_audit_push(
+            state,
+            vec![crate::audit_push::AuditEntry::relayer_agent_action(
+                "memory_org_write",
+                &auth.derived_address,
+                "memory_entry",
+                &blob_id,
+                organization_id.map(String::from),
+                Some(auth.account_id.clone()),
+                serde_json::json!({ "agent_object_id": agent_object_id, "bytes": blob_size }),
+            )],
+        );
+    }
 
     tracing::info!(
         "remember complete: job_id={} blob_id={} owner={} agent={}",
@@ -106,6 +149,8 @@ pub fn spawn_remember_job(
     text: String,
     auth: AuthInfo,
     sub_label: Option<String>,
+    visibility: i16,
+    organization_id: Option<String>,
 ) {
     tokio::spawn(async move {
         if let Err(e) = set_job_status(&state, &job_id, "running", None, None).await {
@@ -119,6 +164,8 @@ pub fn spawn_remember_job(
             &text,
             sub_label.as_deref(),
             0.5,
+            visibility,
+            organization_id.as_deref(),
         )
         .await;
 
@@ -239,9 +286,19 @@ pub fn spawn_bulk_remember_jobs(
     texts: Vec<String>,
     auth: AuthInfo,
     sub_label: Option<String>,
+    visibility: i16,
+    organization_id: Option<String>,
 ) {
     for (job_id, text) in job_ids.into_iter().zip(texts) {
-        spawn_remember_job(state.clone(), job_id, text, auth.clone(), sub_label.clone());
+        spawn_remember_job(
+            state.clone(),
+            job_id,
+            text,
+            auth.clone(),
+            sub_label.clone(),
+            visibility,
+            organization_id.clone(),
+        );
     }
 }
 

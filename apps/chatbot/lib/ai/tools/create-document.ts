@@ -8,12 +8,15 @@ import {
 import type { ChatMessage } from "@/lib/types";
 import { generateUUID } from "@/lib/utils";
 
+import type { BillingContext } from "@/lib/artifacts/server";
+
 type CreateDocumentProps = {
   session: Session;
   dataStream: UIMessageStreamWriter<ChatMessage>;
+  billing?: BillingContext;
 };
 
-export const createDocument = ({ session, dataStream }: CreateDocumentProps) =>
+export const createDocument = ({ session, dataStream, billing }: CreateDocumentProps) =>
   tool({
     description:
       "Create a document for a writing or content creation activities. This tool will call other functions that will generate the contents of the document based on the title and kind.",
@@ -62,6 +65,7 @@ export const createDocument = ({ session, dataStream }: CreateDocumentProps) =>
         title,
         dataStream,
         session,
+        billing,
       });
 
       dataStream.write({ type: "data-finish", data: null, transient: true });

@@ -1,8 +1,9 @@
 use axum::http::HeaderMap;
 
 use crate::memory_contract::{
-    check_platform_scope, has_cap, E_SUB_AGENT_EXPIRED, E_SUB_AGENT_INACTIVE_ANCESTOR,
-    E_SUB_AGENT_MISSING_CAP, E_SUB_AGENT_NOT_ACTIVE, MAX_AGENT_DEPTH,
+    check_platform_scope, has_cap, org_type_label, CLASS_DELEGATED_AI,
+    CLASS_HUMAN, CLASS_ORGANIZATION, E_SUB_AGENT_EXPIRED, E_SUB_AGENT_INACTIVE_ANCESTOR, E_SUB_AGENT_MISSING_CAP,
+    E_SUB_AGENT_NOT_ACTIVE, MAX_AGENT_DEPTH, MAX_ORGANIZATIONS_PER_USER, ORG_TYPE_OTHER,
 };
 use crate::social::SocialSubAgent;
 
@@ -28,6 +29,8 @@ pub enum PolicyError {
     InactiveAncestor,
     MissingCapability { required: u64 },
     WrongPlatformScope,
+    ApprovalRequired { required: u64 },
+    SpendLimitExceeded { limit_mist: Option<u64> },
 }
 
 impl PolicyError {
@@ -40,20 +43,43 @@ impl PolicyError {
             PolicyError::WrongPlatformScope => {
                 crate::memory_contract::E_SUB_AGENT_WRONG_PLATFORM_SCOPE
             }
+            PolicyError::ApprovalRequired { .. } => {
+                crate::memory_contract::E_SUB_AGENT_APPROVAL_REQUIRED
+            }
+            PolicyError::SpendLimitExceeded { .. } => {
+                crate::memory_contract::E_SUB_AGENT_SPEND_EXCEEDED
+            }
         }
     }
 }
 
 impl std::fmt::Display for PolicyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::memory_contract::capability_label;
         match self {
             PolicyError::InactiveAgent => write!(f, "sub-agent is not active"),
             PolicyError::ExpiredAgent => write!(f, "sub-agent has expired"),
             PolicyError::InactiveAncestor => write!(f, "sub-agent has inactive ancestor"),
             PolicyError::MissingCapability { required } => {
-                write!(f, "sub-agent missing capability bit {}", required)
+                write!(
+                    f,
+                    "sub-agent missing capability {} ({})",
+                    required,
+                    capability_label(*required)
+                )
             }
             PolicyError::WrongPlatformScope => write!(f, "platform scope mismatch"),
+            PolicyError::ApprovalRequired { required } => write!(
+                f,
+                "owner co-sign required for capability {} ({})",
+                required,
+                capability_label(*required)
+            ),
+            PolicyError::SpendLimitExceeded { limit_mist } => write!(
+                f,
+                "action exceeds max_action_spend ({:?} MIST)",
+                limit_mist
+            ),
         }
     }
 }
@@ -67,6 +93,22 @@ pub fn validate_agent_policy(
 ) -> Result<(), PolicyError> {
     if !agent.active || agent.revoked_at_ms.is_some() {
         return Err(PolicyError::InactiveAgent);
+    }
+
+    if agent.deactivated_at_ms.is_some() {
+        return Err(PolicyError::InactiveAgent);
+    }
+
+    if !matches!(
+        agent.identity_class as u8,
+        CLASS_HUMAN | CLASS_DELEGATED_AI | CLASS_ORGANIZATION
+    ) {
+        return Err(PolicyError::InactiveAgent);
+    }
+
+    let expected_depth = ancestors.len() as i16 + 1;
+    if agent.parent_object_id.is_some() && agent.depth != expected_depth {
+        return Err(PolicyError::InactiveAncestor);
     }
 
     if let Some(expires_at) = agent.expires_at_ms {
@@ -104,6 +146,20 @@ pub fn validate_agent_policy(
     )
     .map_err(|_| PolicyError::WrongPlatformScope)?;
 
+    tracing::debug!(
+        agent = %agent.agent_object_id,
+        label = %agent.label,
+        role_tags = agent.role_tags,
+        delegatable_caps = agent.delegatable_caps,
+        register_scope = agent.register_scope,
+        registered_by = %agent.registered_by,
+        created_at_ms = agent.created_at_ms,
+        updated_at_ms = agent.updated_at_ms,
+        max_orgs_per_user = MAX_ORGANIZATIONS_PER_USER,
+        org_type = org_type_label(ORG_TYPE_OTHER),
+        "agent policy validated"
+    );
+
     Ok(())
 }
 
@@ -134,6 +190,7 @@ mod tests {
             deactivated_at_ms: None,
             revoked_at_ms: None,
             updated_at_ms: 0,
+            organization_id: None,
         }
     }
 

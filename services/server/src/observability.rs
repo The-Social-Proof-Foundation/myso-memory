@@ -2,11 +2,12 @@
 
 use tracing::{info_span, Span};
 
-pub fn remember_job_span(job_id: &str, agent_object_id: &str) -> Span {
+pub fn remember_job_span(job_id: &str, agent_object_id: &str, agent_label: &str) -> Span {
     info_span!(
         "remember.job",
         job_id = job_id,
-        agent_object_id = agent_object_id
+        agent_object_id = agent_object_id,
+        agent_label = agent_label
     )
 }
 

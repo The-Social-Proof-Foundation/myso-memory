@@ -1,3 +1,5 @@
+mod ai_spend;
+mod audit_push;
 mod auth;
 mod compatibility;
 mod db;
@@ -7,6 +9,7 @@ mod memory_contract;
 mod mydata;
 mod myso;
 mod observability;
+mod org_perms;
 mod policy;
 mod ranker;
 mod rate_limit;
@@ -14,6 +17,7 @@ mod routes;
 mod social;
 mod social_routes;
 mod types;
+mod usage_stats;
 mod vault;
 #[path = "file-storage.rs"]
 mod file_storage;
@@ -149,6 +153,9 @@ async fn main() {
         }
     });
 
+    // Push per-agent memory usage aggregates to social-server (org dashboards).
+    usage_stats::spawn_usage_stats_sync(state.clone());
+
     // Build routes
     // Protected routes (require Ed25519 signature + onchain verification)
     // HIGH-13: 256 KiB covers the largest realistic JSON body (64 KiB plaintext
@@ -165,6 +172,10 @@ async fn main() {
 
         .route("/api/analyze", post(routes::analyze))
         .route("/api/ask", post(routes::ask))
+        .route(
+            "/api/ai-credit/record-inference",
+            post(routes::record_inference_usage_route),
+        )
         .route("/api/restore", post(routes::restore))
         .route("/api/social/post", post(social_routes::create_post))
         .route("/api/social/comment", post(social_routes::create_comment))

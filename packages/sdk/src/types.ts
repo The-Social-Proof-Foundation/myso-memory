@@ -85,17 +85,35 @@ export interface RememberResult {
     namespace: string;
 }
 
+/** Write visibility for remember/analyze paths */
+export type MemoryVisibility = "private" | "org" | "account";
+
+/** Read scope for recall/ask paths */
+export type RecallScope = "all" | "private" | "org" | "account";
+
+/** Options for remember() / rememberBulk() / analyze() */
+export interface RememberOptions {
+    subLabel?: string;
+    visibility?: MemoryVisibility;
+}
+
 /** A single recalled memory */
 export interface RecallMemory {
     blob_id: string;
     text: string;
     distance: number;
+    score?: number;
+    /** 0 private, 1 org, 2 account */
+    visibility?: number;
+    source_agent_id?: string;
 }
 
 /** Result from recall() */
 export interface RecallResult {
     results: RecallMemory[];
     total: number;
+    dropped_count?: number;
+    degraded_scope?: boolean;
 }
 
 /** Result from embed() */
@@ -138,6 +156,7 @@ export interface ScoringWeights {
 export interface RecallOptions {
     limit?: number;
     subLabel?: string;
+    scope?: RecallScope;
     scoringWeights?: ScoringWeights;
 }
 
@@ -161,9 +180,8 @@ export interface RememberManualOptions {
     namespace?: string;
     /** Optional sub-label within agent vault */
     subLabel?: string;
+    visibility?: MemoryVisibility;
 }
-
-/** Result from rememberManual() */
 export interface RememberManualResult {
     id: string;
     blob_id: string;
@@ -181,12 +199,14 @@ export interface RecallManualOptions {
     namespace?: string;
     /** Optional sub-label within agent vault */
     subLabel?: string;
+    /** Read scope (default all visible tiers the agent may access). */
+    scope?: RecallScope;
 }
-
-/** A single search hit — raw blobId + distance (no decrypted text) */
 export interface RecallManualHit {
     blob_id: string;
     distance: number;
+    visibility?: number;
+    source_agent_object_id?: string;
 }
 
 /** Result from restore() */
@@ -341,8 +361,43 @@ interface SubAgentRegistrationFields {
     expiresAt?: number | null;
 }
 
+/** Options for createAgenticOrganization() */
+export interface CreateAgenticOrganizationOpts extends MemoryTxOpts {
+    accountId: string;
+    label: string;
+    orgType: number;
+}
+
+/** Result from createAgenticOrganization() */
+export interface CreateAgenticOrganizationResult {
+    digest: string;
+    organizationId: string;
+}
+
+/** Options for updateAgenticOrganizationLabel() */
+export interface UpdateAgenticOrganizationLabelOpts extends MemoryTxOpts {
+    accountId: string;
+    organizationId: string;
+    label: string;
+}
+
+/** Options for updateAgenticOrganizationCategory() */
+export interface UpdateAgenticOrganizationCategoryOpts extends MemoryTxOpts {
+    accountId: string;
+    organizationId: string;
+    orgType: number;
+}
+
+/** Options for deactivateAgenticOrganization() */
+export interface DeactivateAgenticOrganizationOpts extends MemoryTxOpts {
+    accountId: string;
+    organizationId: string;
+}
+
 /** Options for registerSubAgent() */
-export interface RegisterSubAgentOpts extends MemoryTxOpts, SubAgentRegistrationFields {}
+export interface RegisterSubAgentOpts extends MemoryTxOpts, SubAgentRegistrationFields {
+    organizationId: string;
+}
 
 /** Options for registerSubAgentDelegated() */
 export interface RegisterSubAgentDelegatedOpts extends MemoryTxOpts, SubAgentRegistrationFields {
@@ -399,4 +454,157 @@ export interface ApproveKeyPolicyOpts extends MemoryTxOpts {
     accountId: string;
     /** MYDATA encryption id (hex string) */
     id: string;
+}
+
+/** Shared org transaction fields (extends wallet/package context). */
+interface OrgGroupTxBase extends MemoryTxOpts {
+    accountId: string;
+    organizationId: string;
+    /** PermissionedGroup<MemorySharePackage> shared object for the org */
+    orgMemoryGroupId: string;
+}
+
+export interface EnsureOrgMemoryGroupOpts extends MemoryTxOpts {
+    accountId: string;
+    organizationId: string;
+}
+
+export interface GrantOrgMemoryPermissionOpts extends OrgGroupTxBase {
+    memberAddress: string;
+    permissionsMask: number;
+}
+
+export interface RevokeOrgMemoryPermissionOpts extends OrgGroupTxBase {
+    memberAddress: string;
+    permissionsMask: number;
+}
+
+export interface DefineCustomOrgRoleOpts extends OrgGroupTxBase {
+    roleName: string;
+    mask: number;
+}
+
+export interface AssignOrgRoleOpts extends OrgGroupTxBase {
+    memberAddress: string;
+    roleName: string;
+}
+
+export interface RevokeOrgRoleOpts extends OrgGroupTxBase {
+    memberAddress: string;
+    roleName: string;
+}
+
+export interface AiCreditTxBase extends MemoryTxOpts {
+    aiCreditConfigId: string;
+    balanceId: string;
+}
+
+export interface ApproveAgentSpendOpts extends AiCreditTxBase {
+    agentObjectId: string;
+    maxAmountMist: number;
+    expiresAtMs: number;
+}
+
+export interface RevokeAgentSpendApprovalOpts extends AiCreditTxBase {
+    agentObjectId: string;
+}
+
+export interface ApproveAgentSpendAsApproverOpts extends AiCreditTxBase {
+    accountId: string;
+    organizationId: string;
+    orgMemoryGroupId: string;
+    agentObjectId: string;
+    maxAmountMist: number;
+    expiresAtMs: number;
+}
+
+export interface SetChildAgentBudgetOpts extends AiCreditTxBase {
+    accountId: string;
+    parentAgentObjectId: string;
+    childAgentObjectId: string;
+    budgetMist?: number | null;
+    dailyCapMist?: number | null;
+    monthlyCapMist?: number | null;
+    requireApprovalAboveMist?: number | null;
+}
+
+export interface ApproveChildAgentSpendOpts extends AiCreditTxBase {
+    accountId: string;
+    parentAgentObjectId: string;
+    childAgentObjectId: string;
+    maxAmountMist: number;
+    expiresAtMs: number;
+}
+
+/** Payload on workflow inbox items with `item_type: "approval_request"` (oracle ingest). */
+export interface WorkflowApprovalRequestPayload {
+    balance_id: string;
+    agent_object_id: string;
+    requested_amount_mist: number;
+    threshold_mist: number;
+    organization_id?: string | null;
+}
+
+/** Build `approveAgentSpend` opts from a workflow approval item + on-chain config ids. */
+export interface ApproveAgentSpendFromWorkflowOpts extends MemoryTxOpts {
+    aiCreditConfigId: string;
+    payload: WorkflowApprovalRequestPayload | Record<string, unknown>;
+    /** Defaults to `requested_amount_mist` from the payload. */
+    maxAmountMist?: number;
+    /** Defaults to now + 24h (ms). */
+    expiresAtMs?: number;
+}
+
+export function parseWorkflowApprovalPayload(
+    payload: unknown,
+): WorkflowApprovalRequestPayload {
+    if (!payload || typeof payload !== "object") {
+        throw new Error("workflow approval payload must be an object");
+    }
+    const p = payload as Record<string, unknown>;
+    const balanceId = p.balance_id;
+    const agentObjectId = p.agent_object_id;
+    const requested = p.requested_amount_mist;
+    const threshold = p.threshold_mist;
+    if (typeof balanceId !== "string" || balanceId.length === 0) {
+        throw new Error("workflow approval payload missing balance_id");
+    }
+    if (typeof agentObjectId !== "string" || agentObjectId.length === 0) {
+        throw new Error("workflow approval payload missing agent_object_id");
+    }
+    if (typeof requested !== "number" || !Number.isFinite(requested)) {
+        throw new Error("workflow approval payload missing requested_amount_mist");
+    }
+    if (typeof threshold !== "number" || !Number.isFinite(threshold)) {
+        throw new Error("workflow approval payload missing threshold_mist");
+    }
+    return {
+        balance_id: balanceId,
+        agent_object_id: agentObjectId,
+        requested_amount_mist: requested,
+        threshold_mist: threshold,
+        organization_id:
+            typeof p.organization_id === "string" ? p.organization_id : null,
+    };
+}
+
+export function buildApproveAgentSpendOptsFromWorkflow(
+    opts: ApproveAgentSpendFromWorkflowOpts,
+): ApproveAgentSpendOpts {
+    const payload = parseWorkflowApprovalPayload(opts.payload);
+    const expiresAtMs =
+        opts.expiresAtMs ?? Date.now() + 24 * 60 * 60 * 1000;
+    const maxAmountMist = opts.maxAmountMist ?? payload.requested_amount_mist;
+    return {
+        packageId: opts.packageId,
+        mysoPrivateKey: opts.mysoPrivateKey,
+        walletSigner: opts.walletSigner,
+        mysoClient: opts.mysoClient,
+        mysoNetwork: opts.mysoNetwork,
+        aiCreditConfigId: opts.aiCreditConfigId,
+        balanceId: payload.balance_id,
+        agentObjectId: payload.agent_object_id,
+        maxAmountMist,
+        expiresAtMs,
+    };
 }

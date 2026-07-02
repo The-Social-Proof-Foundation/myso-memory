@@ -18,6 +18,7 @@ import { entitlementsByUserType } from "@/lib/ai/entitlements";
 import { allowedModelIds } from "@/lib/ai/models";
 import { type RequestHints, systemPrompt } from "@/lib/ai/prompts";
 import { getLanguageModel, getMemoryModel } from "@/lib/ai/providers";
+import { recordChatInferenceUsage } from "@/lib/ai/record-inference-usage";
 import { createDocument } from "@/lib/ai/tools/create-document";
 import { getWeather } from "@/lib/ai/tools/get-weather";
 import { requestSuggestions } from "@/lib/ai/tools/request-suggestions";
@@ -104,6 +105,13 @@ export async function POST(request: Request) {
     let messagesFromDb: DBMessage[] = [];
     let titlePromise: Promise<string> | null = null;
 
+    const billingKey = memoryKey || process.env.MEMORY_KEY;
+    const billingAccountId = memoryAccountId || process.env.MEMORY_ACCOUNT_ID;
+    const billing =
+      billingKey && billingAccountId
+        ? { memoryKey: billingKey, memoryAccountId: billingAccountId }
+        : undefined;
+
     if (chat) {
       if (chat.userId !== session.user.id) {
         return new ChatbotError("forbidden:chat").toResponse();
@@ -118,7 +126,11 @@ export async function POST(request: Request) {
         title: "New chat",
         visibility: selectedVisibilityType,
       });
-      titlePromise = generateTitleFromUserMessage({ message });
+      titlePromise = generateTitleFromUserMessage({
+        message,
+        memoryKey: billingKey,
+        memoryAccountId: billingAccountId,
+      });
     }
 
     const uiMessages = isToolApprovalFlow
@@ -182,8 +194,8 @@ export async function POST(request: Request) {
             : undefined,
           tools: {
             getWeather,
-            createDocument: createDocument({ session, dataStream }),
-            updateDocument: updateDocument({ session, dataStream }),
+            createDocument: createDocument({ session, dataStream, billing }),
+            updateDocument: updateDocument({ session, dataStream, billing }),
             requestSuggestions: requestSuggestions({ session, dataStream }),
             saveMemory: saveMemory({ memoryKey, memoryAccountId }),
           },
@@ -196,6 +208,29 @@ export async function POST(request: Request) {
         dataStream.merge(
           result.toUIMessageStream({ sendReasoning: isReasoningModel, sendFinish: false })
         );
+
+        const key = billingKey;
+        const accountId = billingAccountId;
+        if (key && accountId) {
+          void result.usage
+            .then((usage) => {
+              if (!usage) {
+                return;
+              }
+              const promptTokens = usage.inputTokens?.total ?? 0;
+              const completionTokens = usage.outputTokens?.total ?? 0;
+              return recordChatInferenceUsage({
+                memoryKey: key,
+                memoryAccountId: accountId,
+                modelId: selectedChatModel,
+                promptTokens,
+                completionTokens,
+              });
+            })
+            .catch((error) => {
+              console.error("[AI Credit] usage metering failed:", error);
+            });
+        }
 
         if (titlePromise) {
           const title = await titlePromise;

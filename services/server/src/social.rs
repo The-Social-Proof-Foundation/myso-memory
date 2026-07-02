@@ -25,6 +25,9 @@ pub struct SocialSubAgent {
     pub deactivated_at_ms: Option<i64>,
     pub revoked_at_ms: Option<i64>,
     pub updated_at_ms: i64,
+    /// Agentic organization the agent belongs to.
+    #[serde(default)]
+    pub organization_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -167,6 +170,16 @@ mod tests {
         assert_eq!(row.account_id, "0xaccount");
         assert_eq!(row.capabilities, 3);
         assert!(row.active);
+        assert_eq!(row.identity_class, 1);
+        assert_eq!(row.role_tags, 0);
+        assert_eq!(row.delegatable_caps, 0);
+        assert_eq!(row.register_scope, 3);
+        assert_eq!(row.depth, 1);
+        assert_eq!(row.registered_by, "0xowner");
+        assert_eq!(row.created_at_ms, 1);
+        assert_eq!(row.updated_at_ms, 1);
+        assert!(row.deactivated_at_ms.is_none());
+        assert!(row.revoked_at_ms.is_none());
     }
 
     #[tokio::test]

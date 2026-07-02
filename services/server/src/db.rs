@@ -34,6 +34,7 @@ impl VectorDb {
             ("007", include_str!("../migrations/007_sub_agent_policy_cache.sql")),
             ("008", include_str!("../migrations/008_remember_jobs.sql")),
             ("009", include_str!("../migrations/009_importance.sql")),
+            ("010", include_str!("../migrations/010_visibility.sql")),
         ] {
             sqlx::raw_sql(sql)
                 .execute(&pool)
@@ -47,6 +48,8 @@ impl VectorDb {
     }
 
     /// Insert a vector entry scoped to agent_object_id (primary) with optional sub_label.
+    /// `visibility`: 0 = private, 1 = org (requires `organization_id`), 2 = account.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_vector(
         &self,
         id: &str,
@@ -57,14 +60,16 @@ impl VectorDb {
         vector: &[f32],
         blob_size_bytes: i64,
         importance: f32,
+        visibility: i16,
+        organization_id: Option<&str>,
     ) -> Result<(), AppError> {
         let embedding = Vector::from(vector.to_vec());
         let namespace = agent_object_id;
         let label = sub_label.unwrap_or("");
 
         sqlx::query(
-            "INSERT INTO vector_entries (id, owner, namespace, agent_object_id, sub_label, blob_id, embedding, blob_size_bytes, importance)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "INSERT INTO vector_entries (id, owner, namespace, agent_object_id, sub_label, blob_id, embedding, blob_size_bytes, importance, visibility, organization_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(id)
         .bind(owner)
@@ -75,23 +80,29 @@ impl VectorDb {
         .bind(embedding)
         .bind(blob_size_bytes)
         .bind(importance)
+        .bind(visibility)
+        .bind(organization_id)
         .execute(&self.pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to insert vector: {}", e)))?;
 
         tracing::debug!(
-            "inserted vector: id={}, blob_id={}, owner={}, agent={}, size={}B",
+            "inserted vector: id={}, blob_id={}, owner={}, agent={}, size={}B, visibility={}",
             id,
             blob_id,
             owner,
             agent_object_id,
-            blob_size_bytes
+            blob_size_bytes,
+            visibility
         );
         Ok(())
     }
 
-    /// Search for similar vectors scoped by owner + agent_object_id.
-    /// Fetches up to `candidate_limit` rows for optional re-ranking downstream.
+    /// Scope-aware similarity search. Always includes the agent's own rows; additionally
+    /// includes org-visible rows (when the caller holds `OrgMemoryReader`) and
+    /// account-visible rows (any authenticated reader — matches the on-chain decrypt
+    /// policy). Fetches up to `candidate_multiplier * limit` rows for downstream ranking.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_similar(
         &self,
         query_vector: &[f32],
@@ -100,52 +111,80 @@ impl VectorDb {
         sub_label: Option<&str>,
         limit: usize,
         candidate_multiplier: usize,
+        scope: &crate::types::SearchScope,
     ) -> Result<Vec<SearchHit>, AppError> {
         let embedding = Vector::from(query_vector.to_vec());
         let fetch_limit = (limit * candidate_multiplier.max(1)).min(300) as i64;
+        let label = sub_label.filter(|s| !s.is_empty()).unwrap_or("");
 
-        let rows: Vec<(String, f64, chrono::DateTime<chrono::Utc>, f32)> =
-            if let Some(label) = sub_label.filter(|s| !s.is_empty()) {
-                sqlx::query_as(
-                    "SELECT blob_id, (embedding <=> $1)::float8 AS distance, created_at, importance
+        let include_org = scope.include_org && scope.organization_id.is_some();
+        if !scope.include_own && !include_org && !scope.include_account {
+            return Ok(Vec::new());
+        }
+        let org_id = scope.organization_id.clone().unwrap_or_default();
+
+        // Fixed statement so every bind parameter is always referenced; boolean binds
+        // toggle each visibility branch (own / org-shared / account-shared).
+        let rows: Vec<(String, f64, chrono::DateTime<chrono::Utc>, f32, String, i16)> =
+            sqlx::query_as(
+                "SELECT blob_id, (embedding <=> $1)::float8 AS distance, created_at, importance, agent_object_id, visibility
                  FROM vector_entries
-                 WHERE owner = $2 AND agent_object_id = $3 AND sub_label = $4 AND tombstoned = FALSE
-                 ORDER BY embedding <=> $1
-                 LIMIT $5",
-                )
-                .bind(&embedding)
-                .bind(owner)
-                .bind(agent_object_id)
-                .bind(label)
-                .bind(fetch_limit)
-                .fetch_all(&self.pool)
-                .await
-            } else {
-                sqlx::query_as(
-                    "SELECT blob_id, (embedding <=> $1)::float8 AS distance, created_at, importance
-                 FROM vector_entries
-                 WHERE owner = $2 AND agent_object_id = $3 AND tombstoned = FALSE
+                 WHERE owner = $2 AND tombstoned = FALSE
+                   AND ($5 = '' OR sub_label = $5)
+                   AND (
+                        ($7 AND agent_object_id = $3)
+                     OR ($8 AND visibility = 1 AND organization_id = $6)
+                     OR ($9 AND visibility = 2)
+                   )
                  ORDER BY embedding <=> $1
                  LIMIT $4",
-                )
-                .bind(&embedding)
-                .bind(owner)
-                .bind(agent_object_id)
-                .bind(fetch_limit)
-                .fetch_all(&self.pool)
-                .await
-            }
+            )
+            .bind(&embedding)
+            .bind(owner)
+            .bind(agent_object_id)
+            .bind(fetch_limit)
+            .bind(label)
+            .bind(&org_id)
+            .bind(scope.include_own)
+            .bind(include_org)
+            .bind(scope.include_account)
+            .fetch_all(&self.pool)
+            .await
             .map_err(|e| AppError::Internal(format!("Failed to search vectors: {}", e)))?;
 
         Ok(rows
             .into_iter()
-            .map(|(blob_id, distance, created_at, importance)| SearchHit {
-                blob_id,
-                distance,
-                created_at: Some(created_at),
-                importance,
-            })
+            .map(
+                |(blob_id, distance, created_at, importance, source_agent, visibility)| SearchHit {
+                    blob_id,
+                    distance,
+                    created_at: Some(created_at),
+                    importance,
+                    source_agent_object_id: Some(source_agent),
+                    visibility,
+                },
+            )
             .collect())
+    }
+
+    /// Per-agent memory usage aggregates for the social-server stats push.
+    pub async fn memory_usage_summary(
+        &self,
+    ) -> Result<Vec<(String, Option<String>, i64, i64, i64)>, AppError> {
+        let rows: Vec<(String, Option<String>, i64, i64, i64)> = sqlx::query_as(
+            "SELECT agent_object_id,
+                    MAX(organization_id) AS organization_id,
+                    COUNT(*)::BIGINT AS entries,
+                    COALESCE(SUM(blob_size_bytes)::BIGINT, 0) AS bytes,
+                    COUNT(*) FILTER (WHERE visibility = 1)::BIGINT AS org_shared_entries
+             FROM vector_entries
+             WHERE tombstoned = FALSE AND agent_object_id IS NOT NULL
+             GROUP BY agent_object_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to aggregate memory usage: {}", e)))?;
+        Ok(rows)
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -350,6 +389,16 @@ impl VectorDb {
         .fetch_all(&self.pool)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to list cached sub-agents: {}", e)))?;
+        Ok(rows)
+    }
+
+    pub async fn list_cached_memory_accounts(&self) -> Result<Vec<(String, String)>, AppError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT account_id, owner FROM sub_agent_cache WHERE owner IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to list cached memory accounts: {}", e)))?;
         Ok(rows)
     }
 

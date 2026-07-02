@@ -158,7 +158,8 @@ async function main(): Promise<void> {
                 mods.CAP_MEMORY_WRITE |
                 mods.CAP_POST_PUBLISH |
                 mods.CAP_COMMENT |
-                mods.CAP_REACT,
+                mods.CAP_REACT |
+                mods.CAP_AI_SPEND,
             mysoPrivateKey,
             mysoClient,
         });
@@ -253,6 +254,49 @@ async function main(): Promise<void> {
         }
     } else {
         console.log("[test] skipping social (set SOCIAL_WALKTHROUGH=1 with server bootstrap env)");
+    }
+
+    if (process.env.AI_CREDIT_WALKTHROUGH === "1") {
+        const owner = activeAddress();
+        console.log("[test] ai-credit balance (social-server)...");
+        const beforeResp = await fetch(`${SOCIAL_URL}/profiles/${owner}/ai-credit`);
+        if (!beforeResp.ok) {
+            console.log(
+                "[test] skipping ai-credit analyze — no balance row yet. " +
+                    "Create via ai_credit::create_balance_for_memory_account + deposit on localnet.",
+            );
+        } else {
+            const before = (await beforeResp.json()) as { credits: number; balance: { balance_id: string } };
+            console.log(`  credits before=${before.credits} balance_id=${before.balance.balance_id}`);
+
+            if (before.credits <= 0) {
+                console.log("[test] skipping analyze — deposit MYSO credits first (ai_credit::deposit)");
+            } else {
+                console.log("[test] analyze (requires OPENAI_API_KEY + AI_CREDIT_ENABLED=1 on memory-server)...");
+                const analyzed = await memory.analyze(
+                    `Walkthrough analyze fact: prefers teal (${Date.now()})`,
+                );
+                console.log(`  analyze stored ${analyzed.total} facts`);
+
+                const historyResp = await fetch(
+                    `${SOCIAL_URL}/ai-credit/${before.balance.balance_id}/usage-history?limit=5`,
+                );
+                if (historyResp.ok) {
+                    const lines = await historyResp.json();
+                    console.log(`  usage history lines=${Array.isArray(lines) ? lines.length : 0}`);
+                }
+
+                const afterResp = await fetch(`${SOCIAL_URL}/profiles/${owner}/ai-credit`);
+                if (afterResp.ok) {
+                    const after = (await afterResp.json()) as { credits: number };
+                    console.log(`  credits after=${after.credits} (settlement may lag on-chain)`);
+                }
+            }
+        }
+    } else {
+        console.log(
+            "[test] skipping ai-credit walkthrough (set AI_CREDIT_WALKTHROUGH=1 with oracle + credits deposited)",
+        );
     }
 
     console.log("\n✅ Localnet walkthrough passed");

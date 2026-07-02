@@ -9,12 +9,30 @@ pub const CAP_MESSAGE_READ: u64 = 32;
 pub const CAP_MESSAGE_SEND: u64 = 64;
 pub const CAP_COMMENT: u64 = 512;
 pub const CAP_REACT: u64 = 1024;
+pub const CAP_AI_SPEND: u64 = 16384;
 
 pub const CLASS_HUMAN: u8 = 0;
 pub const CLASS_DELEGATED_AI: u8 = 1;
 pub const CLASS_ORGANIZATION: u8 = 2;
 
 pub const MAX_AGENT_DEPTH: u8 = 8;
+pub const MAX_ORGANIZATIONS_PER_USER: u8 = 8;
+
+pub const ORG_TYPE_COMPANY: u8 = 0;
+pub const ORG_TYPE_STARTUP: u8 = 1;
+pub const ORG_TYPE_INVESTMENT_FUND: u8 = 2;
+pub const ORG_TYPE_NONPROFIT: u8 = 3;
+pub const ORG_TYPE_RESEARCH: u8 = 4;
+pub const ORG_TYPE_GOVERNMENT: u8 = 5;
+pub const ORG_TYPE_MEDIA: u8 = 6;
+pub const ORG_TYPE_STEWARDSHIP: u8 = 7;
+pub const ORG_TYPE_BRAND: u8 = 8;
+pub const ORG_TYPE_COMMUNITY: u8 = 9;
+pub const ORG_TYPE_SPORTS: u8 = 10;
+pub const ORG_TYPE_EDUCATION: u8 = 11;
+pub const ORG_TYPE_HEALTHCARE: u8 = 12;
+pub const ORG_TYPE_OTHER: u8 = 13;
+pub const ORG_TYPE_COUNT: u8 = 14;
 
 pub const E_ACCOUNT_DEACTIVATED: u64 = 6;
 pub const E_SUB_AGENT_NOT_ACTIVE: u64 = 15;
@@ -83,6 +101,44 @@ pub fn addresses_equal(a: &str, b: &str) -> bool {
         .eq_ignore_ascii_case(b.trim_start_matches("0x"))
 }
 
+/// Human-readable capability bit label (mirrors memory.move cap constants).
+pub fn capability_label(cap: u64) -> &'static str {
+    match cap {
+        CAP_MEMORY_READ => "memory_read",
+        CAP_MEMORY_WRITE => "memory_write",
+        CAP_MYDATA_READ => "mydata_read",
+        CAP_POST_PUBLISH => "post_publish",
+        CAP_MESSAGE_READ => "message_read",
+        CAP_MESSAGE_SEND => "message_send",
+        CAP_COMMENT => "comment",
+        CAP_REACT => "react",
+        CAP_AI_SPEND => "ai_spend",
+        _ => "unknown",
+    }
+}
+
+/// Human-readable organization type label (mirrors memory.move org type enum).
+pub fn org_type_label(org_type: u8) -> &'static str {
+    match org_type {
+        ORG_TYPE_COMPANY => "company",
+        ORG_TYPE_STARTUP => "startup",
+        ORG_TYPE_INVESTMENT_FUND => "investment_fund",
+        ORG_TYPE_NONPROFIT => "nonprofit",
+        ORG_TYPE_RESEARCH => "research",
+        ORG_TYPE_GOVERNMENT => "government",
+        ORG_TYPE_MEDIA => "media",
+        ORG_TYPE_STEWARDSHIP => "stewardship",
+        ORG_TYPE_BRAND => "brand",
+        ORG_TYPE_COMMUNITY => "community",
+        ORG_TYPE_SPORTS => "sports",
+        ORG_TYPE_EDUCATION => "education",
+        ORG_TYPE_HEALTHCARE => "healthcare",
+        ORG_TYPE_OTHER => "other",
+        _ if org_type >= ORG_TYPE_COUNT => "reserved",
+        _ => "unknown",
+    }
+}
+
 /// Pad a short `0x` object id to 32 bytes (64 hex chars) for MYDATA / SDK consumers.
 pub fn normalize_object_id(id: &str) -> String {
     let hex = id.trim_start_matches("0x");
@@ -134,9 +190,28 @@ mod tests {
     }
 
     #[test]
+    fn cap_ai_spend_matches_move() {
+        assert_eq!(CAP_AI_SPEND, 16384);
+        assert!(has_cap(CAP_AI_SPEND, CAP_AI_SPEND));
+        assert!(!has_cap(CAP_MEMORY_WRITE, CAP_AI_SPEND));
+    }
+
+    #[test]
     fn spend_limit_mirror_matches_move_semantics() {
         assert!(check_spend_limit(None, 100).is_ok());
         assert!(check_spend_limit(Some(100), 50).is_ok());
         assert_eq!(check_spend_limit(Some(10), 50), Err(E_SUB_AGENT_SPEND_EXCEEDED));
+    }
+
+    #[test]
+    fn capability_and_org_type_labels_cover_constants() {
+        assert_eq!(capability_label(CAP_MYDATA_READ), "mydata_read");
+        assert_eq!(capability_label(CAP_MESSAGE_READ), "message_read");
+        assert_eq!(capability_label(CAP_MESSAGE_SEND), "message_send");
+        assert_eq!(org_type_label(ORG_TYPE_COMPANY), "company");
+        assert_eq!(org_type_label(ORG_TYPE_HEALTHCARE), "healthcare");
+        assert_eq!(MAX_ORGANIZATIONS_PER_USER, 8);
+        assert_eq!(E_ACCOUNT_DEACTIVATED, 6);
+        assert_eq!(CLASS_ORGANIZATION, 2);
     }
 }

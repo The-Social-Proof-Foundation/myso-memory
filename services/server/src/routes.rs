@@ -12,21 +12,36 @@ use crate::file_storage;
 use crate::jobs;
 use crate::mydata;
 use crate::observability;
-use crate::ranker::{CompositeRanker, ScoringWeights};
+use crate::ranker::CompositeRanker;
 use crate::rate_limit;
 use crate::types::*;
 use crate::vault::ensure_agent_vault;
 
 const MAX_ANALYZE_FACTS: usize = 20;
 const ANALYZE_CONCURRENCY: usize = 5;
-const ANALYZE_MAX_OUTPUT_TOKENS: u32 = 256;
+pub(crate) const ANALYZE_MAX_OUTPUT_TOKENS: u32 = 256;
 const MAX_SPONSORED_SIGNATURE_BYTES: usize = 2048;
 
 pub(crate) const MAX_REMEMBER_TEXT_BYTES: usize = 64 * 1024;
 
+pub(crate) fn resolve_llm_model(config: &Config, model_id: Option<&str>) -> String {
+    model_id
+        .filter(|m| !m.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| config.default_llm_model.clone())
+}
+
 /// Truncate a string to at most `max_bytes` bytes without splitting a UTF-8
 /// character.  Falls back to the nearest char boundary when `max_bytes` lands
 /// inside a multi-byte sequence (e.g. emoji).
+fn memory_provenance_prefix(visibility: Option<i16>) -> &'static str {
+    match visibility {
+        Some(crate::types::VISIBILITY_ORG) => "[org memory] ",
+        Some(crate::types::VISIBILITY_ACCOUNT) => "[account memory] ",
+        _ => "",
+    }
+}
+
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -149,6 +164,11 @@ pub async fn remember(
     let sub_label = parse_sub_label(&body.namespace);
     let label_str = sub_label.clone().unwrap_or_default();
 
+    // Fail closed before accepting the job: org visibility requires an OrgMemoryWriter
+    // grant, account visibility requires owner co-sign.
+    let (visibility, org_id) =
+        crate::org_perms::authorize_write_visibility(&state, &auth, &body.visibility).await?;
+
     let job_id = jobs::create_remember_job(
         &state,
         owner,
@@ -157,13 +177,15 @@ pub async fn remember(
     )
     .await?;
 
-    let _span = observability::remember_job_span(&job_id, agent_object_id);
+    let _span = observability::remember_job_span(&job_id, agent_object_id, &auth.label);
     jobs::spawn_remember_job(
         state.clone(),
         job_id.clone(),
         body.text,
         auth.clone(),
         sub_label,
+        visibility,
+        org_id,
     );
 
     tracing::info!(
@@ -194,10 +216,22 @@ pub async fn remember_status(
 
     Ok(Json(RememberJobStatusResponse {
         job_id: row.job_id,
-        status: row.status,
-        blob_id: row.blob_id,
+        status: row.status.clone(),
+        blob_id: row.blob_id.clone(),
         error: row.error_msg,
-        agent_object_id: row.agent_object_id,
+        agent_object_id: row.agent_object_id.clone(),
+        result: if row.status == "done" {
+            row.blob_id.as_ref().map(|blob_id| RememberResponse {
+                id: blob_id.clone(),
+                blob_id: blob_id.clone(),
+                owner: auth.owner.clone(),
+                agent_object_id: row.agent_object_id,
+                sub_label: None,
+                namespace: auth.agent_object_id.clone(),
+            })
+        } else {
+            None
+        },
     }))
 }
 
@@ -222,6 +256,9 @@ pub async fn remember_bulk(
     let sub_label = parse_sub_label(&body.namespace);
     let label_str = sub_label.clone().unwrap_or_default();
 
+    let (visibility, org_id) =
+        crate::org_perms::authorize_write_visibility(&state, &auth, &body.visibility).await?;
+
     let job_ids = jobs::create_bulk_remember_jobs(
         &state,
         owner,
@@ -237,6 +274,8 @@ pub async fn remember_bulk(
         body.texts,
         auth,
         sub_label,
+        visibility,
+        org_id,
     );
 
     Ok((
@@ -323,6 +362,10 @@ pub async fn recall(
         .unwrap_or_default();
     let _rank_span = observability::recall_rank_span(limit);
 
+    let requested_scope = crate::types::parse_scope(&body.scope)?;
+    let (search_scope, degraded_scope) =
+        crate::org_perms::resolve_search_scope(&state, &auth, requested_scope).await;
+
     let hits = state
         .db
         .search_similar(
@@ -332,8 +375,24 @@ pub async fn recall(
             sub_label.as_deref(),
             limit,
             3,
+            &search_scope,
         )
         .await?;
+
+    if state.config.audit_org_recalls_enabled && search_scope.include_org {
+        crate::audit_push::spawn_audit_push(
+            &state,
+            vec![crate::audit_push::AuditEntry::relayer_agent_action(
+                "memory_org_recall",
+                &auth.derived_address,
+                "organization",
+                search_scope.organization_id.as_deref().unwrap_or_default(),
+                search_scope.organization_id.clone(),
+                Some(auth.account_id.clone()),
+                serde_json::json!({ "agent_object_id": agent_object_id, "limit": limit }),
+            )],
+        );
+    }
 
     let ranked = CompositeRanker::rank(hits, &weights, chrono::Utc::now());
     let hits_to_fetch: Vec<_> = ranked.into_iter().take(limit).collect();
@@ -350,6 +409,10 @@ pub async fn recall(
             let blob_id = hit.blob_id.clone();
             let distance = hit.distance;
             let score = hit.score;
+            let hit_visibility = hit.visibility;
+            let hit_source_agent = hit.source_agent_object_id.clone();
+            let hit_importance = hit.importance;
+            let hit_created_at = hit.created_at;
             let credential = credential.clone();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
@@ -357,6 +420,12 @@ pub async fn recall(
             let platform_id = auth.platform_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
+                tracing::debug!(
+                    blob_id = %blob_id,
+                    importance = hit_importance,
+                    created_at = ?hit_created_at,
+                    "recall decrypt candidate"
+                );
                 let encrypted_data = match file_storage::download_blob(
                     &http_client,
                     &aggregator_url,
@@ -394,6 +463,8 @@ pub async fn recall(
                             text,
                             distance,
                             score,
+                            visibility: Some(hit_visibility),
+                            source_agent_id: hit_source_agent,
                         }),
                         Err(e) => {
                             tracing::warn!("Invalid UTF-8 in decrypted data: {}", e);
@@ -441,10 +512,26 @@ pub async fn recall(
     }
     tracing::info!("recall complete: {} results for owner={}", total, owner);
 
+    if degraded_scope {
+        crate::audit_push::spawn_audit_push(
+            &state,
+            vec![crate::audit_push::AuditEntry::relayer_agent_action(
+                "memory_org_recall_degraded",
+                &auth.derived_address,
+                "organization",
+                search_scope.organization_id.as_deref().unwrap_or(""),
+                search_scope.organization_id.clone(),
+                Some(auth.account_id.clone()),
+                serde_json::json!({ "agent_object_id": agent_object_id, "requested_scope": body.scope }),
+            )],
+        );
+    }
+
     Ok(Json(RecallResponse {
         results,
         total,
         dropped_count,
+        degraded_scope,
     }))
 }
 
@@ -480,6 +567,9 @@ pub async fn remember_manual(
         sub_label
     );
 
+    let (visibility, org_id) =
+        crate::org_perms::authorize_write_visibility(&state, &auth, &body.visibility).await?;
+
     let (blob_id, blob_size) = if let Some(ref existing_blob_id) = body.blob_id {
         if existing_blob_id.is_empty() {
             return Err(AppError::BadRequest("blob_id cannot be empty".into()));
@@ -510,6 +600,8 @@ pub async fn remember_manual(
             agent_object_id,
             &state.config.package_id,
             Some(&auth.agent_object_id),
+            visibility,
+            org_id.as_deref(),
         )
         .await?;
 
@@ -528,8 +620,25 @@ pub async fn remember_manual(
             &body.vector,
             blob_size,
             0.5,
+            visibility,
+            org_id.as_deref(),
         )
         .await?;
+
+    if visibility == crate::types::VISIBILITY_ORG {
+        crate::audit_push::spawn_audit_push(
+            &state,
+            vec![crate::audit_push::AuditEntry::relayer_agent_action(
+                "memory_org_write",
+                &auth.derived_address,
+                "memory_entry",
+                &blob_id,
+                org_id.clone(),
+                Some(auth.account_id.clone()),
+                serde_json::json!({ "agent_object_id": agent_object_id, "bytes": blob_size }),
+            )],
+        );
+    }
 
     tracing::info!(
         "remember_manual complete: id={}, blob_id={}, agent={}",
@@ -575,6 +684,10 @@ pub async fn recall_manual(
     );
 
     let limit = body.limit.min(100);
+    let requested_scope = crate::types::parse_scope(&body.scope)?;
+    let (search_scope, _degraded_scope) =
+        crate::org_perms::resolve_search_scope(&state, &auth, requested_scope).await;
+
     let hits = state
         .db
         .search_similar(
@@ -584,6 +697,7 @@ pub async fn recall_manual(
             sub_label.as_deref(),
             limit,
             1,
+            &search_scope,
         )
         .await?;
     let total = hits.len();
@@ -629,8 +743,24 @@ pub async fn analyze(
 
     ensure_agent_vault(&state, &auth).await?;
 
+    let (write_visibility, write_org_id) =
+        crate::org_perms::authorize_write_visibility(&state, &auth, &body.visibility).await?;
+
+    crate::ai_spend::preflight_analyze(&state, &auth, &body.text, MAX_ANALYZE_FACTS).await?;
+
+    let llm_model = resolve_llm_model(&state.config, body.model_id.as_deref());
+
     // Step 1: Extract facts using LLM
-    let extracted = extract_facts_llm(&state.http_client, &state.config, &body.text).await?;
+    let extracted =
+        extract_facts_llm(&state.http_client, &state.config, &body.text, &llm_model).await?;
+    crate::ai_spend::record_inference_usage(
+        &state,
+        &auth,
+        &llm_model,
+        extracted.prompt_tokens,
+        extracted.completion_tokens,
+    )
+    .await?;
     let raw_fact_count = extracted.raw_count;
     let facts = extracted.facts;
     let reserved_additional_weight = rate_limit::analyze_additional_weight(facts.len());
@@ -665,11 +795,18 @@ pub async fn analyze(
     let total_text_bytes: i64 = facts.iter().map(|f| f.len() as i64).sum();
     rate_limit::check_storage_quota(&state, owner, total_text_bytes).await?;
 
+    let embed_token_estimate: u64 = facts
+        .iter()
+        .map(|f| estimate_tokens_from_chars(f.len()))
+        .sum();
+
     // Step 2: Process all facts concurrently (embed + encrypt → upload → store)
     // Each fact gets its own key from the pool so sidecar can upload them in parallel
     // (different signer addresses bypass the per-signer serialization lock).
     let auth_agent_id = auth.agent_object_id.clone();
     let sub_label_for_tasks = sub_label.clone();
+    let write_visibility_for_tasks = write_visibility;
+    let write_org_id_for_tasks = write_org_id.clone();
     let tasks: Vec<_> = facts.iter().map(|fact_text| {
         let state = Arc::clone(&state);
         let owner = owner.clone();
@@ -677,6 +814,8 @@ pub async fn analyze(
         let agent_id = auth_agent_id.clone();
         let agent_object_id = auth_agent_id.clone();
         let sub_label = sub_label_for_tasks.clone();
+        let visibility = write_visibility_for_tasks;
+        let organization_id = write_org_id_for_tasks.clone();
         // Pick the next key in round-robin order at task construction time.
         // Convert to owned String *before* async move so we don't borrow-then-move `state`.
         let key_index: Result<usize, AppError> = state.key_pool.next_index()
@@ -704,6 +843,8 @@ pub async fn analyze(
                 &agent_object_id,
                 &state.config.package_id,
                 Some(&agent_id),
+                visibility,
+                organization_id.as_deref(),
             ).await?;
 
             let blob_size = encrypted.len() as i64;
@@ -717,6 +858,8 @@ pub async fn analyze(
                 &vector,
                 blob_size,
                 0.5,
+                visibility,
+                organization_id.as_deref(),
             ).await?;
 
             Ok::<AnalyzedFact, AppError>(AnalyzedFact {
@@ -741,6 +884,16 @@ pub async fn analyze(
         total,
         owner
     );
+
+    if embed_token_estimate > 0 {
+        crate::ai_spend::record_embedding_usage(
+            &state,
+            &auth,
+            crate::ai_spend::DEFAULT_EMBED_MODEL,
+            embed_token_estimate,
+        )
+        .await?;
+    }
 
     Ok(Json(AnalyzeResponse {
         facts: stored_facts,
@@ -772,6 +925,13 @@ struct ChatMessage {
 #[derive(serde::Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -787,6 +947,8 @@ struct ChatMessageResp {
 struct ExtractedFacts {
     facts: Vec<String>,
     raw_count: usize,
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 const FACT_EXTRACTION_PROMPT: &str = r#"You are a fact extraction system. Given a text or conversation, extract distinct factual statements about the user that are worth remembering for future interactions.
@@ -816,6 +978,7 @@ async fn extract_facts_llm(
     client: &reqwest::Client,
     config: &Config,
     text: &str,
+    model_id: &str,
 ) -> Result<ExtractedFacts, AppError> {
     let api_key = config
         .openai_api_key
@@ -829,7 +992,7 @@ async fn extract_facts_llm(
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&ChatCompletionRequest {
-            model: "openai/gpt-4o-mini".to_string(),
+            model: model_id.to_string(),
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
@@ -861,13 +1024,28 @@ async fn extract_facts_llm(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse LLM response: {}", e)))?;
 
+    let usage = api_resp.usage.unwrap_or(ChatUsage {
+        prompt_tokens: estimate_tokens_from_chars(text.len()),
+        completion_tokens: ANALYZE_MAX_OUTPUT_TOKENS as u64,
+    });
+
     let content = api_resp
         .choices
         .first()
         .map(|c| c.message.content.trim().to_string())
         .unwrap_or_default();
 
-    Ok(parse_extracted_facts(&content))
+    let parsed = parse_extracted_facts(&content);
+    Ok(ExtractedFacts {
+        facts: parsed.facts,
+        raw_count: parsed.raw_count,
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+    })
+}
+
+fn estimate_tokens_from_chars(byte_len: usize) -> u64 {
+    ((byte_len as u64 + 3) / 4).max(1)
 }
 
 fn parse_extracted_facts(content: &str) -> ExtractedFacts {
@@ -875,6 +1053,8 @@ fn parse_extracted_facts(content: &str) -> ExtractedFacts {
         return ExtractedFacts {
             facts: vec![],
             raw_count: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
         };
     }
 
@@ -887,7 +1067,12 @@ fn parse_extracted_facts(content: &str) -> ExtractedFacts {
     let raw_count = facts.len();
     facts.truncate(MAX_ANALYZE_FACTS);
 
-    ExtractedFacts { facts, raw_count }
+    ExtractedFacts {
+        facts,
+        raw_count,
+        prompt_tokens: 0,
+        completion_tokens: 0,
+    }
 }
 
 async fn collect_bounded_results<F, T, E>(tasks: Vec<F>, concurrency: usize) -> Vec<Result<T, E>>
@@ -1073,6 +1258,7 @@ mod tests {
             results: vec![],
             total: 0,
             dropped_count: 3,
+            degraded_scope: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["dropped_count"], 3);
@@ -1084,6 +1270,7 @@ mod tests {
             results: vec![],
             total: 0,
             dropped_count: 0,
+            degraded_scope: false,
         };
         let json = serde_json::to_value(&resp).unwrap();
         // skip_serializing_if = "is_zero_usize" → field absent
@@ -1100,6 +1287,8 @@ mod tests {
             text: "User likes coffee".into(),
             distance: 0.1,
             score: None,
+            visibility: Some(0),
+            source_agent_id: Some("0xagent".into()),
         }];
 
         let lines: Vec<String> = memories
@@ -1262,8 +1451,23 @@ pub async fn ask(
         sub_label
     );
 
+    crate::ai_spend::preflight_ask(&state, &auth, &body.question).await?;
+
+    let llm_model = resolve_llm_model(&state.config, body.model_id.as_deref());
+
+    let requested_scope = crate::types::parse_scope(&body.scope)?;
+    let (search_scope, degraded_scope) =
+        crate::org_perms::resolve_search_scope(&state, &auth, requested_scope).await;
+
     let query_vector =
         generate_embedding(&state.http_client, &state.config, &body.question).await?;
+    crate::ai_spend::record_embedding_usage(
+        &state,
+        &auth,
+        crate::ai_spend::DEFAULT_EMBED_MODEL,
+        estimate_tokens_from_chars(body.question.len()),
+    )
+    .await?;
     let hits = state
         .db
         .search_similar(
@@ -1273,8 +1477,38 @@ pub async fn ask(
             sub_label.as_deref(),
             limit,
             3,
+            &search_scope,
         )
         .await?;
+
+    if state.config.audit_org_recalls_enabled && search_scope.include_org {
+        crate::audit_push::spawn_audit_push(
+            &state,
+            vec![crate::audit_push::AuditEntry::relayer_agent_action(
+                "memory_org_recall",
+                &auth.derived_address,
+                "organization",
+                search_scope.organization_id.as_deref().unwrap_or_default(),
+                search_scope.organization_id.clone(),
+                Some(auth.account_id.clone()),
+                serde_json::json!({ "agent_object_id": agent_object_id, "limit": limit, "route": "ask" }),
+            )],
+        );
+    }
+    if degraded_scope {
+        crate::audit_push::spawn_audit_push(
+            &state,
+            vec![crate::audit_push::AuditEntry::relayer_agent_action(
+                "memory_org_recall_degraded",
+                &auth.derived_address,
+                "organization",
+                search_scope.organization_id.as_deref().unwrap_or(""),
+                search_scope.organization_id.clone(),
+                Some(auth.account_id.clone()),
+                serde_json::json!({ "agent_object_id": agent_object_id, "requested_scope": body.scope, "route": "ask" }),
+            )],
+        );
+    }
 
     let weights = body
         .scoring_weights
@@ -1307,6 +1541,10 @@ pub async fn ask(
             let blob_id = hit.blob_id.clone();
             let distance = hit.distance;
             let score = hit.score;
+            let hit_visibility = hit.visibility;
+            let hit_source_agent = hit.source_agent_object_id.clone();
+            let hit_importance = hit.importance;
+            let hit_created_at = hit.created_at;
             let credential = credential.clone();
             let package_id = state.config.package_id.clone();
             let account_id = auth.account_id.clone();
@@ -1314,6 +1552,12 @@ pub async fn ask(
             let platform_id = auth.platform_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
+                tracing::debug!(
+                    blob_id = %blob_id,
+                    importance = hit_importance,
+                    created_at = ?hit_created_at,
+                    "recall decrypt candidate"
+                );
                 let encrypted_data = match file_storage::download_blob(
                     &http_client,
                     &aggregator_url,
@@ -1350,6 +1594,8 @@ pub async fn ask(
                             text,
                             distance,
                             score,
+                            visibility: Some(hit_visibility),
+                            source_agent_id: hit_source_agent,
                         }),
                         Err(e) => {
                             tracing::warn!("Invalid UTF-8: {}", e);
@@ -1387,9 +1633,10 @@ pub async fn ask(
             .iter()
             .map(|m| {
                 format!(
-                    "<memory id=\"{}\" relevance=\"{:.2}\">{}</memory>",
+                    "<memory id=\"{}\" relevance=\"{:.2}\">{}{}</memory>",
                     m.blob_id,
                     1.0 - m.distance,
+                    memory_provenance_prefix(m.visibility),
                     m.text
                 )
             })
@@ -1421,7 +1668,7 @@ pub async fn ask(
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&ChatCompletionRequest {
-            model: "openai/gpt-4o-mini".to_string(),
+            model: llm_model.clone(),
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
@@ -1453,11 +1700,25 @@ pub async fn ask(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to parse LLM response: {}", e)))?;
 
+    let usage = api_resp.usage.unwrap_or(ChatUsage {
+        prompt_tokens: estimate_tokens_from_chars(body.question.len()) + 1500,
+        completion_tokens: 512,
+    });
+
     let answer = api_resp
         .choices
         .first()
         .map(|c| c.message.content.trim().to_string())
         .unwrap_or_else(|| "No response from LLM".to_string());
+
+    crate::ai_spend::record_inference_usage(
+        &state,
+        &auth,
+        &llm_model,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+    )
+    .await?;
 
     tracing::info!("ask complete: answer length={} chars", answer.len());
 
@@ -1466,6 +1727,28 @@ pub async fn ask(
         memories_used,
         memories,
     }))
+}
+
+/// POST /api/ai-credit/record-inference
+///
+/// Record LLM token usage after inference completed outside memory-server (e.g. chatbot streamText).
+pub async fn record_inference_usage_route(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(body): Json<RecordInferenceUsageRequest>,
+) -> Result<Json<RecordInferenceUsageResponse>, AppError> {
+    if body.model_id.trim().is_empty() {
+        return Err(AppError::BadRequest("model_id cannot be empty".into()));
+    }
+    crate::ai_spend::record_inference_usage(
+        &state,
+        &auth,
+        body.model_id.trim(),
+        body.tokens_in,
+        body.tokens_out,
+    )
+    .await?;
+    Ok(Json(RecordInferenceUsageResponse { ok: true }))
 }
 
 // ============================================================
@@ -1566,6 +1849,17 @@ pub async fn restore(
         .iter()
         .filter(|b| !b.package_id.is_empty())
         .map(|b| (b.blob_id.clone(), b.package_id.clone()))
+        .collect();
+
+    // Visibility metadata for restore — legacy blobs default to private.
+    let blob_visibility: std::collections::HashMap<String, (i16, Option<String>)> = on_chain_blobs
+        .iter()
+        .map(|b| {
+            let visibility = b
+                .memory_visibility
+                .unwrap_or(crate::types::VISIBILITY_PRIVATE);
+            (b.blob_id.clone(), (visibility, b.memory_org_id.clone()))
+        })
         .collect();
 
     if total == 0 {
@@ -1769,6 +2063,10 @@ pub async fn restore(
             );
             0
         });
+        let (visibility, organization_id) = blob_visibility
+            .get(blob_id)
+            .cloned()
+            .unwrap_or((crate::types::VISIBILITY_PRIVATE, None));
         state
             .db
             .insert_vector(
@@ -1780,9 +2078,24 @@ pub async fn restore(
                 vector,
                 blob_size,
                 0.5,
+                visibility,
+                organization_id.as_deref(),
             )
             .await?;
     }
+
+    crate::audit_push::spawn_audit_push(
+        &state,
+        vec![crate::audit_push::AuditEntry::relayer_agent_action(
+            "memory_restore",
+            &auth.derived_address,
+            "agent",
+            agent_object_id,
+            auth.organization_id.clone(),
+            Some(auth.account_id.clone()),
+            serde_json::json!({ "restored": restored, "skipped": skipped, "total": total }),
+        )],
+    );
 
     tracing::info!(
         "restore complete: restored={} skipped={} total={} owner={} agent={}",

@@ -10,16 +10,21 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::memory_contract::{
-    self, CAP_COMMENT, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_POST_PUBLISH, CAP_REACT,
+    self, capability_label, CAP_COMMENT, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MYDATA_READ,
+    CAP_POST_PUBLISH, CAP_REACT, E_SUB_AGENT_APPROVAL_REQUIRED, check_direct_execution_allowed,
+    check_spend_limit,
 };
 use crate::myso::{derived_address_from_public_key, verify_sub_agent_onchain};
 use crate::policy::{PolicyError, RequestPolicyInput, validate_agent_policy};
 use crate::social::{
-    fetch_ancestor_chain, fetch_sub_agent_by_derived_address, SocialApiError, SocialSubAgent,
+    fetch_ancestor_chain, fetch_sub_agent_by_derived_address, fetch_sub_agent_by_object_id,
+    SocialApiError, SocialSubAgent,
 };
 use crate::types::{AppState, AuthInfo};
 
 /// Estimated gas for a sponsored File Storage upload (MIST). Conservative ceiling for max_action_spend checks.
+pub const ESTIMATED_FILE_STORAGE_UPLOAD_MIST: u64 = 5_000_000;
+
 async fn constant_time_reject() -> StatusCode {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     StatusCode::UNAUTHORIZED
@@ -228,8 +233,49 @@ pub async fn verify_signature(
     {
         Ok(info) => info,
         Err(ResolveError::Policy(e)) => return Err(policy_reject(e)),
-        Err(ResolveError::Other(_)) => return Err(constant_time_reject().await),
+        Err(ResolveError::Other(msg)) => {
+            tracing::debug!("auth resolve failed: {msg}");
+            return Err(constant_time_reject().await);
+        }
     };
+
+    if is_write {
+        if let Err(code) = check_direct_execution_allowed(
+            resolved.agent.approval_required_caps as u64,
+            required_cap,
+            resolved.owner_co_signed,
+        ) {
+            if code == E_SUB_AGENT_APPROVAL_REQUIRED {
+                return Err(policy_reject(PolicyError::ApprovalRequired {
+                    required: required_cap,
+                }));
+            }
+        }
+        if let Err(code) = check_spend_limit(
+            resolved.agent.max_action_spend.map(|v| v as u64),
+            ESTIMATED_FILE_STORAGE_UPLOAD_MIST,
+        ) {
+            tracing::warn!(
+                "max_action_spend exceeded for agent {} (code={})",
+                resolved.agent.agent_object_id,
+                code
+            );
+            return Err(policy_reject(PolicyError::SpendLimitExceeded {
+                limit_mist: resolved.agent.max_action_spend.map(|v| v as u64),
+            }));
+        }
+    }
+
+    if !memory_contract::has_cap(resolved.agent.capabilities as u64, CAP_MYDATA_READ) {
+        tracing::warn!(
+            "agent {} missing {}",
+            resolved.agent.agent_object_id,
+            capability_label(CAP_MYDATA_READ)
+        );
+        return Err(policy_reject(PolicyError::MissingCapability {
+            required: CAP_MYDATA_READ,
+        }));
+    }
 
     parts.extensions.insert(AuthInfo {
         public_key: public_key_hex,
@@ -241,6 +287,7 @@ pub async fn verify_signature(
         approval_required_caps: resolved.agent.approval_required_caps as u64,
         max_action_spend: resolved.agent.max_action_spend.map(|v| v as u64),
         platform_scope: resolved.agent.platform_scope.clone(),
+        organization_id: resolved.agent.organization_id.clone(),
         platform_id: policy_input.platform_id.clone(),
         label: resolved.agent.label.clone(),
         sub_agent_key: sub_agent_key_hex,
@@ -328,32 +375,49 @@ async fn resolve_sub_agent(
     let mut agent: Option<SocialSubAgent> = None;
     let mut owner = String::new();
 
-    if let Ok(Some(_cached)) = state.db.get_cached_sub_agent(public_key_hex).await {
-        if let Ok(indexed) = fetch_sub_agent_by_derived_address(
+    if let Ok(Some(cached)) = state.db.get_cached_sub_agent(public_key_hex).await {
+        match verify_sub_agent_onchain(
             &state.http_client,
-            &state.config.social_server_url,
-            &derived_address,
+            &state.config.myso_rpc_url,
+            &cached.account_id,
+            &cached.agent_object_id,
+            pk_bytes,
+            required_cap,
         )
         .await
         {
-            match verify_sub_agent_onchain(
-                &state.http_client,
-                &state.config.myso_rpc_url,
-                &indexed.account_id,
-                &indexed.agent_object_id,
-                pk_bytes,
-                required_cap,
-            )
-            .await
-            {
-                Ok(verified) => {
-                    owner = verified.owner;
-                    agent = Some(indexed);
+            Ok(verified) => {
+                match fetch_sub_agent_by_object_id(
+                    &state.http_client,
+                    &state.config.social_server_url,
+                    &cached.agent_object_id,
+                )
+                .await
+                {
+                    Ok(indexed)
+                        if indexed.account_id == cached.account_id
+                            && indexed.agent_object_id == cached.agent_object_id
+                            && indexed.derived_address == verified.derived_address
+                            && indexed.capabilities as u64 == verified.capabilities =>
+                    {
+                        owner = verified.owner;
+                        agent = Some(indexed);
+                    }
+                    Ok(_) => {
+                        let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "cached sub-agent {} stale: {}",
+                            cached.agent_object_id,
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
-                    return Err(ResolveError::Other(e.to_string()));
-                }
+            }
+            Err(e) => {
+                let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
+                return Err(ResolveError::Other(e.to_string()));
             }
         }
     }
@@ -384,6 +448,15 @@ async fn resolve_sub_agent(
                 )
                 .await
                 .map_err(|e| ResolveError::Other(e.to_string()))?;
+                if verified.account_id != indexed.account_id
+                    || verified.agent_object_id != indexed.agent_object_id
+                    || verified.derived_address != indexed.derived_address
+                    || verified.capabilities != indexed.capabilities as u64
+                {
+                    return Err(ResolveError::Other(
+                        "social index and on-chain sub-agent state diverged".into(),
+                    ));
+                }
                 owner = verified.owner;
                 agent = Some(indexed);
             }
@@ -471,6 +544,7 @@ mod tests {
             approval_required_caps: 0,
             max_action_spend: None,
             platform_scope: None,
+            organization_id: None,
             platform_id: None,
             label: "test".into(),
             sub_agent_key: None,
@@ -479,5 +553,9 @@ mod tests {
             owner_delegate_key: None,
         };
         assert_eq!(auth.agent_object_id, "0xagent");
+        assert_eq!(auth.label, "test");
+        assert_eq!(auth.approval_required_caps, 0);
+        assert!(auth.max_action_spend.is_none());
+        assert!(auth.organization_id.is_none());
     }
 }

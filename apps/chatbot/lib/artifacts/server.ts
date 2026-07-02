@@ -16,11 +16,17 @@ export type SaveDocumentProps = {
   userId: string;
 };
 
+export type BillingContext = {
+  memoryKey: string;
+  memoryAccountId: string;
+};
+
 export type CreateDocumentCallbackProps = {
   id: string;
   title: string;
   dataStream: UIMessageStreamWriter<ChatMessage>;
   session: Session;
+  billing?: BillingContext;
 };
 
 export type UpdateDocumentCallbackProps = {
@@ -28,6 +34,7 @@ export type UpdateDocumentCallbackProps = {
   description: string;
   dataStream: UIMessageStreamWriter<ChatMessage>;
   session: Session;
+  billing?: BillingContext;
 };
 
 export type DocumentHandler<T = ArtifactKind> = {
@@ -49,6 +56,7 @@ export function createDocumentHandler<T extends ArtifactKind>(config: {
         title: args.title,
         dataStream: args.dataStream,
         session: args.session,
+        billing: args.billing,
       });
 
       if (args.session?.user?.id) {
@@ -69,6 +77,7 @@ export function createDocumentHandler<T extends ArtifactKind>(config: {
         description: args.description,
         dataStream: args.dataStream,
         session: args.session,
+        billing: args.billing,
       });
 
       if (args.session?.user?.id) {

@@ -103,6 +103,22 @@ pub struct Config {
     pub allowed_origins: String,
     /// Bootstrap shared objects for social_contracts::post PTBs
     pub social_chain: SocialChainConfig,
+    /// AI credit oracle base URL (preflight + usage metering)
+    pub ai_credit_oracle_url: String,
+    /// When true, AI routes require sufficient on-chain AI credits
+    pub ai_credit_enabled: bool,
+    /// Default LLM model id for analyze/ask when client omits model_id.
+    pub default_llm_model: String,
+    /// Push per-agent memory usage aggregates to social-server when true.
+    pub memory_usage_sync_enabled: bool,
+    /// Interval for the usage-stats push task (seconds).
+    pub memory_usage_sync_interval_secs: u64,
+    /// Shared secret for `POST /internal/memory/usage-stats` on social-server.
+    pub memory_usage_sync_secret: Option<String>,
+    /// Shared secret for `POST /internal/audit/logs` on social-server.
+    pub audit_sync_secret: Option<String>,
+    /// Audit org-scope recalls (data-plane reads; admin actions are always audited).
+    pub audit_org_recalls_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -196,14 +212,95 @@ impl Config {
             social_server_url: std::env::var("SOCIAL_SERVER_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:9126".to_string()),
             sidecar_url: std::env::var("SIDECAR_URL")
-                .unwrap_or_else(|_| "http://localhost:9001".to_string()),
+                .unwrap_or_else(|_| "http://localhost:9009".to_string()),
             sidecar_secret: std::env::var("SIDECAR_AUTH_TOKEN").ok(),
             rate_limit: RateLimitConfig::from_env(),
             sponsor_rate_limit: SponsorRateLimitConfig::from_env(),
             allowed_origins: std::env::var("ALLOWED_ORIGINS")
                 .unwrap_or_default(),
             social_chain: SocialChainConfig::from_env(),
+            ai_credit_oracle_url: std::env::var("AI_CREDIT_ORACLE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8095".to_string()),
+            ai_credit_enabled: std::env::var("AI_CREDIT_ENABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            default_llm_model: std::env::var("DEFAULT_LLM_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-4o-mini".to_string()),
+            memory_usage_sync_enabled: std::env::var("MEMORY_USAGE_SYNC_ENABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            memory_usage_sync_interval_secs: std::env::var("MEMORY_USAGE_SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+            memory_usage_sync_secret: std::env::var("MEMORY_USAGE_SYNC_SECRET").ok(),
+            audit_sync_secret: std::env::var("AUDIT_SYNC_SECRET").ok(),
+            audit_org_recalls_enabled: std::env::var("AUDIT_ORG_RECALLS_ENABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
+    }
+}
+
+// ============================================================
+// Memory visibility + recall scope
+// ============================================================
+
+pub const VISIBILITY_PRIVATE: i16 = 0;
+pub const VISIBILITY_ORG: i16 = 1;
+pub const VISIBILITY_ACCOUNT: i16 = 2;
+
+/// Parse a write-path visibility string (default private).
+pub fn parse_visibility(raw: &Option<String>) -> Result<i16, AppError> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") | Some("private") => Ok(VISIBILITY_PRIVATE),
+        Some("org") => Ok(VISIBILITY_ORG),
+        Some("account") => Ok(VISIBILITY_ACCOUNT),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "invalid visibility '{}': expected private | org | account",
+            other
+        ))),
+    }
+}
+
+/// Resolved read-scope flags passed to the vector search.
+#[derive(Debug, Clone, Default)]
+pub struct SearchScope {
+    pub include_own: bool,
+    pub include_org: bool,
+    pub include_account: bool,
+    pub organization_id: Option<String>,
+}
+
+impl SearchScope {
+    pub fn private_only() -> Self {
+        Self {
+            include_own: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// Requested recall scope (`scope` field): which visibility tiers to search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedScope {
+    /// Everything the agent may see (default).
+    All,
+    Private,
+    Org,
+    Account,
+}
+
+pub fn parse_scope(raw: &Option<String>) -> Result<RequestedScope, AppError> {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") | Some("all") => Ok(RequestedScope::All),
+        Some("private") => Ok(RequestedScope::Private),
+        Some("org") => Ok(RequestedScope::Org),
+        Some("account") => Ok(RequestedScope::Account),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "invalid scope '{}': expected all | private | org | account",
+            other
+        ))),
     }
 }
 
@@ -258,6 +355,10 @@ pub struct RememberRequest {
     /// Deprecated: use `sub_label`. Optional tag within the authenticated agent vault.
     #[serde(default, alias = "sub_label")]
     pub namespace: String,
+    /// Write visibility: `private` (default) | `org` (requires OrgMemoryWriter) |
+    /// `account` (requires owner co-sign).
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,6 +389,9 @@ pub struct RecallRequest {
     pub namespace: String,
     #[serde(default)]
     pub scoring_weights: Option<crate::ranker::ScoringWeights>,
+    /// Read scope: `all` (default) | `private` | `org` | `account`.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -298,10 +402,18 @@ pub struct RecallResponse {
     /// failed and were silently omitted from `results`. Zero on the happy path.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub dropped_count: usize,
+    /// True when org-scope permissions could not be resolved (social-server outage)
+    /// and results were degraded to private + account tiers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub degraded_scope: bool,
 }
 
 fn is_zero_usize(n: &usize) -> bool {
     *n == 0
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Serialize)]
@@ -311,6 +423,12 @@ pub struct RecallResult {
     pub distance: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// Visibility tier of the source row (0 private, 1 org, 2 account).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<i16>,
+    /// Agent that wrote the memory (provenance for shared tiers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,6 +437,10 @@ pub struct SearchHit {
     pub distance: f64,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub importance: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_agent_object_id: Option<String>,
+    #[serde(default)]
+    pub visibility: i16,
 }
 
 /// POST /api/remember — async job accepted (202)
@@ -338,6 +460,9 @@ pub struct RememberJobStatusResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub agent_object_id: String,
+    /// Populated when `status == "done"` — canonical remember result payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<RememberResponse>,
 }
 
 /// POST /api/remember/bulk
@@ -346,6 +471,8 @@ pub struct RememberBulkRequest {
     pub texts: Vec<String>,
     #[serde(default, alias = "sub_label")]
     pub namespace: String,
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -386,6 +513,10 @@ pub struct AnalyzeRequest {
     pub text: String,
     #[serde(default, alias = "sub_label")]
     pub namespace: String,
+    /// LLM model id for billing (must match oracle pricing catalog).
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,6 +547,8 @@ pub struct RememberManualRequest {
     pub vector: Vec<f32>,
     #[serde(default, alias = "sub_label")]
     pub namespace: String,
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -439,6 +572,8 @@ pub struct RecallManualRequest {
     pub limit: usize,
     #[serde(default, alias = "sub_label")]
     pub namespace: String,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -447,7 +582,19 @@ pub struct RecallManualResponse {
     pub total: usize,
 }
 
-/// POST /api/ask
+/// POST /api/ai-credit/record-inference — record LLM usage after external inference (e.g. chatbot).
+#[derive(Debug, Deserialize)]
+pub struct RecordInferenceUsageRequest {
+    pub model_id: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordInferenceUsageResponse {
+    pub ok: bool,
+}
+
 /// Recall memories + LLM chat — full AI-with-memory demo
 #[derive(Debug, Deserialize)]
 pub struct AskRequest {
@@ -459,6 +606,10 @@ pub struct AskRequest {
     pub namespace: String,
     #[serde(default)]
     pub scoring_weights: Option<crate::ranker::ScoringWeights>,
+    /// LLM model id for billing (must match oracle pricing catalog).
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -565,6 +716,8 @@ pub struct AuthInfo {
     pub approval_required_caps: u64,
     pub max_action_spend: Option<u64>,
     pub platform_scope: Option<String>,
+    /// Agentic organization this sub-agent belongs to (from the social index).
+    pub organization_id: Option<String>,
     /// `x-platform-id` header from the client request (when present).
     pub platform_id: Option<String>,
     pub label: String,
@@ -597,6 +750,10 @@ impl std::fmt::Debug for AuthInfo {
             .field("agent_object_id", &self.agent_object_id)
             .field("derived_address", &self.derived_address)
             .field("capabilities", &self.capabilities)
+            .field("approval_required_caps", &self.approval_required_caps)
+            .field("max_action_spend", &self.max_action_spend)
+            .field("organization_id", &self.organization_id)
+            .field("label", &self.label)
             .field(
                 "sub_agent_key",
                 &self.sub_agent_key.as_ref().map(|_| "<redacted>"),
@@ -628,6 +785,14 @@ pub enum AppError {
     QuotaExceeded(String),
     /// Policy / capability rejection (HTTP 403)
     Forbidden(String),
+    /// AI credit balance depleted (HTTP 402)
+    AiCreditDepleted(String),
+    /// Spend exceeds the agent's approval threshold — the owner (or an org spend
+    /// approver) must grant an on-chain allowance first (HTTP 402).
+    AiCreditApprovalRequired {
+        threshold_mist: Option<u64>,
+        estimated_mist: Option<u64>,
+    },
 }
 
 impl std::fmt::Display for AppError {
@@ -640,6 +805,12 @@ impl std::fmt::Display for AppError {
             AppError::RateLimited(msg) => write!(f, "Rate Limited: {}", msg),
             AppError::QuotaExceeded(msg) => write!(f, "Quota Exceeded: {}", msg),
             AppError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
+            AppError::AiCreditDepleted(msg) => write!(f, "AI credits depleted: {}", msg),
+            AppError::AiCreditApprovalRequired { threshold_mist, .. } => write!(
+                f,
+                "AI spend approval required (threshold: {} MIST)",
+                threshold_mist.map(|t| t.to_string()).unwrap_or_else(|| "?".into())
+            ),
         }
     }
 }
@@ -668,9 +839,28 @@ impl axum::response::IntoResponse for AppError {
             AppError::RateLimited(msg) => (axum::http::StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::QuotaExceeded(msg) => (axum::http::StatusCode::PAYMENT_REQUIRED, msg.clone()),
             AppError::Forbidden(msg) => (axum::http::StatusCode::FORBIDDEN, msg.clone()),
+            AppError::AiCreditDepleted(msg) => (axum::http::StatusCode::PAYMENT_REQUIRED, msg.clone()),
+            AppError::AiCreditApprovalRequired { .. } => {
+                (axum::http::StatusCode::PAYMENT_REQUIRED, self.to_string())
+            }
         };
 
-        let body = serde_json::json!({ "error": message });
+        let body = match &self {
+            AppError::AiCreditDepleted(_) => serde_json::json!({
+                "error": message,
+                "code": "insufficient_ai_credits",
+            }),
+            AppError::AiCreditApprovalRequired {
+                threshold_mist,
+                estimated_mist,
+            } => serde_json::json!({
+                "error": message,
+                "code": "ai_credit_approval_required",
+                "threshold_mist": threshold_mist,
+                "estimated_mist": estimated_mist,
+            }),
+            _ => serde_json::json!({ "error": message }),
+        };
         (status, axum::Json(body)).into_response()
     }
 }
@@ -704,6 +894,7 @@ mod tests {
             approval_required_caps: 0,
             max_action_spend: None,
             platform_scope: None,
+            organization_id: None,
             platform_id: None,
             label: "test".to_string(),
             sub_agent_key: None,
@@ -870,5 +1061,34 @@ mod tests {
         assert!(AppError::BlobNotFound("x".into()).to_string().contains("Blob Not Found"));
         assert!(AppError::RateLimited("x".into()).to_string().contains("Rate Limited"));
         assert!(AppError::QuotaExceeded("x".into()).to_string().contains("Quota Exceeded"));
+    }
+
+    #[tokio::test]
+    async fn app_error_approval_required_status_and_code() {
+        let err = AppError::AiCreditApprovalRequired {
+            threshold_mist: Some(100_000_000),
+            estimated_mist: Some(500_000_000),
+        };
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["code"], "ai_credit_approval_required");
+        assert_eq!(body["threshold_mist"], 100_000_000);
+    }
+
+    #[test]
+    fn parse_visibility_and_scope_accept_expected_values() {
+        assert_eq!(parse_visibility(&None).unwrap(), VISIBILITY_PRIVATE);
+        assert_eq!(parse_visibility(&Some("org".into())).unwrap(), VISIBILITY_ORG);
+        assert_eq!(
+            parse_visibility(&Some("account".into())).unwrap(),
+            VISIBILITY_ACCOUNT
+        );
+        assert!(parse_visibility(&Some("global".into())).is_err());
+
+        assert_eq!(parse_scope(&None).unwrap(), RequestedScope::All);
+        assert_eq!(parse_scope(&Some("org".into())).unwrap(), RequestedScope::Org);
+        assert!(parse_scope(&Some("everything".into())).is_err());
     }
 }

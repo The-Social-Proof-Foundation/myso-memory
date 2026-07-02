@@ -1139,7 +1139,7 @@ app.post("/sponsor/execute", async (req, res) => {
 // Start server
 // ============================================================
 
-const PORT = parseInt(process.env.SIDECAR_PORT || "9001", 10);
+const PORT = parseInt(process.env.SIDECAR_PORT || "9009", 10);
 const HOST = process.env.SIDECAR_HOST || "127.0.0.1";
 app.listen(PORT, HOST, () => {
     console.log(JSON.stringify({

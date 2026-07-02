@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::myso::fetch_memory_account_owner;
 use crate::social::{fetch_sub_agent_by_derived_address, SocialApiError};
 use crate::types::AppState;
 
@@ -34,6 +35,41 @@ pub async fn run_lifecycle_sync(state: Arc<AppState>) {
             }
             Err(e) => {
                 tracing::warn!("lifecycle: lookup failed for {}: {}", derived, e);
+            }
+        }
+    }
+
+    let accounts = match state.db.list_cached_memory_accounts().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("lifecycle sync: failed to list cached accounts: {}", e);
+            return;
+        }
+    };
+
+    for (account_id, owner) in accounts {
+        match fetch_memory_account_owner(
+            &state.http_client,
+            &state.config.myso_rpc_url,
+            &account_id,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(crate::myso::OnchainVerifyError::MemoryAccountDeactivated(_)) => {
+                tracing::info!(
+                    "lifecycle: tombstoning owner {} (account {} deactivated)",
+                    owner,
+                    account_id
+                );
+                let _ = state.db.tombstone_owner(&owner).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "lifecycle: account {} owner check failed: {}",
+                    account_id,
+                    e
+                );
             }
         }
     }

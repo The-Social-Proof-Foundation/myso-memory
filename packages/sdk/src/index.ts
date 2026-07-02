@@ -12,7 +12,7 @@
  */
 
 // Core client (server-mode: server handles MYDATA + File Storage + embedding)
-export { Memory } from "./memory.js";
+export { Memory, AiCreditApprovalRequiredError } from "./memory.js";
 
 // Delegate key utilities (no @socialproof/myso dependency)
 export { delegateKeyToMySoAddress, delegateKeyToPublicKey } from "./utils.js";
@@ -23,6 +23,26 @@ export {
     MemoryCompatibilityError,
     MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
 } from "./compatibility.js";
+
+export {
+    MAX_ORGANIZATIONS_PER_USER,
+    ORG_TYPE_COMPANY,
+    ORG_TYPE_STARTUP,
+    ORG_TYPE_INVESTMENT_FUND,
+    ORG_TYPE_NONPROFIT,
+    ORG_TYPE_RESEARCH,
+    ORG_TYPE_GOVERNMENT,
+    ORG_TYPE_MEDIA,
+    ORG_TYPE_STEWARDSHIP,
+    ORG_TYPE_BRAND,
+    ORG_TYPE_COMMUNITY,
+    ORG_TYPE_SPORTS,
+    ORG_TYPE_EDUCATION,
+    ORG_TYPE_HEALTHCARE,
+    ORG_TYPE_OTHER,
+    ORG_TYPE_COUNT,
+    OrganizationType,
+} from "./contract.js";
 
 export type {
     MemoryConfig,
@@ -35,6 +55,9 @@ export type {
     RecallResult,
     RecallMemory,
     RecallOptions,
+    RememberOptions,
+    MemoryVisibility,
+    RecallScope,
     ScoringWeights,
     RelayerVersionMetadata,
     EmbedResult,

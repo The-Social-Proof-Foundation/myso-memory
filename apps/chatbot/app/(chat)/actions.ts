@@ -3,7 +3,9 @@
 import { generateText, type UIMessage } from "ai";
 import { cookies } from "next/headers";
 import type { VisibilityType } from "@/components/visibility-selector";
+import { TITLE_MODEL_ID } from "@/lib/ai/catalog";
 import { titlePrompt } from "@/lib/ai/prompts";
+import { recordChatInferenceUsage } from "@/lib/ai/record-inference-usage";
 import { getTitleModel } from "@/lib/ai/providers";
 import {
   deleteMessagesByChatIdAfterTimestamp,
@@ -28,15 +30,32 @@ export async function saveChatModelAsCookie(model: string) {
 
 export async function generateTitleFromUserMessage({
   message,
+  memoryKey,
+  memoryAccountId,
 }: {
   message: UIMessage;
+  memoryKey?: string;
+  memoryAccountId?: string;
 }) {
-  const { text } = await generateText({
+  const result = await generateText({
     model: getTitleModel(),
     system: titlePrompt,
     prompt: getTextFromMessage(message),
   });
-  return text
+
+  const key = memoryKey || process.env.MEMORY_KEY;
+  const accountId = memoryAccountId || process.env.MEMORY_ACCOUNT_ID;
+  if (key && accountId && result.usage) {
+    await recordChatInferenceUsage({
+      memoryKey: key,
+      memoryAccountId: accountId,
+      modelId: TITLE_MODEL_ID,
+      promptTokens: result.usage.inputTokens?.total ?? 0,
+      completionTokens: result.usage.outputTokens?.total ?? 0,
+    });
+  }
+
+  return result.text
     .replace(/^[#*"\s]+/, "")
     .replace(/["]+$/, "")
     .trim();
