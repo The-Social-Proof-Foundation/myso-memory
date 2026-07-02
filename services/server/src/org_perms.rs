@@ -122,6 +122,18 @@ pub async fn authorize_write_visibility(
             // Fail closed: an unresolved grant must never allow an org-visible write.
             let perms = resolve_org_memory_perms(state, auth).await?.unwrap_or_default();
             if !perms.writer {
+                // Best-effort: notify the org admin via workflow inbox so they can
+                // grant `OrgMemoryWriter`. Producer failures never block the 403.
+                let requested_mask = ORG_PERM_MEMORY_WRITE;
+                if let Err(err) = crate::access_request_client::spawn_memory_access_request(
+                    state,
+                    auth,
+                    requested_mask,
+                )
+                .await
+                {
+                    tracing::warn!(error = %err, "memory access request producer failed");
+                }
                 return Err(AppError::Forbidden(
                     "org visibility requires OrgMemoryWriter on the org's memory share group"
                         .into(),

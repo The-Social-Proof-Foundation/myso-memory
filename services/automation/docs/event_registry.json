@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "description": "Canonical automation event registry. New families are additive — no engine code changes.",
+  "families": {
+    "ai_credit": {
+      "version": 1,
+      "types": ["funded", "spent", "low_balance"]
+    },
+    "workflow": {
+      "version": 1,
+      "types": ["item.created", "item.actioned", "item.expired"]
+    },
+    "approval": {
+      "version": 1,
+      "types": ["requested", "completed", "revoked"]
+    },
+    "post": {
+      "version": 1,
+      "types": ["created", "deleted"]
+    },
+    "comment": {
+      "version": 1,
+      "types": ["created"]
+    },
+    "reaction": {
+      "version": 1,
+      "types": ["created", "removed"]
+    },
+    "follow": {
+      "version": 1,
+      "types": ["created", "removed"]
+    },
+    "message": {
+      "version": 1,
+      "types": ["received", "sent"]
+    },
+    "group": {
+      "version": 1,
+      "types": ["discovered", "hidden"]
+    },
+    "organization": {
+      "version": 1,
+      "types": ["role_assigned", "role_revoked"]
+    },
+    "memory": {
+      "version": 1,
+      "types": ["created", "updated", "deleted", "shared"]
+    },
+    "governance": {
+      "version": 1,
+      "types": ["proposal_created", "vote_cast", "executed"]
+    },
+    "audit": {
+      "version": 1,
+      "types": ["action"]
+    },
+    "budget": {
+      "version": 1,
+      "types": ["threshold_crossed"]
+    },
+    "oracle": {
+      "version": 1,
+      "types": ["usage_recorded"]
+    },
+    "automation": {
+      "version": 1,
+      "types": ["tick", "condition_met"]
+    }
+  }
+}

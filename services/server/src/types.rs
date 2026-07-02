@@ -19,6 +19,8 @@ pub struct AppState {
     pub redis: redis::aio::MultiplexedConnection,
     /// In-memory token bucket fallback for when Redis is unavailable
     pub fallback_rate_limit: tokio::sync::Mutex<crate::rate_limit::InMemoryFallback>,
+    /// Canonical org metadata cache (fetched from social-server; never derived).
+    pub org_summaries: crate::org_summary::OrgSummaryCache,
 }
 
 // ============================================================
@@ -119,6 +121,12 @@ pub struct Config {
     pub audit_sync_secret: Option<String>,
     /// Audit org-scope recalls (data-plane reads; admin actions are always audited).
     pub audit_org_recalls_enabled: bool,
+    /// Shared secret for internal social-server endpoints (`/internal/*`),
+    /// including the org summary lookup used by MYDATA org decrypt.
+    pub internal_sync_secret: Option<String>,
+    /// Memory access request producer (`POST /internal/memory/access-requests`).
+    pub memory_access_sync_enabled: bool,
+    pub memory_access_sync_secret: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +246,11 @@ impl Config {
             audit_org_recalls_enabled: std::env::var("AUDIT_ORG_RECALLS_ENABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            internal_sync_secret: std::env::var("INTERNAL_SYNC_SECRET").ok(),
+            memory_access_sync_enabled: std::env::var("MEMORY_ACCESS_SYNC_ENABLED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            memory_access_sync_secret: std::env::var("MEMORY_ACCESS_SYNC_SECRET").ok(),
         }
     }
 }

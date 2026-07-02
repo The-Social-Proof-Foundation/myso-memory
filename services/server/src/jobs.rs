@@ -58,6 +58,8 @@ pub async fn execute_remember_text(
         text.as_bytes(),
         owner,
         &state.config.package_id,
+        visibility,
+        organization_id,
     );
     let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
     let vector = vector_result?;

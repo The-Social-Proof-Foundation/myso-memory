@@ -46,6 +46,7 @@ import type {
     EnsureAgentMemoryVaultOpts,
     EnsureAgentMemoryVaultResult,
     ApproveKeyPolicyOpts,
+    ApproveOrgKeyPolicyOpts,
     EnsureOrgMemoryGroupOpts,
     GrantOrgMemoryPermissionOpts,
     RevokeOrgMemoryPermissionOpts,
@@ -58,10 +59,13 @@ import type {
     SetChildAgentBudgetOpts,
     ApproveChildAgentSpendOpts,
     ApproveAgentSpendFromWorkflowOpts,
+    GrantOrgMemoryPermissionFromWorkflowOpts,
 } from "./types.js";
 import {
     buildApproveAgentSpendOptsFromWorkflow,
+    buildGrantOrgMemoryPermissionOptsFromWorkflow,
     parseWorkflowApprovalPayload,
+    parseWorkflowMemoryAccessPayload,
 } from "./types.js";
 import { bytesToHex, hexToBytes } from "./utils.js";
 import {
@@ -757,6 +761,59 @@ export async function approveKeyWritePolicy(
     return { digest, txBytes: new Uint8Array(txBytes) };
 }
 
+/**
+ * Build (only) an `approve_org_key_policy` PTB for MYDATA key release on
+ * org-visible blobs. Same shape as {@link buildApproveKeyPolicyTxBytes} but
+ * includes the org + memory group refs required by `memory::approve_org_key_policy`.
+ *
+ * `orgMemoryGroupId` MUST come from social-server's org summary endpoint;
+ * clients must never re-derive the group address locally.
+ */
+export async function buildApproveOrgKeyPolicyTxBytes(
+    opts: ApproveOrgKeyPolicyOpts,
+): Promise<Uint8Array> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::approve_org_key_policy`,
+        arguments: [
+            tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.accountId),
+            tx.object(opts.organizationId),
+            tx.object(opts.orgMemoryGroupId),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+    return tx.build({ client: ctx.mysoClient, onlyTransactionKind: true });
+}
+
+/**
+ * Sign + execute an `approve_org_key_policy` PTB. Direct clients that decrypt
+ * org-visible blobs outside the memory relayer sidecar can use this to obtain
+ * the transaction digest + built bytes.
+ */
+export async function approveOrgKeyPolicy(
+    opts: ApproveOrgKeyPolicyOpts,
+): Promise<{ digest: string; txBytes: Uint8Array }> {
+    const ctx = await buildTxContext(opts);
+    const { Transaction } = ctx;
+    const tx = new Transaction();
+    tx.moveCall({
+        target: `${opts.packageId}::memory::approve_org_key_policy`,
+        arguments: [
+            tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.accountId),
+            tx.object(opts.organizationId),
+            tx.object(opts.orgMemoryGroupId),
+            tx.object(MYSO_CLOCK),
+        ],
+    });
+    const txBytes = await tx.build({ client: ctx.mysoClient, onlyTransactionKind: true });
+    const { digest } = await signAndExecute(ctx, tx);
+    return { digest, txBytes: new Uint8Array(txBytes) };
+}
+
 // ============================================================
 // Org memory sharing + roles
 // ============================================================
@@ -1179,11 +1236,50 @@ export async function approveChildAgentSpend(
     return { digest };
 }
 
-/** Owner approval PTB built from a workflow inbox `approval_request` payload. */
+/**
+ * Sign + execute a workflow approval item.
+ *
+ * When the workflow payload carries an `organization_id` AND the caller
+ * supplies `orgContext` (obtained from social-server's org summary endpoint),
+ * this routes through `ai_credit::approve_agent_spend_as_approver` so the
+ * caller may be an `OrgSpendApprover` role holder rather than the account
+ * owner. Otherwise the owner PTB (`ai_credit::approve_agent_spend`) runs.
+ */
 export async function approveAgentSpendFromWorkflowItem(
     opts: ApproveAgentSpendFromWorkflowOpts,
-): Promise<{ digest: string; txBytes: Uint8Array }> {
+): Promise<{ digest: string; txBytes?: Uint8Array }> {
+    const payload = parseWorkflowApprovalPayload(opts.payload);
+    if (payload.organization_id && opts.orgContext) {
+        const approverOpts: ApproveAgentSpendAsApproverOpts = {
+            packageId: opts.packageId,
+            mysoPrivateKey: opts.mysoPrivateKey,
+            walletSigner: opts.walletSigner,
+            mysoClient: opts.mysoClient,
+            mysoNetwork: opts.mysoNetwork,
+            aiCreditConfigId: opts.aiCreditConfigId,
+            balanceId: payload.balance_id,
+            accountId: opts.orgContext.accountId,
+            organizationId: payload.organization_id,
+            orgMemoryGroupId: opts.orgContext.orgMemoryGroupId,
+            agentObjectId: payload.agent_object_id,
+            maxAmountMist: opts.maxAmountMist ?? payload.requested_amount_mist,
+            expiresAtMs: opts.expiresAtMs ?? Date.now() + 24 * 60 * 60 * 1000,
+        };
+        return approveAgentSpendAsApprover(approverOpts);
+    }
     return approveAgentSpend(buildApproveAgentSpendOptsFromWorkflow(opts));
 }
 
-export { parseWorkflowApprovalPayload, buildApproveAgentSpendOptsFromWorkflow };
+/** Org admin PTB built from a workflow inbox `memory_access_request` payload. */
+export async function grantOrgMemoryPermissionFromWorkflowItem(
+    opts: GrantOrgMemoryPermissionFromWorkflowOpts,
+): Promise<{ digest: string }> {
+    return grantOrgMemoryPermission(buildGrantOrgMemoryPermissionOptsFromWorkflow(opts));
+}
+
+export {
+    parseWorkflowApprovalPayload,
+    buildApproveAgentSpendOptsFromWorkflow,
+    parseWorkflowMemoryAccessPayload,
+    buildGrantOrgMemoryPermissionOptsFromWorkflow,
+};

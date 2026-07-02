@@ -90,8 +90,13 @@ fn feature_flags() -> BTreeMap<String, bool> {
         ("subAgent.v1PolicyHardening".to_string(), true),
         ("runtime.versionEndpoint".to_string(), true),
         ("memory.visibility.v1".to_string(), true),
+        ("memory.orgEncryption.v1".to_string(), true),
+        ("memory.orgAccessRequests.v1".to_string(), true),
         ("aiCredit.approvals.v1".to_string(), true),
+        ("aiCredit.approverPath.v1".to_string(), true),
         ("org.roles.v1".to_string(), true),
+        ("org.invitations.v1".to_string(), true),
+        ("workflow.inbox.v1".to_string(), true),
     ])
 }
 
@@ -195,6 +200,23 @@ mod tests {
             response.feature_flags.get("runtime.versionEndpoint"),
             Some(&true)
         );
+        // Enterprise v1 flags — invariant: never advertise support the built
+        // binaries don't provide (see plan Wave 3.4).
+        for flag in [
+            "memory.orgEncryption.v1",
+            "memory.orgAccessRequests.v1",
+            "aiCredit.approvals.v1",
+            "aiCredit.approverPath.v1",
+            "org.roles.v1",
+            "org.invitations.v1",
+            "workflow.inbox.v1",
+        ] {
+            assert_eq!(
+                response.feature_flags.get(flag),
+                Some(&true),
+                "expected v1 feature flag `{flag}` to be advertised"
+            );
+        }
         assert!(response
             .deprecations
             .iter()

@@ -431,6 +431,79 @@ async function resolveSessionKey(
 }
 
 // ============================================================
+// Org-scoped key policy routing (FX3 / enterprise v1)
+// ============================================================
+
+const MYSO_ADDRESS_RE = /^0x[0-9a-fA-F]{1,64}$/;
+
+function normalizeMySoAddress(addr: string): string {
+    return addr.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
+}
+
+interface OrgDecryptContext {
+    organizationId: string;
+    orgMemoryGroupId: string;
+}
+
+/**
+ * Decide whether a decrypt request targets an org-identity blob.
+ *
+ * Org-visible blobs encrypt under the organization object id (`mydataOwner ===
+ * organizationId`); key release is gated on-chain by `approve_org_key_policy`
+ * (OrgMemoryReader on the org's share group). Owner-identity blobs — private,
+ * account, and legacy pre-org rows — keep the existing `approve_key_policy` path.
+ *
+ * The caller (memory relayer) fetches `organizationId` / `orgMemoryGroupId` from
+ * social-server's org summary endpoint; the sidecar never derives them locally.
+ */
+function resolveOrgDecryptContext(body: {
+    mydataOwner?: string;
+    organizationId?: string;
+    orgMemoryGroupId?: string;
+}): OrgDecryptContext | null {
+    const { mydataOwner, organizationId, orgMemoryGroupId } = body;
+    if (!mydataOwner || !organizationId || !orgMemoryGroupId) return null;
+    if (!MYSO_ADDRESS_RE.test(organizationId) || !MYSO_ADDRESS_RE.test(orgMemoryGroupId)) {
+        throw new Error("Invalid organizationId or orgMemoryGroupId format");
+    }
+    if (normalizeMySoAddress(mydataOwner) !== normalizeMySoAddress(organizationId)) {
+        return null;
+    }
+    return { organizationId, orgMemoryGroupId };
+}
+
+/** Append the correct key-policy approval moveCall for one MYDATA id. */
+function addApproveKeyPolicyCall(
+    tx: Transaction,
+    packageId: string,
+    idBytes: number[],
+    accountId: string,
+    orgCtx: OrgDecryptContext | null,
+): void {
+    if (orgCtx) {
+        tx.moveCall({
+            target: `${packageId}::memory::approve_org_key_policy`,
+            arguments: [
+                tx.pure("vector<u8>", idBytes),
+                tx.object(accountId),
+                tx.object(orgCtx.organizationId),
+                tx.object(orgCtx.orgMemoryGroupId),
+                tx.object(MYSO_CLOCK),
+            ],
+        });
+    } else {
+        tx.moveCall({
+            target: `${packageId}::memory::approve_key_policy`,
+            arguments: [
+                tx.pure("vector<u8>", idBytes),
+                tx.object(accountId),
+                tx.object(MYSO_CLOCK),
+            ],
+        });
+    }
+}
+
+// ============================================================
 // POST /mydata/decrypt
 // ============================================================
 app.post("/mydata/decrypt", async (req, res) => {
@@ -438,6 +511,13 @@ app.post("/mydata/decrypt", async (req, res) => {
         const { data, packageId, accountId, platformId, platformScope } = req.body;
         if (!data || !packageId || !accountId) {
             return res.status(400).json({ error: "Missing required fields: data, packageId, accountId" });
+        }
+
+        let orgCtx: OrgDecryptContext | null;
+        try {
+            orgCtx = resolveOrgDecryptContext(req.body);
+        } catch (err: any) {
+            return res.status(400).json({ error: err.message });
         }
 
         // Defense-in-depth: when caller declares platform_scope, require matching platformId.
@@ -468,16 +548,11 @@ app.post("/mydata/decrypt", async (req, res) => {
             Uint8Array.from(fullId.match(/.{1,2}/g)!.map((b: string) => parseInt(b, 16)))
         );
 
-        // Build approve_key_policy PTB — pass MemoryAccount (owned object) instead of MemoryRegistry
+        // Build the key-policy approval PTB: org-identity blobs route through
+        // approve_org_key_policy (OrgMemoryReader gate); everything else keeps
+        // the owner-suffix approve_key_policy path.
         const tx = new Transaction();
-        tx.moveCall({
-            target: `${packageId}::memory::approve_key_policy`,
-            arguments: [
-                tx.pure("vector<u8>", idBytes),
-                tx.object(accountId),
-                tx.object(MYSO_CLOCK),
-            ],
-        });
+        addApproveKeyPolicyCall(tx, packageId, idBytes, accountId, orgCtx);
         const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
 
         // Fetch keys from key servers
@@ -527,6 +602,15 @@ app.post("/mydata/decrypt-batch", express.json({ limit: "8mb" }), async (req, re
             return res.status(400).json({ error: "Missing required fields: packageId, accountId" });
         }
 
+        // Org context applies to the whole batch — callers must not mix org-identity
+        // and owner-identity blobs in one request (the PTB aborts as a unit).
+        let orgCtx: OrgDecryptContext | null;
+        try {
+            orgCtx = resolveOrgDecryptContext(req.body);
+        } catch (err: any) {
+            return res.status(400).json({ error: err.message });
+        }
+
         // ENG-1697: resolve credential (x-mydata-session preferred; legacy
         // x-delegate-key supported during the deprecation window).
         const sessionKey = await resolveSessionKey(req, packageId);
@@ -557,20 +641,13 @@ app.post("/mydata/decrypt-batch", express.json({ limit: "8mb" }), async (req, re
         // Collect all unique IDs
         const allIds = [...new Set(parsedItems.map(p => p.fullId))];
 
-        // Build ONE PTB with approve_key_policy for ALL IDs
+        // Build ONE PTB with the key-policy approval for ALL IDs
         const tx = new Transaction();
         for (const id of allIds) {
             const idBytes = Array.from(
                 Uint8Array.from(id.match(/.{1,2}/g)!.map((b: string) => parseInt(b, 16)))
             );
-            tx.moveCall({
-                target: `${packageId}::memory::approve_key_policy`,
-                arguments: [
-                    tx.pure("vector<u8>", idBytes),
-                    tx.object(accountId),
-                    tx.object(MYSO_CLOCK),
-                ],
-            });
+            addApproveKeyPolicyCall(tx, packageId, idBytes, accountId, orgCtx);
         }
         const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
 

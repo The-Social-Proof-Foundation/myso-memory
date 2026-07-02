@@ -31,6 +31,34 @@ pub(crate) fn resolve_llm_model(config: &Config, model_id: Option<&str>) -> Stri
         .unwrap_or_else(|| config.default_llm_model.clone())
 }
 
+/// Look up `org_memory_group_id` for an org via social-server (canonical source).
+///
+/// Returns `None` when the org is unknown, its group id has not been indexed
+/// yet, or the lookup fails; callers degrade to the legacy owner-identity
+/// decrypt path in that case so recall stays best-effort.
+pub(crate) async fn resolve_org_memory_group_id(
+    state: &Arc<AppState>,
+    organization_id: Option<&str>,
+) -> Option<String> {
+    let org_id = organization_id.filter(|id| !id.is_empty())?;
+    match crate::org_summary::fetch_org_summary(
+        &state.http_client,
+        &state.org_summaries,
+        &state.config.social_server_url,
+        state.config.internal_sync_secret.as_deref(),
+        org_id,
+    )
+    .await
+    {
+        Ok(Some(summary)) => summary.org_memory_group_id,
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(error = %err, org = %org_id, "org summary lookup failed");
+            None
+        }
+    }
+}
+
 /// Truncate a string to at most `max_bytes` bytes without splitting a UTF-8
 /// character.  Falls back to the nearest char boundary when `max_bytes` lands
 /// inside a multi-byte sequence (e.g. emoji).
@@ -399,6 +427,12 @@ pub async fn recall(
 
     // Step 3: Download + MYDATA decrypt all results concurrently
     let db = &state.db;
+    let recall_organization_id = search_scope.organization_id.clone();
+    let recall_org_memory_group_id = resolve_org_memory_group_id(
+        &state,
+        recall_organization_id.as_deref(),
+    )
+    .await;
     let tasks: Vec<_> = hits_to_fetch
         .iter()
         .map(|hit| {
@@ -419,6 +453,17 @@ pub async fn recall(
             let platform_scope = auth.platform_scope.clone();
             let platform_id = auth.platform_id.clone();
             let owner_for_cleanup = owner.clone();
+            let owner_for_decrypt = owner.clone();
+            let hit_organization_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                recall_organization_id.clone()
+            } else {
+                None
+            };
+            let hit_org_memory_group_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                recall_org_memory_group_id.clone()
+            } else {
+                None
+            };
             async move {
                 tracing::debug!(
                     blob_id = %blob_id,
@@ -454,6 +499,10 @@ pub async fn recall(
                     &account_id,
                     platform_id.as_deref(),
                     platform_scope.as_deref(),
+                    hit_visibility,
+                    &owner_for_decrypt,
+                    hit_organization_id.as_deref(),
+                    hit_org_memory_group_id.as_deref(),
                 )
                 .await
                 {
@@ -827,6 +876,8 @@ pub async fn analyze(
                 &state.http_client, &state.config.sidecar_url,
                 state.config.sidecar_secret.as_deref(),
                 fact_text.as_bytes(), &owner, &state.config.package_id,
+                visibility,
+                organization_id.as_deref(),
             );
             let (vector_result, encrypted_result) = tokio::join!(embed_fut, encrypt_fut);
             let vector = vector_result?;
@@ -1531,6 +1582,12 @@ pub async fn ask(
 
     // Download + MYDATA decrypt all memories concurrently
     let db = &state.db;
+    let ask_organization_id = search_scope.organization_id.clone();
+    let ask_org_memory_group_id = resolve_org_memory_group_id(
+        &state,
+        ask_organization_id.as_deref(),
+    )
+    .await;
     let tasks: Vec<_> = hits_to_fetch
         .iter()
         .map(|hit| {
@@ -1551,6 +1608,17 @@ pub async fn ask(
             let platform_scope = auth.platform_scope.clone();
             let platform_id = auth.platform_id.clone();
             let owner_for_cleanup = owner.clone();
+            let owner_for_decrypt = owner.clone();
+            let hit_organization_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                ask_organization_id.clone()
+            } else {
+                None
+            };
+            let hit_org_memory_group_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                ask_org_memory_group_id.clone()
+            } else {
+                None
+            };
             async move {
                 tracing::debug!(
                     blob_id = %blob_id,
@@ -1585,6 +1653,10 @@ pub async fn ask(
                     &account_id,
                     platform_id.as_deref(),
                     platform_scope.as_deref(),
+                    hit_visibility,
+                    &owner_for_decrypt,
+                    hit_organization_id.as_deref(),
+                    hit_org_memory_group_id.as_deref(),
                 )
                 .await
                 {
@@ -1862,6 +1934,20 @@ pub async fn restore(
         })
         .collect();
 
+    // Prefetch org_memory_group_id for every org referenced by restored blobs so
+    // the decrypt tasks can rely on the cache and never re-derive locally.
+    let mut restore_org_group_ids: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for (_, (_, org_id)) in blob_visibility.iter() {
+        if let Some(org_id) = org_id.as_deref() {
+            if !restore_org_group_ids.contains_key(org_id) {
+                let group_id =
+                    resolve_org_memory_group_id(&state, Some(org_id)).await;
+                restore_org_group_ids.insert(org_id.to_string(), group_id);
+            }
+        }
+    }
+
     if total == 0 {
         return Ok(Json(RestoreResponse {
             restored: 0,
@@ -1987,8 +2073,16 @@ pub async fn restore(
             let account_id = auth.account_id.clone();
             let platform_scope = auth.platform_scope.clone();
             let platform_id = auth.platform_id.clone();
+            let (blob_visibility, blob_organization_id) = blob_visibility
+                .get(&blob_id)
+                .cloned()
+                .unwrap_or((crate::types::VISIBILITY_PRIVATE, None));
+            let blob_org_memory_group_id = blob_organization_id
+                .as_deref()
+                .and_then(|org_id| restore_org_group_ids.get(org_id).cloned().flatten());
+            let owner_for_restore = owner.clone();
             async move {
-                match mydata::mydata_decrypt(
+                match mydata::mydata_decrypt_restore(
                     &http_client,
                     &sidecar_url,
                     sidecar_secret.as_deref(),
@@ -1998,6 +2092,10 @@ pub async fn restore(
                     &account_id,
                     platform_id.as_deref(),
                     platform_scope.as_deref(),
+                    blob_visibility,
+                    &owner_for_restore,
+                    blob_organization_id.as_deref(),
+                    blob_org_memory_group_id.as_deref(),
                 )
                 .await
                 {

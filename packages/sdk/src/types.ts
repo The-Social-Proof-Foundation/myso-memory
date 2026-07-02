@@ -456,6 +456,20 @@ export interface ApproveKeyPolicyOpts extends MemoryTxOpts {
     id: string;
 }
 
+/**
+ * Options for approveOrgKeyPolicy: MYDATA key release gated by `OrgMemoryReader`
+ * on the organization's memory share group. Used by org-visible blob decrypt
+ * when the caller is not the account owner.
+ */
+export interface ApproveOrgKeyPolicyOpts extends MemoryTxOpts {
+    accountId: string;
+    organizationId: string;
+    /** PermissionedGroup<MemorySharePackage> shared object for the org */
+    orgMemoryGroupId: string;
+    /** MYDATA encryption id (hex string) */
+    id: string;
+}
+
 /** Shared org transaction fields (extends wallet/package context). */
 interface OrgGroupTxBase extends MemoryTxOpts {
     accountId: string;
@@ -553,6 +567,26 @@ export interface ApproveAgentSpendFromWorkflowOpts extends MemoryTxOpts {
     maxAmountMist?: number;
     /** Defaults to now + 24h (ms). */
     expiresAtMs?: number;
+    /**
+     * Optional org context for the org-approver path
+     * (`ai_credit::approve_agent_spend_as_approver`).
+     *
+     * When the workflow payload carries an `organization_id`, callers can supply
+     * these values (typically fetched from social-server's
+     * `/internal/organizations/:id/summary`) to route approval through the
+     * approver PTB instead of the owner PTB.
+     */
+    orgContext?: WorkflowApprovalOrgContext;
+}
+
+/**
+ * Values required to invoke `ai_credit::approve_agent_spend_as_approver` from
+ * a workflow approval item. `accountId` + `orgMemoryGroupId` must be sourced
+ * from social-server's org summary — SDK callers must not re-derive them.
+ */
+export interface WorkflowApprovalOrgContext {
+    accountId: string;
+    orgMemoryGroupId: string;
 }
 
 export function parseWorkflowApprovalPayload(
@@ -606,5 +640,78 @@ export function buildApproveAgentSpendOptsFromWorkflow(
         agentObjectId: payload.agent_object_id,
         maxAmountMist,
         expiresAtMs,
+    };
+}
+
+/** Payload on workflow inbox items with `item_type: "memory_access_request"`. */
+export interface WorkflowMemoryAccessRequestPayload {
+    organization_id: string;
+    account_id: string;
+    org_memory_group_id: string;
+    member_address: string;
+    permissions_mask: number;
+    agent_object_id?: string | null;
+}
+
+/** Build `grantOrgMemoryPermission` opts from a workflow memory access item. */
+export interface GrantOrgMemoryPermissionFromWorkflowOpts extends MemoryTxOpts {
+    payload: WorkflowMemoryAccessRequestPayload | Record<string, unknown>;
+    /** Defaults to `permissions_mask` from the payload. */
+    permissionsMask?: number;
+}
+
+export function parseWorkflowMemoryAccessPayload(
+    payload: unknown,
+): WorkflowMemoryAccessRequestPayload {
+    if (!payload || typeof payload !== "object") {
+        throw new Error("workflow memory access payload must be an object");
+    }
+    const p = payload as Record<string, unknown>;
+    const organizationId = p.organization_id;
+    const accountId = p.account_id;
+    const orgMemoryGroupId = p.org_memory_group_id;
+    const memberAddress = p.member_address;
+    const permissionsMask = p.permissions_mask;
+    if (typeof organizationId !== "string" || organizationId.length === 0) {
+        throw new Error("workflow memory access payload missing organization_id");
+    }
+    if (typeof accountId !== "string" || accountId.length === 0) {
+        throw new Error("workflow memory access payload missing account_id");
+    }
+    if (typeof orgMemoryGroupId !== "string" || orgMemoryGroupId.length === 0) {
+        throw new Error("workflow memory access payload missing org_memory_group_id");
+    }
+    if (typeof memberAddress !== "string" || memberAddress.length === 0) {
+        throw new Error("workflow memory access payload missing member_address");
+    }
+    if (typeof permissionsMask !== "number" || !Number.isFinite(permissionsMask)) {
+        throw new Error("workflow memory access payload missing permissions_mask");
+    }
+    return {
+        organization_id: organizationId,
+        account_id: accountId,
+        org_memory_group_id: orgMemoryGroupId,
+        member_address: memberAddress,
+        permissions_mask: permissionsMask,
+        agent_object_id:
+            typeof p.agent_object_id === "string" ? p.agent_object_id : null,
+    };
+}
+
+export function buildGrantOrgMemoryPermissionOptsFromWorkflow(
+    opts: GrantOrgMemoryPermissionFromWorkflowOpts,
+): GrantOrgMemoryPermissionOpts {
+    const payload = parseWorkflowMemoryAccessPayload(opts.payload);
+    return {
+        packageId: opts.packageId,
+        mysoPrivateKey: opts.mysoPrivateKey,
+        walletSigner: opts.walletSigner,
+        mysoClient: opts.mysoClient,
+        mysoNetwork: opts.mysoNetwork,
+        accountId: payload.account_id,
+        organizationId: payload.organization_id,
+        orgMemoryGroupId: payload.org_memory_group_id,
+        memberAddress: payload.member_address,
+        permissionsMask: opts.permissionsMask ?? payload.permissions_mask,
     };
 }
