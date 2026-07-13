@@ -422,3 +422,46 @@ pub async fn record_embedding_usage(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_inference_targets_oracle_native_path() {
+        // Relayer must keep calling the oracle's private inference API — not an
+        // OpenAI-compatible proxy on the Memory server.
+        let base = "http://127.0.0.1:8095/";
+        let url = format!(
+            "{}/v1/ai-credit/inference",
+            base.trim_end_matches('/')
+        );
+        assert_eq!(url, "http://127.0.0.1:8095/v1/ai-credit/inference");
+    }
+
+    #[test]
+    fn gateway_inference_request_serializes_native_shape() {
+        let body = GatewayInferenceRequest {
+            owner: "0xowner",
+            balance_id: "0xbal",
+            memory_account_id: "0xmem",
+            agent_object_id: "0xagent",
+            model_id: "openai/gpt-4o-mini",
+            system_prompt: Some("sys"),
+            prompt: "hello",
+            max_tokens: 32,
+            idempotency_key: "idem-1",
+        };
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value["owner"], "0xowner");
+        assert_eq!(value["balance_id"], "0xbal");
+        assert_eq!(value["memory_account_id"], "0xmem");
+        assert_eq!(value["agent_object_id"], "0xagent");
+        assert_eq!(value["model_id"], "openai/gpt-4o-mini");
+        assert_eq!(value["system_prompt"], "sys");
+        assert_eq!(value["prompt"], "hello");
+        assert_eq!(value["max_tokens"], 32);
+        assert_eq!(value["idempotency_key"], "idem-1");
+        assert!(value.get("messages").is_none());
+    }
+}

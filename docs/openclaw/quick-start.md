@@ -178,5 +178,6 @@ Then the LLM can call `memory_search` and `memory_store` on its own when it deci
 
 ## Next steps
 
+- [AI Credit Provider](/openclaw/ai-credit-provider) — bill OpenClaw chat through the AI credit oracle (no OpenAI key in the harness)
 - [How It Works](/openclaw/how-it-works) — understand the architecture, message flow, and hook mechanics
 - [Reference](/openclaw/reference) — detailed breakdown of hooks, tools, CLI, and configuration

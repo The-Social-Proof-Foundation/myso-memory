@@ -47,13 +47,13 @@ The Memory memory plugin adds a **cloud-based, encrypted memory layer** to OpenC
   <Card title="Quick Start" icon="rocket" href="/openclaw/quick-start">
     Install, configure, and verify the plugin in minutes
   </Card>
+  <Card title="AI Credit Provider" icon="coins" href="/openclaw/ai-credit-provider">
+    Bill OpenClaw / Hermes chat through the AI credit oracle (on-chain credits + OpenRouter)
+  </Card>
   <Card title="How It Works" icon="gear" href="/openclaw/how-it-works">
     Architecture, message flow, hooks vs tools
   </Card>
   <Card title="Reference" icon="book" href="/openclaw/reference">
     Hooks, tools, CLI, configuration, and troubleshooting
-  </Card>
-  <Card title="Source Code" icon="github" href="https://github.com/the-social-proof-foundation/myso-memory/tree/main/packages/openclaw-memory">
-    Browse the source on GitHub
   </Card>
 </CardGroup>

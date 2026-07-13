@@ -78,6 +78,7 @@ These are not all enforced at boot, but most real deployments need them.
 - `MEMORY_PACKAGE_ID` and `MEMORY_REGISTRY_ID` are server env vars. Do not replace them with `VITE_*` app env vars.
 - Social tools are discoverable only when every social-chain object ID is configured. The authenticated context remains authoritative; client-side pins must match it.
 - With `AI_CREDIT_ENABLED=true`, startup fails unless `AI_CREDIT_ORACLE_API_SECRET` is non-empty. The oracle must independently enable inference and require the same secret.
+- OpenAI-compatible `/v1/{chat/completions,responses,models}` for OpenClaw / Hermes is served by the **AI credit oracle** (`AI_CREDIT_ORACLE_URL`), not this Memory relayer. See [AI Credit Provider](/openclaw/ai-credit-provider).
 - Raw `x-delegate-key` and `x-owner-delegate-key` headers are rejected unless an explicit local-only legacy switch is enabled.
 - Public `/sponsor` and `/sponsor/execute` are absent by default. Agents use authenticated registry-only `/api/chain/actions/prepare` and `/api/chain/actions/submit` instead.
 - For network-specific `MEMORY_PACKAGE_ID` and `MEMORY_REGISTRY_ID` values, see [Contract Overview](/contract/overview).

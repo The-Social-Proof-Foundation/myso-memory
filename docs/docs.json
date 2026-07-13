@@ -138,6 +138,7 @@
             "pages": [
               "openclaw/overview",
               "openclaw/quick-start",
+              "openclaw/ai-credit-provider",
               "openclaw/how-it-works",
               "openclaw/reference",
               "openclaw/changelog"

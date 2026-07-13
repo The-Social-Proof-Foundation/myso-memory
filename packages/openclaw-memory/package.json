@@ -20,6 +20,7 @@
   "files": [
     "dist",
     "openclaw.plugin.json",
+    "openclaw.ai-credit.example.json",
     "README.md"
   ],
   "scripts": {

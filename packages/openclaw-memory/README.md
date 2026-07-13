@@ -26,6 +26,8 @@ Memories are **encrypted** and stored on **Memory**, a privacy-preserving memory
 - **Prompt injection protection** — detection and escaping on all read/write paths
 - **CLI** — `openclaw memory search` and `openclaw memory stats` for debugging
 
+To bill OpenClaw chat through on-chain **AI credits** (oracle → OpenRouter) instead of a raw OpenAI key, point OpenClaw's model provider at the **AI credit oracle** (`http://127.0.0.1:8095/v1`) while keeping the Memory plugin pointed at the relayer (`http://127.0.0.1:8000`). See [`openclaw.ai-credit.example.json`](./openclaw.ai-credit.example.json) and the [AI Credit Provider docs](https://docs.mysocial.network/openclaw/ai-credit-provider).
+
 ## Prerequisites
 
 ### OpenClaw

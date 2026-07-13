@@ -1,0 +1,49 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace",
+      "model": {
+        "primary": "myso-ai-credit/openai/gpt-4o-mini"
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local"
+  },
+  "plugins": {
+    "allow": ["memory"],
+    "slots": { "memory": "memory" },
+    "entries": {
+      "memory": {
+        "enabled": true,
+        "hooks": { "allowConversationAccess": true },
+        "config": {
+          "privateKey": "${MEMORY_PRIVATE_KEY}",
+          "accountId": "0xREPLACE_WITH_YOUR_MEMORY_ACCOUNT_ID",
+          "serverUrl": "http://127.0.0.1:8000"
+        }
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "myso-ai-credit": {
+        "baseUrl": "http://127.0.0.1:8095/v1",
+        "api": "openai-responses",
+        "apiKey": "${MYSO_AI_CREDIT_PROVIDER_TOKEN}",
+        "models": [
+          { "id": "openai/gpt-4o-mini", "name": "openai/gpt-4o-mini" },
+          { "id": "openai/gpt-4o", "name": "openai/gpt-4o" }
+        ]
+      }
+    }
+  },
+  "auth": {
+    "profiles": {
+      "myso-ai-credit:apikey": {
+        "provider": "myso-ai-credit",
+        "mode": "api_key"
+      }
+    }
+  }
+}
