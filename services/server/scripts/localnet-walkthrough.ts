@@ -24,6 +24,7 @@ const USERNAME_REGISTRY =
 const MEMORY_REGISTRY =
     process.env.MEMORY_REGISTRY_ID ??
     "0xee405b83143252de2356095a3e35306d193ee7d440e8f481bd682b00ef07b157";
+const MEMORY_CONFIG = process.env.MEMORY_CONFIG_ID ?? "";
 const CLOCK_ID = process.env.CLOCK_ID ?? "0x6";
 const SERVER_URL = process.env.MEMORY_SERVER_URL ?? "http://127.0.0.1:8000";
 const SOCIAL_URL = process.env.SOCIAL_SERVER_URL ?? "http://127.0.0.1:9126";
@@ -32,6 +33,7 @@ const GAS = process.env.GAS_BUDGET ?? "1000000000";
 
 interface WalkthroughState {
     accountId: string;
+    organizationId?: string;
     agentObjectId: string;
     subAgentPrivateKey: string;
     derivedAddress: string;
@@ -148,9 +150,24 @@ async function main(): Promise<void> {
         const { MySoJsonRpcClient } = await import("@socialproof/myso/jsonRpc");
         const mysoClient = new MySoJsonRpcClient({ url: RPC_URL });
 
+        if (!MEMORY_CONFIG) {
+            throw new Error("MEMORY_CONFIG_ID must be set for organization and sub-agent setup");
+        }
+        const organization = await mods.createAgenticOrganization({
+            packageId: PACKAGE_ID,
+            memoryConfigId: MEMORY_CONFIG,
+            accountId,
+            label: "Walkthrough Organization",
+            orgType: mods.ORG_TYPE_OTHER,
+            mysoPrivateKey,
+            mysoClient,
+        });
+
         const reg = await mods.registerSubAgent({
             packageId: PACKAGE_ID,
+            memoryConfigId: MEMORY_CONFIG,
             accountId,
+            organizationId: organization.organizationId,
             publicKey: agent.publicKey,
             label: "walkthrough-agent",
             capabilities:
@@ -170,6 +187,7 @@ async function main(): Promise<void> {
 
         state = {
             accountId,
+            organizationId: organization.organizationId,
             agentObjectId: reg.agentObjectId,
             subAgentPrivateKey: agent.privateKey,
             derivedAddress: agent.derivedAddress,
@@ -266,11 +284,11 @@ async function main(): Promise<void> {
                     "Create via ai_credit::create_balance_for_memory_account + deposit on localnet.",
             );
         } else {
-            const before = (await beforeResp.json()) as { credits: number; balance: { balance_id: string } };
-            console.log(`  credits before=${before.credits} balance_id=${before.balance.balance_id}`);
+            const before = (await beforeResp.json()) as { available_mist: number; billing_unit: "MIST"; balance: { balance_id: string } };
+            console.log(`  available_mist before=${before.available_mist} balance_id=${before.balance.balance_id}`);
 
-            if (before.credits <= 0) {
-                console.log("[test] skipping analyze — deposit MYSO credits first (ai_credit::deposit)");
+            if (before.available_mist <= 0) {
+                console.log("[test] skipping analyze — deposit MYSO into the AI balance first (ai_credit::deposit)");
             } else {
                 console.log("[test] analyze (requires OPENAI_API_KEY + AI_CREDIT_ENABLED=1 on memory-server)...");
                 const analyzed = await memory.analyze(
@@ -288,14 +306,14 @@ async function main(): Promise<void> {
 
                 const afterResp = await fetch(`${SOCIAL_URL}/profiles/${owner}/ai-credit`);
                 if (afterResp.ok) {
-                    const after = (await afterResp.json()) as { credits: number };
-                    console.log(`  credits after=${after.credits} (settlement may lag on-chain)`);
+                    const after = (await afterResp.json()) as { available_mist: number };
+                    console.log(`  available_mist after=${after.available_mist}`);
                 }
             }
         }
     } else {
         console.log(
-            "[test] skipping ai-credit walkthrough (set AI_CREDIT_WALKTHROUGH=1 with oracle + credits deposited)",
+            "[test] skipping ai-credit walkthrough (set AI_CREDIT_WALKTHROUGH=1 with oracle + MYSO deposited)",
         );
     }
 

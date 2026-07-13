@@ -17,7 +17,9 @@
  *
  * await registerSubAgent({
  *   packageId: "0x...",
+ *   memoryConfigId: "0x...",
  *   accountId: "0x...",
+ *   organizationId: "0x...",
  *   publicKey: agent.publicKey,
  *   label: "My Laptop",
  *   walletSigner,
@@ -84,6 +86,7 @@ export {
     CAP_REACT,
     CAP_AI_SPEND,
     CAP_BUDGET_MANAGE,
+    CAP_SOCIAL_GRAPH,
     ORG_PERM_MEMORY_READ,
     ORG_PERM_MEMORY_WRITE,
     ORG_PERM_AGENT_MANAGER,
@@ -339,9 +342,11 @@ export async function createAgenticOrganization(
     tx.moveCall({
         target: `${opts.packageId}::memory::create_agentic_organization`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
-            tx.pure("string", opts.label),
             tx.pure("u8", opts.orgType),
+            tx.pure("option<string>", opts.label || null),
+            tx.pure("option<string>", opts.description ?? null),
             tx.object(MYSO_CLOCK),
         ],
     });
@@ -361,11 +366,13 @@ export async function updateAgenticOrganizationLabel(
 
     const tx = new Transaction();
     tx.moveCall({
-        target: `${opts.packageId}::memory::update_agentic_organization_label`,
+        target: `${opts.packageId}::memory::update_agentic_organization_metadata`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
-            tx.pure("string", opts.label),
+            tx.pure("option<string>", opts.label || null),
+            tx.pure("option<string>", null),
         ],
     });
 
@@ -383,6 +390,7 @@ export async function updateAgenticOrganizationCategory(
     tx.moveCall({
         target: `${opts.packageId}::memory::update_agentic_organization_category`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.pure("u8", opts.orgType),
@@ -446,6 +454,7 @@ export async function registerSubAgent(
     tx.moveCall({
         target: `${opts.packageId}::memory::register_sub_agent`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.pure("vector<u8>", Array.from(pkBytes)),
@@ -492,6 +501,7 @@ export async function registerSubAgentDelegated(
     tx.moveCall({
         target: `${opts.packageId}::memory::register_sub_agent_delegated`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.parentAgentObjectId),
             tx.pure("vector<u8>", Array.from(pkBytes)),
@@ -633,6 +643,7 @@ export async function updateSubAgentLabel(
     tx.moveCall({
         target: `${opts.packageId}::memory::update_sub_agent_label`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.agentObjectId),
             tx.pure("string", opts.label),
@@ -778,6 +789,7 @@ export async function buildApproveOrgKeyPolicyTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_org_key_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
@@ -802,6 +814,7 @@ export async function approveOrgKeyPolicy(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_org_key_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
@@ -944,6 +957,7 @@ export async function defineCustomOrgRole(
     tx.moveCall({
         target: `${opts.packageId}::memory::define_custom_org_role`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.object(opts.orgMemoryGroupId),
@@ -965,6 +979,7 @@ export async function buildDefineCustomOrgRoleTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::define_custom_org_role`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.object(opts.orgMemoryGroupId),

@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::db::VectorDb;
 use crate::rate_limit::RateLimitConfig;
@@ -105,8 +105,18 @@ pub struct Config {
     pub allowed_origins: String,
     /// Bootstrap shared objects for social_contracts::post PTBs
     pub social_chain: SocialChainConfig,
+    /// Emergency local-only compatibility switch. Production social execution is
+    /// client-built/sponsored and never forwards a private key.
+    pub allow_legacy_social_key_forwarding: bool,
+    /// Legacy MYDATA raw delegate-key transport. Session keys are the default.
+    pub allow_legacy_delegate_key_forwarding: bool,
+    /// Compatibility-only arbitrary TransactionKind sponsorship routes.
+    /// Registry-only authenticated prepare/submit is the production default.
+    pub allow_public_generic_sponsor: bool,
     /// AI credit oracle base URL (preflight + usage metering)
     pub ai_credit_oracle_url: String,
+    /// Shared service credential for the private AI gateway.
+    pub ai_credit_oracle_api_secret: Option<String>,
     /// When true, AI routes require sufficient on-chain AI credits
     pub ai_credit_enabled: bool,
     /// Default LLM model id for analyze/ask when client omits model_id.
@@ -124,6 +134,11 @@ pub struct Config {
     /// Shared secret for internal social-server endpoints (`/internal/*`),
     /// including the org summary lookup used by MYDATA org decrypt.
     pub internal_sync_secret: Option<String>,
+    /// GraphQL endpoint used to discover local shared-object IDs after regenesis.
+    pub social_chain_graphql_url: Option<String>,
+    /// Enables type-based discovery for missing social/messaging object IDs.
+    /// Defaults on for localnet and off for remote networks.
+    pub social_chain_auto_discovery: bool,
     /// Memory access request producer (`POST /internal/memory/access-requests`).
     pub memory_access_sync_enabled: bool,
     pub memory_access_sync_secret: Option<String>,
@@ -136,22 +151,35 @@ pub struct SocialChainConfig {
     pub platform_object_id: String,
     pub block_list_registry_id: String,
     pub post_config_id: String,
+    pub memory_config_id: String,
     pub mydata_registry_id: String,
+    pub social_graph_id: String,
+    pub messaging_package_id: String,
+    pub messaging_version_id: String,
+    pub messaging_config_id: String,
+    pub messaging_namespace_id: String,
+    pub messaging_group_manager_id: String,
+    pub messaging_group_leaver_id: String,
 }
 
 impl SocialChainConfig {
     pub fn from_env() -> Self {
         Self {
-            username_registry_id: std::env::var("USERNAME_REGISTRY_ID")
-                .unwrap_or_default(),
-            platform_registry_id: std::env::var("PLATFORM_REGISTRY_ID")
-                .unwrap_or_default(),
-            platform_object_id: std::env::var("PLATFORM_OBJECT_ID")
-                .unwrap_or_default(),
-            block_list_registry_id: std::env::var("BLOCK_LIST_REGISTRY_ID")
-                .unwrap_or_default(),
+            username_registry_id: std::env::var("USERNAME_REGISTRY_ID").unwrap_or_default(),
+            platform_registry_id: std::env::var("PLATFORM_REGISTRY_ID").unwrap_or_default(),
+            platform_object_id: std::env::var("PLATFORM_OBJECT_ID").unwrap_or_default(),
+            block_list_registry_id: std::env::var("BLOCK_LIST_REGISTRY_ID").unwrap_or_default(),
             post_config_id: std::env::var("POST_CONFIG_ID").unwrap_or_default(),
-            mydata_registry_id: std::env::var("MYDATA_REGISTRY_ID")
+            memory_config_id: std::env::var("MEMORY_CONFIG_ID").unwrap_or_default(),
+            mydata_registry_id: std::env::var("MYDATA_REGISTRY_ID").unwrap_or_default(),
+            social_graph_id: std::env::var("SOCIAL_GRAPH_ID").unwrap_or_default(),
+            messaging_package_id: std::env::var("MESSAGING_PACKAGE_ID").unwrap_or_default(),
+            messaging_version_id: std::env::var("MESSAGING_VERSION_ID").unwrap_or_default(),
+            messaging_config_id: std::env::var("MESSAGING_CONFIG_ID").unwrap_or_default(),
+            messaging_namespace_id: std::env::var("MESSAGING_NAMESPACE_ID").unwrap_or_default(),
+            messaging_group_manager_id: std::env::var("MESSAGING_GROUP_MANAGER_ID")
+                .unwrap_or_default(),
+            messaging_group_leaver_id: std::env::var("MESSAGING_GROUP_LEAVER_ID")
                 .unwrap_or_default(),
         }
     }
@@ -162,14 +190,45 @@ impl SocialChainConfig {
             && !self.platform_object_id.is_empty()
             && !self.block_list_registry_id.is_empty()
             && !self.post_config_id.is_empty()
+            && !self.memory_config_id.is_empty()
             && !self.mydata_registry_id.is_empty()
+    }
+
+    pub fn env_pairs(&self) -> [(&'static str, &str); 14] {
+        [
+            ("USERNAME_REGISTRY_ID", &self.username_registry_id),
+            ("PLATFORM_REGISTRY_ID", &self.platform_registry_id),
+            ("PLATFORM_OBJECT_ID", &self.platform_object_id),
+            ("BLOCK_LIST_REGISTRY_ID", &self.block_list_registry_id),
+            ("POST_CONFIG_ID", &self.post_config_id),
+            ("MEMORY_CONFIG_ID", &self.memory_config_id),
+            ("MYDATA_REGISTRY_ID", &self.mydata_registry_id),
+            ("SOCIAL_GRAPH_ID", &self.social_graph_id),
+            ("MESSAGING_PACKAGE_ID", &self.messaging_package_id),
+            ("MESSAGING_VERSION_ID", &self.messaging_version_id),
+            ("MESSAGING_CONFIG_ID", &self.messaging_config_id),
+            ("MESSAGING_NAMESPACE_ID", &self.messaging_namespace_id),
+            (
+                "MESSAGING_GROUP_MANAGER_ID",
+                &self.messaging_group_manager_id,
+            ),
+            ("MESSAGING_GROUP_LEAVER_ID", &self.messaging_group_leaver_id),
+        ]
     }
 }
 
 impl Config {
     pub fn from_env() -> Self {
-        let network = std::env::var("MYSO_NETWORK")
-            .unwrap_or_else(|_| "mainnet".to_string());
+        let network = std::env::var("MYSO_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
+        let ai_credit_enabled = std::env::var("AI_CREDIT_ENABLED")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let ai_credit_oracle_api_secret = std::env::var("AI_CREDIT_ORACLE_API_SECRET")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if ai_credit_enabled && ai_credit_oracle_api_secret.is_none() {
+            panic!("AI_CREDIT_ORACLE_API_SECRET must be set when AI_CREDIT_ENABLED=true");
+        }
         let default_rpc = match network.as_str() {
             "testnet" => "https://fullnode.testnet.mysosocial.network:443",
             "devnet" => "https://fullnode.devnet.mysosocial.network:443",
@@ -227,11 +286,23 @@ impl Config {
             allowed_origins: std::env::var("ALLOWED_ORIGINS")
                 .unwrap_or_default(),
             social_chain: SocialChainConfig::from_env(),
+            allow_legacy_social_key_forwarding: std::env::var(
+                "ALLOW_LEGACY_SOCIAL_KEY_FORWARDING",
+            )
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+            allow_legacy_delegate_key_forwarding: std::env::var(
+                "ALLOW_LEGACY_DELEGATE_KEY_FORWARDING",
+            )
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+            allow_public_generic_sponsor: std::env::var("ALLOW_PUBLIC_GENERIC_SPONSOR")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             ai_credit_oracle_url: std::env::var("AI_CREDIT_ORACLE_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:8095".to_string()),
-            ai_credit_enabled: std::env::var("AI_CREDIT_ENABLED")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            ai_credit_oracle_api_secret,
+            ai_credit_enabled,
             default_llm_model: std::env::var("DEFAULT_LLM_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-4o-mini".to_string()),
             memory_usage_sync_enabled: std::env::var("MEMORY_USAGE_SYNC_ENABLED")
@@ -247,6 +318,16 @@ impl Config {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             internal_sync_secret: std::env::var("INTERNAL_SYNC_SECRET").ok(),
+            social_chain_graphql_url: std::env::var("SOCIAL_CHAIN_GRAPHQL_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    (network == "localnet")
+                        .then(|| "http://127.0.0.1:9125/graphql".to_string())
+                }),
+            social_chain_auto_discovery: std::env::var("SOCIAL_CHAIN_AUTO_DISCOVERY")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(network == "localnet"),
             memory_access_sync_enabled: std::env::var("MEMORY_ACCESS_SYNC_ENABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -515,8 +596,6 @@ pub struct RememberBulkStatusResponse {
     pub jobs: Vec<RememberBulkStatusItem>,
 }
 
-
-
 /// POST /api/analyze
 /// Extract facts from conversation text using LLM, then remember each fact
 /// Owner is derived from delegate key via onchain verification (auth middleware)
@@ -528,6 +607,8 @@ pub struct AnalyzeRequest {
     pub namespace: String,
     /// LLM model id for billing (must match oracle pricing catalog).
     pub model_id: Option<String>,
+    /// Stable retry key for reserve/provider/capture idempotency.
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub visibility: Option<String>,
 }
@@ -608,6 +689,28 @@ pub struct RecordInferenceUsageResponse {
     pub ok: bool,
 }
 
+/// Authenticated, reserve-before-provider chat inference.
+#[derive(Debug, Deserialize)]
+pub struct GatewayInferenceRequest {
+    pub model_id: String,
+    pub system_prompt: Option<String>,
+    pub prompt: String,
+    pub max_tokens: Option<u32>,
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GatewayInferenceResponse {
+    pub content: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub amount_mist: u64,
+    pub billing_state: String,
+    pub reservation_nonce: Option<u64>,
+    pub reserve_digest: Option<String>,
+    pub capture_digest: Option<String>,
+}
+
 /// Recall memories + LLM chat — full AI-with-memory demo
 #[derive(Debug, Deserialize)]
 pub struct AskRequest {
@@ -621,6 +724,8 @@ pub struct AskRequest {
     pub scoring_weights: Option<crate::ranker::ScoringWeights>,
     /// LLM model id for billing (must match oracle pricing catalog).
     pub model_id: Option<String>,
+    /// Stable retry key for reserve/provider/capture idempotency.
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
 }
@@ -681,6 +786,36 @@ pub struct ConfigResponse {
     pub network: String,
     #[serde(rename = "mysoRpcUrl")]
     pub myso_rpc_url: String,
+    #[serde(rename = "socialChain", skip_serializing_if = "Option::is_none")]
+    pub social_chain: Option<PublicSocialChainConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicSocialChainConfig {
+    pub package_id: String,
+    pub username_registry_id: String,
+    pub platform_registry_id: String,
+    pub platform_object_id: String,
+    pub block_list_registry_id: String,
+    pub post_config_id: String,
+    pub memory_config_id: String,
+    pub mydata_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub social_graph_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_package_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_version_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_namespace_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_group_manager_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_group_leaver_id: String,
+    pub clock_id: &'static str,
 }
 
 // ============================================================
@@ -705,6 +840,104 @@ pub struct SponsorExecuteRequest {
     /// MySo address of the transaction sender (0x + 64 hex). Optional but
     /// recommended — enables per-sender rate limiting on this endpoint too.
     pub sender: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegisteredActionPrepareRequest {
+    pub registry_action: String,
+    pub registry_version: String,
+    pub idempotency_key: String,
+    pub parameters: serde_json::Value,
+    pub approval_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegisteredActionSubmitRequest {
+    pub registry_action: String,
+    pub registry_version: String,
+    pub idempotency_key: String,
+    pub digest: String,
+    pub signature: String,
+    pub approval_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActionApprovalRequest {
+    pub registry_action: String,
+    pub registry_version: String,
+    pub idempotency_key: String,
+    pub parameters: serde_json::Value,
+    pub expires_in_seconds: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ActionApprovalDecisionRequest {
+    pub wallet_signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarWalletVerificationResponse {
+    pub signer_address: String,
+    pub public_key_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionApprovalResponse {
+    pub approval_id: String,
+    pub registry_action: String,
+    pub registry_version: String,
+    pub idempotency_key: String,
+    pub parameter_hash: String,
+    pub risk_tier: String,
+    pub required_capability: u64,
+    pub approval_intent: String,
+    pub status: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidecarPreparedAction {
+    pub registry_action: String,
+    pub registry_version: String,
+    pub required_capability: u64,
+    pub risk_tier: String,
+    pub parameter_hash: String,
+    pub package_id: String,
+    pub package_version: String,
+    pub transaction_bytes_hash: String,
+    pub prepared_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub transaction_block_kind_bytes: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SponsoredTransactionResponse {
+    pub bytes: String,
+    pub digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredActionPrepareResponse {
+    pub registry_action: String,
+    pub registry_version: String,
+    pub idempotency_key: String,
+    pub parameter_hash: String,
+    pub transaction_kind_hash: String,
+    pub package_id: String,
+    pub package_version: String,
+    pub bytes: String,
+    pub digest: String,
+    pub status: String,
+    pub simulation: Option<serde_json::Value>,
+    pub expires_at_ms: i64,
 }
 
 // ============================================================
@@ -798,6 +1031,10 @@ pub enum AppError {
     QuotaExceeded(String),
     /// Policy / capability rejection (HTTP 403)
     Forbidden(String),
+    /// Idempotency or lifecycle conflict (HTTP 409)
+    Conflict(String),
+    /// A registered blockchain action needs an owner wallet approval (HTTP 403).
+    ActionApprovalRequired(String),
     /// AI credit balance depleted (HTTP 402)
     AiCreditDepleted(String),
     /// Spend exceeds the agent's approval threshold — the owner (or an org spend
@@ -818,11 +1055,15 @@ impl std::fmt::Display for AppError {
             AppError::RateLimited(msg) => write!(f, "Rate Limited: {}", msg),
             AppError::QuotaExceeded(msg) => write!(f, "Quota Exceeded: {}", msg),
             AppError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
+            AppError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            AppError::ActionApprovalRequired(msg) => write!(f, "Action approval required: {}", msg),
             AppError::AiCreditDepleted(msg) => write!(f, "AI credits depleted: {}", msg),
             AppError::AiCreditApprovalRequired { threshold_mist, .. } => write!(
                 f,
                 "AI spend approval required (threshold: {} MIST)",
-                threshold_mist.map(|t| t.to_string()).unwrap_or_else(|| "?".into())
+                threshold_mist
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "?".into())
             ),
         }
     }
@@ -852,7 +1093,13 @@ impl axum::response::IntoResponse for AppError {
             AppError::RateLimited(msg) => (axum::http::StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::QuotaExceeded(msg) => (axum::http::StatusCode::PAYMENT_REQUIRED, msg.clone()),
             AppError::Forbidden(msg) => (axum::http::StatusCode::FORBIDDEN, msg.clone()),
-            AppError::AiCreditDepleted(msg) => (axum::http::StatusCode::PAYMENT_REQUIRED, msg.clone()),
+            AppError::Conflict(msg) => (axum::http::StatusCode::CONFLICT, msg.clone()),
+            AppError::ActionApprovalRequired(msg) => {
+                (axum::http::StatusCode::FORBIDDEN, msg.clone())
+            }
+            AppError::AiCreditDepleted(msg) => {
+                (axum::http::StatusCode::PAYMENT_REQUIRED, msg.clone())
+            }
             AppError::AiCreditApprovalRequired { .. } => {
                 (axum::http::StatusCode::PAYMENT_REQUIRED, self.to_string())
             }
@@ -871,6 +1118,11 @@ impl axum::response::IntoResponse for AppError {
                 "code": "ai_credit_approval_required",
                 "threshold_mist": threshold_mist,
                 "estimated_mist": estimated_mist,
+            }),
+            AppError::ActionApprovalRequired(_) => serde_json::json!({
+                "error": message,
+                "code": "action_approval_required",
+                "approval_required": true,
             }),
             _ => serde_json::json!({ "error": message }),
         };
@@ -925,7 +1177,11 @@ mod tests {
         let debug_str = format!("{:?}", auth);
 
         assert!(debug_str.contains("<redacted>"), "got: {}", debug_str);
-        assert!(!debug_str.contains("supersecretprivatekeyinhex"), "got: {}", debug_str);
+        assert!(
+            !debug_str.contains("supersecretprivatekeyinhex"),
+            "got: {}",
+            debug_str
+        );
         assert!(debug_str.contains("aabbccdd"));
         assert!(debug_str.contains("0xowner"));
         assert!(debug_str.contains("0xaccount"));
@@ -935,16 +1191,19 @@ mod tests {
     fn auth_info_debug_shows_none_when_no_sub_agent_key() {
         let auth = sample_auth();
         let debug_str = format!("{:?}", auth);
-        assert!(debug_str.contains("None"), "expected None in debug: {}", debug_str);
+        assert!(
+            debug_str.contains("None"),
+            "expected None in debug: {}",
+            debug_str
+        );
         assert!(!debug_str.contains("<redacted>"));
     }
 
     #[test]
     fn auth_info_debug_redacts_mydata_session() {
         let mut auth = sample_auth();
-        auth.mydata_session = Some(
-            "eyJhZGRyZXNzIjoiMHhhYmMiLCJwYWNrYWdlSWQiOiIweGRlZiJ9".to_string(),
-        );
+        auth.mydata_session =
+            Some("eyJhZGRyZXNzIjoiMHhhYmMiLCJwYWNrYWdlSWQiOiIweGRlZiJ9".to_string());
 
         let debug_str = format!("{:?}", auth);
         assert!(debug_str.contains("<redacted>"));
@@ -1015,15 +1274,18 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
     }
 
+    #[test]
+    fn app_error_conflict_status() {
+        let err = AppError::Conflict("test".into());
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
+    }
+
     // ── KeyPool: round-robin selection ───────────────────────────────────
 
     #[test]
     fn key_pool_round_robin() {
-        let pool = KeyPool::new(vec![
-            "key_a".into(),
-            "key_b".into(),
-            "key_c".into(),
-        ]);
+        let pool = KeyPool::new(vec!["key_a".into(), "key_b".into(), "key_c".into()]);
 
         assert_eq!(pool.next(), Some("key_a"));
         assert_eq!(pool.next(), Some("key_b"));
@@ -1068,12 +1330,27 @@ mod tests {
 
     #[test]
     fn app_error_display_all_variants() {
-        assert!(AppError::BadRequest("x".into()).to_string().contains("Bad Request"));
-        assert!(AppError::Unauthorized("x".into()).to_string().contains("Unauthorized"));
-        assert!(AppError::Internal("x".into()).to_string().contains("Internal"));
-        assert!(AppError::BlobNotFound("x".into()).to_string().contains("Blob Not Found"));
-        assert!(AppError::RateLimited("x".into()).to_string().contains("Rate Limited"));
-        assert!(AppError::QuotaExceeded("x".into()).to_string().contains("Quota Exceeded"));
+        assert!(AppError::BadRequest("x".into())
+            .to_string()
+            .contains("Bad Request"));
+        assert!(AppError::Unauthorized("x".into())
+            .to_string()
+            .contains("Unauthorized"));
+        assert!(AppError::Internal("x".into())
+            .to_string()
+            .contains("Internal"));
+        assert!(AppError::BlobNotFound("x".into())
+            .to_string()
+            .contains("Blob Not Found"));
+        assert!(AppError::RateLimited("x".into())
+            .to_string()
+            .contains("Rate Limited"));
+        assert!(AppError::QuotaExceeded("x".into())
+            .to_string()
+            .contains("Quota Exceeded"));
+        assert!(AppError::Conflict("x".into())
+            .to_string()
+            .contains("Conflict"));
     }
 
     #[tokio::test]
@@ -1093,7 +1370,10 @@ mod tests {
     #[test]
     fn parse_visibility_and_scope_accept_expected_values() {
         assert_eq!(parse_visibility(&None).unwrap(), VISIBILITY_PRIVATE);
-        assert_eq!(parse_visibility(&Some("org".into())).unwrap(), VISIBILITY_ORG);
+        assert_eq!(
+            parse_visibility(&Some("org".into())).unwrap(),
+            VISIBILITY_ORG
+        );
         assert_eq!(
             parse_visibility(&Some("account".into())).unwrap(),
             VISIBILITY_ACCOUNT
@@ -1101,7 +1381,10 @@ mod tests {
         assert!(parse_visibility(&Some("global".into())).is_err());
 
         assert_eq!(parse_scope(&None).unwrap(), RequestedScope::All);
-        assert_eq!(parse_scope(&Some("org".into())).unwrap(), RequestedScope::Org);
+        assert_eq!(
+            parse_scope(&Some("org".into())).unwrap(),
+            RequestedScope::Org
+        );
         assert!(parse_scope(&Some("everything".into())).is_err());
     }
 }

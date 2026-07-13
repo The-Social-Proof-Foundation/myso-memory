@@ -19,6 +19,7 @@ export const CAP_AGENT_UPDATE = 4096;
 export const CAP_AGENT_REGISTER = 8192;
 export const CAP_AI_SPEND = 16384;
 export const CAP_BUDGET_MANAGE = 32768;
+export const CAP_SOCIAL_GRAPH = 65536;
 
 /** Server error code when AI credit balance is depleted (HTTP 402). */
 export const AI_CREDIT_DEPLETED_CODE = "insufficient_ai_credits";

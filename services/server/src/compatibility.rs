@@ -94,6 +94,8 @@ fn feature_flags() -> BTreeMap<String, bool> {
         ("memory.orgAccessRequests.v1".to_string(), true),
         ("aiCredit.approvals.v1".to_string(), true),
         ("aiCredit.approverPath.v1".to_string(), true),
+        ("chainActions.ownerApprovals.v1".to_string(), true),
+        ("chainActions.registryOnly.v1".to_string(), true),
         ("org.roles.v1".to_string(), true),
         ("org.invitations.v1".to_string(), true),
         ("workflow.inbox.v1".to_string(), true),
@@ -115,22 +117,10 @@ fn deprecations() -> Vec<DeprecationNotice> {
             guidance: "Use x-mydata-session for relayer-managed MYDATA decrypt flows.".to_string(),
         },
         DeprecationNotice {
-            surface: "subAgent.approvalRequiredCaps".to_string(),
-            deprecated_since: "1.1.1".to_string(),
-            removal_api_version: "2.0.0".to_string(),
-            guidance: "Relayer does not enforce approval_required_caps in v1; use 0 for autonomous agents. On-chain social txs still abort if set.".to_string(),
-        },
-        DeprecationNotice {
             surface: "subAgent.maxActionSpend".to_string(),
             deprecated_since: "1.1.1".to_string(),
             removal_api_version: "2.0.0".to_string(),
             guidance: "Relayer does not enforce max_action_spend in v1; reserved for v2 spend policy.".to_string(),
-        },
-        DeprecationNotice {
-            surface: "social.ownerCoSignForCreates".to_string(),
-            deprecated_since: "1.1.1".to_string(),
-            removal_api_version: "2.0.0".to_string(),
-            guidance: "Owner HTTP co-sign applies to social delete routes only, not creates.".to_string(),
         },
     ]
 }

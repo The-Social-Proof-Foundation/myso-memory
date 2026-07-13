@@ -1,9 +1,10 @@
 use axum::http::HeaderMap;
 
 use crate::memory_contract::{
-    check_platform_scope, has_cap, org_type_label, CLASS_DELEGATED_AI,
-    CLASS_HUMAN, CLASS_ORGANIZATION, E_SUB_AGENT_EXPIRED, E_SUB_AGENT_INACTIVE_ANCESTOR, E_SUB_AGENT_MISSING_CAP,
-    E_SUB_AGENT_NOT_ACTIVE, MAX_AGENT_DEPTH, MAX_ORGANIZATIONS_PER_USER, ORG_TYPE_OTHER,
+    check_platform_scope, has_cap, org_type_label, CLASS_DELEGATED_AI, CLASS_HUMAN,
+    CLASS_ORGANIZATION, E_SUB_AGENT_EXPIRED, E_SUB_AGENT_INACTIVE_ANCESTOR,
+    E_SUB_AGENT_MISSING_CAP, E_SUB_AGENT_NOT_ACTIVE, MAX_AGENT_DEPTH, MAX_ORGANIZATIONS_PER_USER,
+    ORG_TYPE_OTHER,
 };
 use crate::social::SocialSubAgent;
 
@@ -75,11 +76,9 @@ impl std::fmt::Display for PolicyError {
                 required,
                 capability_label(*required)
             ),
-            PolicyError::SpendLimitExceeded { limit_mist } => write!(
-                f,
-                "action exceeds max_action_spend ({:?} MIST)",
-                limit_mist
-            ),
+            PolicyError::SpendLimitExceeded { limit_mist } => {
+                write!(f, "action exceeds max_action_spend ({:?} MIST)", limit_mist)
+            }
         }
     }
 }
@@ -197,9 +196,7 @@ mod tests {
     #[test]
     fn approval_required_caps_do_not_block_relayer_v1() {
         let agent = sample_agent(3, crate::memory_contract::CAP_MEMORY_WRITE as i64);
-        let input = RequestPolicyInput {
-            platform_id: None,
-        };
+        let input = RequestPolicyInput { platform_id: None };
         assert!(validate_agent_policy(
             &agent,
             &[],
@@ -213,9 +210,7 @@ mod tests {
     fn max_action_spend_does_not_block_relayer_v1() {
         let mut agent = sample_agent(crate::memory_contract::CAP_MEMORY_WRITE as i64, 0);
         agent.max_action_spend = Some(1);
-        let input = RequestPolicyInput {
-            platform_id: None,
-        };
+        let input = RequestPolicyInput { platform_id: None };
         assert!(validate_agent_policy(
             &agent,
             &[],

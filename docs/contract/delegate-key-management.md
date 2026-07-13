@@ -28,7 +28,9 @@ Only the MemoryAccount owner can register root-level sub-agents:
 ```typescript
 await registerSubAgent({
   packageId: "0x...",
+  memoryConfigId: "0x...", // shared MemoryConfig
   accountId: "0x...", // MemoryAccount object ID
+  organizationId: "0x...", // organization receiving this root agent
   publicKey: agent.publicKey,
   label: "Production Server",
   walletSigner,

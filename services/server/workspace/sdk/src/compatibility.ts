@@ -1,6 +1,6 @@
 import type { RelayerVersionMetadata } from "./types.js";
 
-export const MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION = "0.6.0";
+export const MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION = "0.7.0";
 export const SUPPORTED_RELAYER_API_MAJOR = 1;
 
 export class MemoryCompatibilityError extends Error {

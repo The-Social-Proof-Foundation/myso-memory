@@ -50,6 +50,40 @@ struct UsageRequest {
     tokens_out: Option<u64>,
     tool_id: Option<String>,
     model_id: Option<String>,
+    idempotency_key: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GatewayInferenceRequest<'a> {
+    owner: &'a str,
+    balance_id: &'a str,
+    memory_account_id: &'a str,
+    agent_object_id: &'a str,
+    model_id: &'a str,
+    system_prompt: Option<&'a str>,
+    prompt: &'a str,
+    max_tokens: u32,
+    idempotency_key: &'a str,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct GatewayInferenceResponse {
+    pub content: String,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub amount_mist: u64,
+    pub billing_state: String,
+    pub reservation_nonce: Option<u64>,
+    pub reserve_digest: Option<String>,
+    pub capture_digest: Option<String>,
+}
+
+fn oracle_post(client: &reqwest::Client, config: &Config, url: &str) -> reqwest::RequestBuilder {
+    let request = client.post(url);
+    match config.ai_credit_oracle_api_secret.as_deref() {
+        Some(secret) => request.header("x-ai-credit-oracle-secret", secret),
+        None => request,
+    }
 }
 
 fn ai_credit_enabled(config: &Config) -> bool {
@@ -81,13 +115,13 @@ async fn fetch_balance(
         config.social_server_url.trim_end_matches('/'),
         owner
     );
-    let resp = client.get(&url).send().await.map_err(|e| {
-        AppError::Internal(format!("ai-credit balance fetch failed: {}", e))
-    })?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("ai-credit balance fetch failed: {}", e)))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(AppError::AiCreditDepleted(
-            "no_ai_credit_balance".into(),
-        ));
+        return Err(AppError::AiCreditDepleted("no_ai_credit_balance".into()));
     }
     if !resp.status().is_success() {
         return Err(AppError::Internal(format!(
@@ -104,9 +138,10 @@ async fn fetch_balance(
     struct BalanceEnvelope {
         balance: BalanceRow,
     }
-    let envelope: BalanceEnvelope = resp.json().await.map_err(|e| {
-        AppError::Internal(format!("parse ai-credit balance: {}", e))
-    })?;
+    let envelope: BalanceEnvelope = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("parse ai-credit balance: {}", e)))?;
     Ok(AiCreditBalance {
         balance_id: envelope.balance.balance_id,
         memory_account_id: envelope.balance.memory_account_id,
@@ -122,8 +157,7 @@ async fn oracle_preflight(
         "{}/v1/ai-credit/preflight",
         config.ai_credit_oracle_url.trim_end_matches('/')
     );
-    let resp = client
-        .post(&url)
+    let resp = oracle_post(client, config, &url)
         .json(req)
         .send()
         .await
@@ -134,21 +168,21 @@ async fn oracle_preflight(
             resp.status()
         )));
     }
-    let body: PreflightResponse = resp.json().await.map_err(|e| {
-        AppError::Internal(format!("parse oracle preflight: {}", e))
-    })?;
+    let body: PreflightResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("parse oracle preflight: {}", e)))?;
     if body.allowed {
         Ok(())
-    } else if body.approval_required
-        || body.reason.as_deref() == Some(APPROVAL_REQUIRED_REASON)
-    {
+    } else if body.approval_required || body.reason.as_deref() == Some(APPROVAL_REQUIRED_REASON) {
         Err(AppError::AiCreditApprovalRequired {
             threshold_mist: body.approval_threshold_mist,
             estimated_mist: body.estimated_mist,
         })
     } else {
         Err(AppError::AiCreditDepleted(
-            body.reason.unwrap_or_else(|| "insufficient_ai_credits".into()),
+            body.reason
+                .unwrap_or_else(|| "insufficient_ai_balance".into()),
         ))
     }
 }
@@ -177,9 +211,9 @@ async fn oracle_record_usage(
         tokens_out: Some(tokens_out),
         tool_id: None,
         model_id: model_id.map(String::from),
+        idempotency_key: uuid::Uuid::new_v4().to_string(),
     };
-    let resp = client
-        .post(&url)
+    let resp = oracle_post(client, config, &url)
         .json(&req)
         .send()
         .await
@@ -187,16 +221,10 @@ async fn oracle_record_usage(
     if resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
         let body_text = resp.text().await.unwrap_or_default();
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
-            if v.get("code").and_then(|c| c.as_str())
-                == Some("ai_credit_approval_required")
-            {
+            if v.get("code").and_then(|c| c.as_str()) == Some("ai_credit_approval_required") {
                 return Err(AppError::AiCreditApprovalRequired {
-                    threshold_mist: v
-                        .get("threshold_mist")
-                        .and_then(|x| x.as_u64()),
-                    estimated_mist: v
-                        .get("estimated_mist")
-                        .and_then(|x| x.as_u64()),
+                    threshold_mist: v.get("threshold_mist").and_then(|x| x.as_u64()),
+                    estimated_mist: v.get("estimated_mist").and_then(|x| x.as_u64()),
                 });
             }
         }
@@ -208,7 +236,7 @@ async fn oracle_record_usage(
         });
     }
     if resp.status() == reqwest::StatusCode::BAD_REQUEST {
-        return Err(AppError::AiCreditDepleted("insufficient_ai_credits".into()));
+        return Err(AppError::AiCreditDepleted("insufficient_ai_balance".into()));
     }
     if !resp.status().is_success() {
         return Err(AppError::Internal(format!(
@@ -221,6 +249,62 @@ async fn oracle_record_usage(
 
 fn amount_mist_from_usage(_usage_kind: u8, tokens_in: u64, tokens_out: u64) -> u64 {
     tokens_in.saturating_add(tokens_out)
+}
+
+/// Run a bounded chat completion through the reservation-owning gateway. The
+/// gateway finalizes an on-chain MIST reservation before contacting OpenRouter.
+pub async fn run_gateway_inference(
+    state: &Arc<AppState>,
+    auth: &AuthInfo,
+    model_id: &str,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    max_tokens: u32,
+    idempotency_key: &str,
+) -> Result<GatewayInferenceResponse, AppError> {
+    require_ai_spend_capability(auth)?;
+    let balance = fetch_balance(&state.http_client, &state.config, &auth.owner).await?;
+    let url = format!(
+        "{}/v1/ai-credit/inference",
+        state.config.ai_credit_oracle_url.trim_end_matches('/')
+    );
+    let response = oracle_post(&state.http_client, &state.config, &url)
+        .json(&GatewayInferenceRequest {
+            owner: &auth.owner,
+            balance_id: &balance.balance_id,
+            memory_account_id: &balance.memory_account_id,
+            agent_object_id: &auth.agent_object_id,
+            model_id,
+            system_prompt,
+            prompt,
+            max_tokens,
+            idempotency_key,
+        })
+        .send()
+        .await
+        .map_err(|error| AppError::Internal(format!("AI gateway unavailable: {error}")))?;
+
+    if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+        return Err(AppError::AiCreditDepleted(
+            "insufficient_ai_balance_or_approval".into(),
+        ));
+    }
+    if response.status() == reqwest::StatusCode::CONFLICT {
+        return Err(AppError::Internal(
+            "AI inference with this idempotency key is still reconciling".into(),
+        ));
+    }
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(AppError::Internal(format!(
+            "AI gateway inference failed ({status}): {detail}"
+        )));
+    }
+    response
+        .json::<GatewayInferenceResponse>()
+        .await
+        .map_err(|error| AppError::Internal(format!("parse AI gateway response: {error}")))
 }
 
 pub async fn preflight_analyze(

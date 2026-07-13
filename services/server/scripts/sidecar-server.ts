@@ -35,6 +35,10 @@ const FILE_STORAGE_NETWORK: "mainnet" | "testnet" =
 const MYSO_RPC_URL =
     process.env.MYSO_RPC_URL ||
     getJsonRpcFullnodeUrl(FILE_STORAGE_NETWORK);
+const ALLOW_LEGACY_SOCIAL_KEY_FORWARDING =
+    /^(1|true)$/i.test(process.env.ALLOW_LEGACY_SOCIAL_KEY_FORWARDING || "");
+const ALLOW_LEGACY_DELEGATE_KEY_FORWARDING =
+    /^(1|true)$/i.test(process.env.ALLOW_LEGACY_DELEGATE_KEY_FORWARDING || "");
 
 const mysoClient = new MySoJsonRpcClient({
     url: MYSO_RPC_URL,
@@ -160,10 +164,22 @@ const ENOKI_FALLBACK_TO_DIRECT_SIGN = (() => {
     const raw = (process.env.ENOKI_FALLBACK_TO_DIRECT_SIGN || "true").trim().toLowerCase();
     return raw !== "0" && raw !== "false" && raw !== "no";
 })();
+const LOCAL_SPONSOR_ENABLED =
+    MYSO_NETWORK_RAW === "localnet" &&
+    /^(1|true)$/i.test(process.env.LOCAL_SPONSOR_ENABLED || "");
+const LOCAL_SPONSOR_GAS_BUDGET = process.env.LOCAL_SPONSOR_GAS_BUDGET || "100000000";
+const LOCAL_SPONSOR_TTL_MS = 5 * 60 * 1000;
 
 type EnokiDataWrapper<T> = { data: T };
 type EnokiSponsorResponse = { bytes: string; digest: string };
 type EnokiExecuteResponse = { digest: string };
+type LocalSponsoredTransaction = {
+    bytes: string;
+    sponsorSignature: string;
+    expiresAtMs: number;
+};
+const localSponsoredTransactions = new Map<string, LocalSponsoredTransaction>();
+let localSponsorKeyIndex = 0;
 const signerUploadQueues = new Map<string, Promise<void>>();
 let uploadRelayTipAddressCache: string | null | undefined = undefined;
 
@@ -219,6 +235,72 @@ async function callEnoki<T>(path: string, payload: unknown): Promise<T> {
 
     const parsed = JSON.parse(text) as EnokiDataWrapper<T>;
     return parsed.data;
+}
+
+function pruneLocalSponsoredTransactions(now = Date.now()): void {
+    for (const [digest, pending] of localSponsoredTransactions) {
+        if (pending.expiresAtMs <= now) localSponsoredTransactions.delete(digest);
+    }
+}
+
+async function createLocalSponsoredTransaction(
+    transactionBlockKindBytes: string,
+    sender: string,
+): Promise<EnokiSponsorResponse> {
+    if (!LOCAL_SPONSOR_ENABLED || SERVER_MYSO_PRIVATE_KEYS.length === 0) {
+        throw new Error("Local sponsorship is not configured");
+    }
+    if (!/^0x[0-9a-fA-F]{1,64}$/.test(sender)) {
+        throw new Error("sender must be a MySo address");
+    }
+    const kindBytes = Buffer.from(transactionBlockKindBytes, "base64");
+    if (kindBytes.length < 10 || kindBytes.length > 128 * 1024) {
+        throw new Error("transactionBlockKindBytes is outside the allowed size");
+    }
+    pruneLocalSponsoredTransactions();
+    if (localSponsoredTransactions.size >= 1_000) {
+        throw new Error("Local sponsorship queue is full");
+    }
+
+    const keyIndex = localSponsorKeyIndex++ % SERVER_MYSO_PRIVATE_KEYS.length;
+    const sponsor = keypairFromPool(keyIndex);
+    const tx = Transaction.fromKind(new Uint8Array(kindBytes));
+    tx.setSenderIfNotSet(sender);
+    if (tx.getData().sender?.toLowerCase() !== sender.toLowerCase()) {
+        throw new Error("transaction sender does not match the sponsorship request");
+    }
+    tx.setGasOwner(sponsor.toMySoAddress());
+    tx.setGasBudgetIfNotSet(LOCAL_SPONSOR_GAS_BUDGET);
+    const bytes = await tx.build({ client: mysoClient as any });
+    const digest = await tx.getDigest({ client: mysoClient as any });
+    const sponsorSignature = (await sponsor.signTransaction(bytes)).signature;
+    const encodedBytes = Buffer.from(bytes).toString("base64");
+    localSponsoredTransactions.set(digest, {
+        bytes: encodedBytes,
+        sponsorSignature,
+        expiresAtMs: Date.now() + LOCAL_SPONSOR_TTL_MS,
+    });
+    return { bytes: encodedBytes, digest };
+}
+
+async function executeLocalSponsoredTransaction(
+    digest: string,
+    senderSignature: string,
+): Promise<EnokiExecuteResponse> {
+    pruneLocalSponsoredTransactions();
+    const pending = localSponsoredTransactions.get(digest);
+    if (!pending) throw new Error("Unknown or expired local sponsored transaction");
+    // Delete before awaiting RPC so two concurrent submissions cannot replay the same gas coin.
+    localSponsoredTransactions.delete(digest);
+    const executed = await mysoClient.executeTransactionBlock({
+        transactionBlock: pending.bytes,
+        signature: [senderSignature, pending.sponsorSignature],
+        options: { showEffects: true },
+    });
+    if (executed.digest !== digest) {
+        throw new Error("Fullnode returned an unexpected transaction digest");
+    }
+    return { digest: executed.digest };
 }
 
 async function executeWithEnokiSponsor(tx: Transaction, signer: Ed25519Keypair, allowedAddresses?: string[]): Promise<string> {
@@ -406,6 +488,9 @@ async function resolveSessionKey(
 
     const privateKey = req.headers["x-delegate-key"] as string | undefined;
     if (!privateKey) return null;
+    if (!ALLOW_LEGACY_DELEGATE_KEY_FORWARDING) {
+        throw new Error("Legacy x-delegate-key transport is disabled");
+    }
 
     let keypair: Ed25519Keypair;
     if (privateKey.startsWith("mysoprivkey")) {
@@ -534,7 +619,9 @@ app.post("/mydata/decrypt", async (req, res) => {
         const sessionKey = await resolveSessionKey(req, packageId);
         if (!sessionKey) {
             return res.status(400).json({
-                error: "Missing credential: provide x-mydata-session (preferred) or x-delegate-key header",
+                error: ALLOW_LEGACY_DELEGATE_KEY_FORWARDING
+                    ? "Missing credential: provide x-mydata-session or the enabled legacy x-delegate-key header"
+                    : "Missing credential: provide x-mydata-session",
             });
         }
 
@@ -616,7 +703,9 @@ app.post("/mydata/decrypt-batch", express.json({ limit: "8mb" }), async (req, re
         const sessionKey = await resolveSessionKey(req, packageId);
         if (!sessionKey) {
             return res.status(400).json({
-                error: "Missing credential: provide x-mydata-session (preferred) or x-delegate-key header",
+                error: ALLOW_LEGACY_DELEGATE_KEY_FORWARDING
+                    ? "Missing credential: provide x-mydata-session or the enabled legacy x-delegate-key header"
+                    : "Missing credential: provide x-mydata-session",
             });
         }
 
@@ -1120,6 +1209,9 @@ app.post("/memory/ensure-vault", async (req, res) => {
 // Social actions — PTB build + execute for sub-agent feed interactions
 // ============================================================
 app.post("/social/build", async (req, res) => {
+    if (!ALLOW_LEGACY_SOCIAL_KEY_FORWARDING) {
+        return res.status(410).json({ error: "Legacy social build route is disabled" });
+    }
     try {
         const { buildSocialTransaction } = await import("./social-execute.js");
         const bytes = await buildSocialTransaction(req.body);
@@ -1132,7 +1224,31 @@ app.post("/social/build", async (req, res) => {
     }
 });
 
+app.post("/social/prepare-registered", async (req, res) => {
+    try {
+        const { prepareRegisteredSocialAction } = await import("./social-execute.js");
+        const prepared = await prepareRegisteredSocialAction(req.body);
+        res.json(prepared);
+    } catch (err: any) {
+        console.error(`[social/prepare-registered] error: ${err.message || err}`);
+        res.status(400).json({ error: err.message || String(err) });
+    }
+});
+
+app.post("/social/verify-owner-approval", async (req, res) => {
+    try {
+        const { verifyOwnerApproval } = await import("./social-execute.js");
+        res.json(await verifyOwnerApproval(String(req.body?.message ?? ""), String(req.body?.signature ?? "")));
+    } catch (err: any) {
+        console.error(`[social/verify-owner-approval] error: ${err.message || err}`);
+        res.status(400).json({ error: "Invalid owner wallet approval" });
+    }
+});
+
 app.post("/social/execute", async (req, res) => {
+    if (!ALLOW_LEGACY_SOCIAL_KEY_FORWARDING) {
+        return res.status(410).json({ error: "Legacy social key-forwarding route is disabled" });
+    }
     try {
         const { executeSocialAction } = await import("./social-execute.js");
         const result = await executeSocialAction(req.body);
@@ -1153,19 +1269,20 @@ app.post("/sponsor", async (req, res) => {
         if (!transactionBlockKindBytes || !sender) {
             return res.status(400).json({ error: "Missing required fields: transactionBlockKindBytes, sender" });
         }
-        if (!enokiApiKey) {
-            return res.status(503).json({ error: "Enoki sponsorship is not configured (ENOKI_API_KEY missing)" });
+        if (!LOCAL_SPONSOR_ENABLED && !enokiApiKey) {
+            return res.status(503).json({ error: "Transaction sponsorship is not configured" });
         }
-
         // LOW-18: Redact full sender address (PII / deanonymisation) — log only
         // a short prefix for correlation. Never log the full digest here either.
         const senderPrefix = typeof sender === "string" ? sender.slice(0, 10) : "unknown";
         console.log(`[sponsor] creating sponsored tx for sender=${senderPrefix}...`);
-        const sponsored = await callEnoki<EnokiSponsorResponse>("/transaction-blocks/sponsor", {
-            network: enokiNetwork,
-            transactionBlockKindBytes,
-            sender,
-        });
+        const sponsored = LOCAL_SPONSOR_ENABLED
+            ? await createLocalSponsoredTransaction(transactionBlockKindBytes, sender)
+            : await callEnoki<EnokiSponsorResponse>("/transaction-blocks/sponsor", {
+                network: enokiNetwork,
+                transactionBlockKindBytes,
+                sender,
+            });
 
         console.log(`[sponsor] sponsored tx created (digest_len=${sponsored.digest.length})`);
         res.json(sponsored); // { bytes, digest }
@@ -1185,21 +1302,21 @@ app.post("/sponsor/execute", async (req, res) => {
         if (!digest || !signature) {
             return res.status(400).json({ error: "Missing required fields: digest, signature" });
         }
-        if (!enokiApiKey) {
-            return res.status(503).json({ error: "Enoki sponsorship is not configured (ENOKI_API_KEY missing)" });
+        if (!LOCAL_SPONSOR_ENABLED && !enokiApiKey) {
+            return res.status(503).json({ error: "Transaction sponsorship is not configured" });
         }
-
         // LOW-15: Percent-encode digest before path interpolation. The digest is
         // attacker-controlled when the sidecar is reached directly (no auth,
         // S1 in audit) or via the Rust proxy which validates base58 but the
         // sidecar must not rely on that. encodeURIComponent neutralises any
         // path traversal (`..`), query injection (`?`), or fragment (`#`)
         // payloads in the digest segment.
-        const encodedDigest = encodeURIComponent(digest);
-        const executed = await callEnoki<EnokiExecuteResponse>(
-            `/transaction-blocks/sponsor/${encodedDigest}`,
-            { digest, signature }
-        );
+        const executed = LOCAL_SPONSOR_ENABLED
+            ? await executeLocalSponsoredTransaction(digest, signature)
+            : await callEnoki<EnokiExecuteResponse>(
+                `/transaction-blocks/sponsor/${encodeURIComponent(digest)}`,
+                { digest, signature }
+            );
 
         // LOW-18: Redact digest from console logs — it's a high-cardinality
         // value that ties log lines to individual user transactions. Log only
@@ -1222,6 +1339,7 @@ app.listen(PORT, HOST, () => {
     console.log(JSON.stringify({
         event: "sidecar_ready",
         host: HOST,
+        sponsorMode: LOCAL_SPONSOR_ENABLED ? "local-key-pool" : enokiApiKey ? "enoki" : "disabled",
         port: PORT,
         pid: process.pid,
     }));

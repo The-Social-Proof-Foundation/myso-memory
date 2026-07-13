@@ -120,7 +120,9 @@ pub async fn authorize_write_visibility(
                 ));
             };
             // Fail closed: an unresolved grant must never allow an org-visible write.
-            let perms = resolve_org_memory_perms(state, auth).await?.unwrap_or_default();
+            let perms = resolve_org_memory_perms(state, auth)
+                .await?
+                .unwrap_or_default();
             if !perms.writer {
                 // Best-effort: notify the org admin via workflow inbox so they can
                 // grant `OrgMemoryWriter`. Producer failures never block the 403.
@@ -171,9 +173,9 @@ pub async fn resolve_search_scope(
                 None
             } else {
                 match resolve_org_memory_perms(state, auth).await {
-                    Ok(perms) => perms.filter(|p| p.reader).map(|_| {
-                        auth.organization_id.clone().expect("org id checked above")
-                    }),
+                    Ok(perms) => perms
+                        .filter(|p| p.reader)
+                        .map(|_| auth.organization_id.clone().expect("org id checked above")),
                     Err(err) => {
                         tracing::warn!(error = %err, "org perms lookup failed; degrading recall scope");
                         degraded = true;

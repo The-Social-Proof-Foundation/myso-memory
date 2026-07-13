@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::{Extension, Json};
@@ -23,6 +23,425 @@ pub(crate) const ANALYZE_MAX_OUTPUT_TOKENS: u32 = 256;
 const MAX_SPONSORED_SIGNATURE_BYTES: usize = 2048;
 
 pub(crate) const MAX_REMEMBER_TEXT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentContextResponse {
+    pub owner: String,
+    pub memory_account_id: String,
+    pub agent_object_id: String,
+    pub derived_address: String,
+    pub label: String,
+    pub capabilities: u64,
+    pub approval_required_capabilities: u64,
+    pub max_action_spend_mist: Option<u64>,
+    pub platform_scope: Option<String>,
+    pub organization_id: Option<String>,
+    pub network: String,
+    pub rpc_url: String,
+    pub package_id: String,
+    pub social_chain: Option<AgentContextSocialChain>,
+    pub permitted_registry_actions: Vec<&'static str>,
+    pub chain: AgentContextChainTruth,
+    pub indexer: AgentContextIndexerState,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentContextSocialChain {
+    pub package_id: String,
+    pub username_registry_id: String,
+    pub platform_registry_id: String,
+    pub platform_object_id: String,
+    pub block_list_registry_id: String,
+    pub post_config_id: String,
+    pub memory_config_id: String,
+    pub mydata_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub social_graph_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_package_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_version_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_namespace_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_group_manager_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub messaging_group_leaver_id: String,
+    pub clock_id: &'static str,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentContextChainTruth {
+    pub source: &'static str,
+    pub authenticated: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentContextIndexerState {
+    pub source: &'static str,
+    pub status: &'static str,
+    pub organization_enrichment_present: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingInboxQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub group_id: Option<String>,
+    pub after_created_at_ms: Option<i64>,
+    pub after_seq: Option<i64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingWaitQuery {
+    pub timeout_ms: Option<u64>,
+    pub group_id: Option<String>,
+    pub after_created_at_ms: Option<i64>,
+    pub after_seq: Option<i64>,
+}
+
+async fn fetch_agent_inbox(
+    state: &AppState,
+    derived_address: &str,
+    limit: usize,
+    offset: usize,
+    group_id: Option<&str>,
+    after_created_at_ms: Option<i64>,
+    after_seq: Option<i64>,
+) -> Result<Vec<serde_json::Value>, AppError> {
+    let url = format!(
+        "{}/wallets/{}/messages?limit={}&offset={}",
+        state.config.social_server_url.trim_end_matches('/'),
+        derived_address,
+        limit.clamp(1, 100),
+        offset,
+    );
+    let response =
+        state.http_client.get(url).send().await.map_err(|error| {
+            AppError::Internal(format!("messaging inbox lookup failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "messaging inbox lookup returned {}",
+            response.status()
+        )));
+    }
+    let values: Vec<serde_json::Value> = response.json().await.map_err(|error| {
+        AppError::Internal(format!("messaging inbox response invalid: {error}"))
+    })?;
+    Ok(values
+        .into_iter()
+        .filter(|message| {
+            let recipient = message.get("recipient").and_then(|value| value.as_str());
+            let matches_recipient = recipient.is_some_and(|recipient| {
+                crate::memory_contract::addresses_equal(recipient, derived_address)
+            });
+            let matches_group = group_id.is_none_or(|expected| {
+                message.get("groupId").and_then(|value| value.as_str()) == Some(expected)
+            });
+            let matches_time = after_created_at_ms.is_none_or(|after| {
+                message
+                    .get("createdAtMs")
+                    .and_then(|value| value.as_i64())
+                    .is_some_and(|created| created > after)
+            });
+            let matches_seq = after_seq.is_none_or(|after| {
+                message
+                    .get("seq")
+                    .and_then(|value| value.as_i64())
+                    .is_some_and(|seq| seq > after)
+            });
+            matches_recipient && matches_group && matches_time && matches_seq
+        })
+        .collect())
+}
+
+pub async fn messaging_inbox(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Query(query): Query<MessagingInboxQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if query.after_seq.is_some() && query.group_id.is_none() {
+        return Err(AppError::BadRequest("afterSeq requires groupId".into()));
+    }
+    let messages = fetch_agent_inbox(
+        &state,
+        &auth.derived_address,
+        query.limit.unwrap_or(50),
+        query.offset.unwrap_or(0),
+        query.group_id.as_deref(),
+        query.after_created_at_ms,
+        query.after_seq,
+    )
+    .await?;
+    Ok(Json(serde_json::json!({
+        "agentAddress": auth.derived_address,
+        "messages": messages,
+    })))
+}
+
+pub async fn messaging_wait(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Query(query): Query<MessagingWaitQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if query.after_seq.is_some() && query.group_id.is_none() {
+        return Err(AppError::BadRequest("afterSeq requires groupId".into()));
+    }
+    let timeout_ms = query.timeout_ms.unwrap_or(15_000).clamp(250, 20_000);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let messages = fetch_agent_inbox(
+            &state,
+            &auth.derived_address,
+            100,
+            0,
+            query.group_id.as_deref(),
+            query.after_created_at_ms,
+            query.after_seq,
+        )
+        .await?;
+        if !messages.is_empty() {
+            return Ok(Json(serde_json::json!({
+                "agentAddress": auth.derived_address,
+                "timedOut": false,
+                "messages": messages,
+            })));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(Json(serde_json::json!({
+                "agentAddress": auth.derived_address,
+                "timedOut": true,
+                "messages": [],
+            })));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+pub async fn organization_control(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Path(organization_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let summary = crate::org_summary::fetch_org_summary(
+        &state.http_client,
+        &state.org_summaries,
+        &state.config.social_server_url,
+        state.config.internal_sync_secret.as_deref(),
+        &organization_id,
+    )
+    .await?
+    .ok_or_else(|| AppError::BadRequest("organization is not indexed".into()))?;
+    let principal_owns =
+        crate::memory_contract::addresses_equal(&summary.principal_owner, &auth.owner);
+    let agent_belongs = auth
+        .organization_id
+        .as_deref()
+        .is_some_and(|current| crate::memory_contract::addresses_equal(current, &organization_id));
+    if !principal_owns && !agent_belongs {
+        return Err(AppError::Forbidden(
+            "organization control is outside the authenticated principal".into(),
+        ));
+    }
+    let url = format!(
+        "{}/internal/organizations/{}/control",
+        state.config.social_server_url.trim_end_matches('/'),
+        organization_id,
+    );
+    let mut request = state.http_client.get(url);
+    if let Some(secret) = state.config.internal_sync_secret.as_deref() {
+        request = request.header("x-internal-sync-secret", secret);
+    }
+    let response = request.send().await.map_err(|error| {
+        AppError::Internal(format!("organization control lookup failed: {error}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "organization control lookup returned {}",
+            response.status()
+        )));
+    }
+    let body = response.json().await.map_err(|error| {
+        AppError::Internal(format!("organization control response invalid: {error}"))
+    })?;
+    Ok(Json(body))
+}
+
+/// Return the complete authenticated execution context in one request. Identity
+/// and capabilities were verified against the on-chain SubAgent by auth
+/// middleware; organization data is indexed enrichment and is labeled as such.
+pub async fn agent_context(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+) -> Json<AgentContextResponse> {
+    use crate::memory_contract::{
+        has_cap, CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_AI_SPEND, CAP_COMMENT,
+        CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MESSAGE_SEND, CAP_MYDATA_READ, CAP_POST_PUBLISH,
+        CAP_REACT, CAP_SOCIAL_GRAPH,
+    };
+
+    let mut actions = Vec::new();
+    if has_cap(auth.capabilities, CAP_MEMORY_READ) {
+        actions.extend(["memory.recall.v1", "memory.ask.v1"]);
+    }
+    if has_cap(auth.capabilities, CAP_MEMORY_WRITE) {
+        actions.push("memory.remember.v1");
+    }
+    if has_cap(auth.capabilities, CAP_MYDATA_READ) {
+        actions.extend(["mydata.search.v1", "mydata.check_access.v1"]);
+    }
+    if has_cap(auth.capabilities, CAP_POST_PUBLISH) {
+        actions.extend([
+            "social.create_post.v1",
+            "social.edit_post.v1",
+            "social.create_repost.v1",
+            "social.remove_repost.v1",
+            "social.delete_post.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_COMMENT) {
+        actions.extend([
+            "social.create_comment.v1",
+            "social.edit_comment.v1",
+            "social.delete_comment.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_REACT) {
+        actions.extend([
+            "social.react_to_post.v1",
+            "social.remove_post_reaction.v1",
+            "social.react_to_comment.v1",
+            "social.remove_comment_reaction.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_SOCIAL_GRAPH)
+        && !state.config.social_chain.social_graph_id.is_empty()
+    {
+        actions.extend([
+            "social.follow_profile.v1",
+            "social.unfollow_profile.v1",
+            "social.block_profile.v1",
+            "social.unblock_profile.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_MESSAGE_SEND)
+        && !state.config.social_chain.messaging_package_id.is_empty()
+        && !state.config.social_chain.messaging_version_id.is_empty()
+        && !state.config.social_chain.messaging_config_id.is_empty()
+    {
+        actions.push("messaging.send_message.v1");
+        if !state.config.social_chain.messaging_namespace_id.is_empty()
+            && !state
+                .config
+                .social_chain
+                .messaging_group_manager_id
+                .is_empty()
+            && !state
+                .config
+                .social_chain
+                .messaging_group_leaver_id
+                .is_empty()
+        {
+            actions.push("messaging.create_group.v1");
+        }
+    }
+    if has_cap(auth.capabilities, CAP_MEMORY_READ) {
+        actions.extend([
+            "organization.accept_invitation.v1",
+            "organization.decline_invitation.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_AGENT_REGISTER) {
+        actions.extend([
+            "organization.create.v1",
+            "agent.register_agent.v1",
+            "agent.register_child.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_AGENT_UPDATE) {
+        actions.extend([
+            "organization.update_metadata.v1",
+            "organization.update_category.v1",
+            "organization.deactivate.v1",
+            "organization.ensure_memory_group.v1",
+            "organization.define_role.v1",
+            "organization.assign_role.v1",
+            "organization.revoke_role.v1",
+            "organization.create_invitation.v1",
+            "agent.update_child.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_AGENT_REVOKE) {
+        actions.extend(["agent.deactivate_child.v1", "agent.revoke_child.v1"]);
+    }
+    if has_cap(auth.capabilities, CAP_AI_SPEND) {
+        actions.extend(["ai.estimate_spend.v1", "ai.run_inference.v1"]);
+    }
+
+    let package_id = crate::memory_contract::normalize_object_id(&state.config.package_id);
+    let social_chain = state
+        .config
+        .social_chain
+        .is_configured()
+        .then(|| AgentContextSocialChain {
+            package_id: package_id.clone(),
+            username_registry_id: state.config.social_chain.username_registry_id.clone(),
+            platform_registry_id: state.config.social_chain.platform_registry_id.clone(),
+            platform_object_id: state.config.social_chain.platform_object_id.clone(),
+            block_list_registry_id: state.config.social_chain.block_list_registry_id.clone(),
+            post_config_id: state.config.social_chain.post_config_id.clone(),
+            memory_config_id: state.config.social_chain.memory_config_id.clone(),
+            mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
+            social_graph_id: state.config.social_chain.social_graph_id.clone(),
+            messaging_package_id: state.config.social_chain.messaging_package_id.clone(),
+            messaging_version_id: state.config.social_chain.messaging_version_id.clone(),
+            messaging_config_id: state.config.social_chain.messaging_config_id.clone(),
+            messaging_namespace_id: state.config.social_chain.messaging_namespace_id.clone(),
+            messaging_group_manager_id: state
+                .config
+                .social_chain
+                .messaging_group_manager_id
+                .clone(),
+            messaging_group_leaver_id: state.config.social_chain.messaging_group_leaver_id.clone(),
+            clock_id: "0x6",
+        });
+
+    Json(AgentContextResponse {
+        owner: auth.owner,
+        memory_account_id: auth.account_id,
+        agent_object_id: auth.agent_object_id,
+        derived_address: auth.derived_address,
+        label: auth.label,
+        capabilities: auth.capabilities,
+        approval_required_capabilities: auth.approval_required_caps,
+        max_action_spend_mist: auth.max_action_spend,
+        platform_scope: auth.platform_scope,
+        organization_id: auth.organization_id.clone(),
+        network: state.config.myso_network.clone(),
+        rpc_url: state.config.myso_rpc_url.clone(),
+        package_id,
+        social_chain,
+        permitted_registry_actions: actions,
+        chain: AgentContextChainTruth {
+            source: "authenticated_sub_agent",
+            authenticated: true,
+        },
+        indexer: AgentContextIndexerState {
+            source: "social_indexer",
+            status: "available",
+            organization_enrichment_present: auth.organization_id.is_some(),
+        },
+    })
+}
 
 pub(crate) fn resolve_llm_model(config: &Config, model_id: Option<&str>) -> String {
     model_id
@@ -197,13 +616,7 @@ pub async fn remember(
     let (visibility, org_id) =
         crate::org_perms::authorize_write_visibility(&state, &auth, &body.visibility).await?;
 
-    let job_id = jobs::create_remember_job(
-        &state,
-        owner,
-        agent_object_id,
-        &label_str,
-    )
-    .await?;
+    let job_id = jobs::create_remember_job(&state, owner, agent_object_id, &label_str).await?;
 
     let _span = observability::remember_job_span(&job_id, agent_object_id, &auth.label);
     jobs::spawn_remember_job(
@@ -384,10 +797,7 @@ pub async fn recall(
     // MED-3 fix: Cap limit to prevent unbounded DB scans / memory use.
     // Without this, an attacker could send limit=999999 to scan the entire DB.
     let limit = body.limit.min(100);
-    let weights = body
-        .scoring_weights
-        .clone()
-        .unwrap_or_default();
+    let weights = body.scoring_weights.clone().unwrap_or_default();
     let _rank_span = observability::recall_rank_span(limit);
 
     let requested_scope = crate::types::parse_scope(&body.scope)?;
@@ -428,118 +838,115 @@ pub async fn recall(
     // Step 3: Download + MYDATA decrypt all results concurrently
     let db = &state.db;
     let recall_organization_id = search_scope.organization_id.clone();
-    let recall_org_memory_group_id = resolve_org_memory_group_id(
-        &state,
-        recall_organization_id.as_deref(),
-    )
-    .await;
-    let tasks: Vec<_> = hits_to_fetch
-        .iter()
-        .map(|hit| {
-            let http_client = state.http_client.clone();
-            let aggregator_url = state.config.file_storage_aggregator_url.clone();
-            let sidecar_url = state.config.sidecar_url.clone();
-            let sidecar_secret = state.config.sidecar_secret.clone();
-            let blob_id = hit.blob_id.clone();
-            let distance = hit.distance;
-            let score = hit.score;
-            let hit_visibility = hit.visibility;
-            let hit_source_agent = hit.source_agent_object_id.clone();
-            let hit_importance = hit.importance;
-            let hit_created_at = hit.created_at;
-            let credential = credential.clone();
-            let package_id = state.config.package_id.clone();
-            let account_id = auth.account_id.clone();
-            let platform_scope = auth.platform_scope.clone();
-            let platform_id = auth.platform_id.clone();
-            let owner_for_cleanup = owner.clone();
-            let owner_for_decrypt = owner.clone();
-            let hit_organization_id = if hit_visibility == crate::types::VISIBILITY_ORG {
-                recall_organization_id.clone()
-            } else {
-                None
-            };
-            let hit_org_memory_group_id = if hit_visibility == crate::types::VISIBILITY_ORG {
-                recall_org_memory_group_id.clone()
-            } else {
-                None
-            };
-            async move {
-                tracing::debug!(
-                    blob_id = %blob_id,
-                    importance = hit_importance,
-                    created_at = ?hit_created_at,
-                    "recall decrypt candidate"
-                );
-                let encrypted_data = match file_storage::download_blob(
-                    &http_client,
-                    &aggregator_url,
-                    &blob_id,
-                ).await {
-                    Ok(data) => data,
-                    Err(AppError::BlobNotFound(msg)) => {
-                        // Blob expired on File Storage — clean up from DB reactively
-                        tracing::warn!("Blob expired, cleaning up: {}", msg);
-                        cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
-                        return None;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to download blob {}: {}", blob_id, e);
-                        return None;
-                    }
+    let recall_org_memory_group_id =
+        resolve_org_memory_group_id(&state, recall_organization_id.as_deref()).await;
+    let tasks: Vec<_> =
+        hits_to_fetch
+            .iter()
+            .map(|hit| {
+                let http_client = state.http_client.clone();
+                let aggregator_url = state.config.file_storage_aggregator_url.clone();
+                let sidecar_url = state.config.sidecar_url.clone();
+                let sidecar_secret = state.config.sidecar_secret.clone();
+                let blob_id = hit.blob_id.clone();
+                let distance = hit.distance;
+                let score = hit.score;
+                let hit_visibility = hit.visibility;
+                let hit_source_agent = hit.source_agent_object_id.clone();
+                let hit_importance = hit.importance;
+                let hit_created_at = hit.created_at;
+                let credential = credential.clone();
+                let package_id = state.config.package_id.clone();
+                let account_id = auth.account_id.clone();
+                let platform_scope = auth.platform_scope.clone();
+                let platform_id = auth.platform_id.clone();
+                let owner_for_cleanup = owner.clone();
+                let owner_for_decrypt = owner.clone();
+                let hit_organization_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                    recall_organization_id.clone()
+                } else {
+                    None
                 };
-                // Decrypt using MYDATA (via sidecar HTTP)
-                match mydata::mydata_decrypt(
-                    &http_client,
-                    &sidecar_url,
-                    sidecar_secret.as_deref(),
-                    &encrypted_data,
-                    &credential,
-                    &package_id,
-                    &account_id,
-                    platform_id.as_deref(),
-                    platform_scope.as_deref(),
-                    hit_visibility,
-                    &owner_for_decrypt,
-                    hit_organization_id.as_deref(),
-                    hit_org_memory_group_id.as_deref(),
-                )
-                .await
-                {
-                    Ok(plaintext) => match String::from_utf8(plaintext) {
-                        Ok(text) => Some(RecallResult {
-                            blob_id,
-                            text,
-                            distance,
-                            score,
-                            visibility: Some(hit_visibility),
-                            source_agent_id: hit_source_agent,
-                        }),
+                let hit_org_memory_group_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                    recall_org_memory_group_id.clone()
+                } else {
+                    None
+                };
+                async move {
+                    tracing::debug!(
+                        blob_id = %blob_id,
+                        importance = hit_importance,
+                        created_at = ?hit_created_at,
+                        "recall decrypt candidate"
+                    );
+                    let encrypted_data =
+                        match file_storage::download_blob(&http_client, &aggregator_url, &blob_id)
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(AppError::BlobNotFound(msg)) => {
+                                // Blob expired on File Storage — clean up from DB reactively
+                                tracing::warn!("Blob expired, cleaning up: {}", msg);
+                                cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
+                                return None;
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to download blob {}: {}", blob_id, e);
+                                return None;
+                            }
+                        };
+                    // Decrypt using MYDATA (via sidecar HTTP)
+                    match mydata::mydata_decrypt(
+                        &http_client,
+                        &sidecar_url,
+                        sidecar_secret.as_deref(),
+                        &encrypted_data,
+                        &credential,
+                        &package_id,
+                        &account_id,
+                        platform_id.as_deref(),
+                        platform_scope.as_deref(),
+                        hit_visibility,
+                        &owner_for_decrypt,
+                        hit_organization_id.as_deref(),
+                        hit_org_memory_group_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(plaintext) => match String::from_utf8(plaintext) {
+                            Ok(text) => Some(RecallResult {
+                                blob_id,
+                                text,
+                                distance,
+                                score,
+                                visibility: Some(hit_visibility),
+                                source_agent_id: hit_source_agent,
+                            }),
+                            Err(e) => {
+                                tracing::warn!("Invalid UTF-8 in decrypted data: {}", e);
+                                return None;
+                            }
+                        },
                         Err(e) => {
-                            tracing::warn!("Invalid UTF-8 in decrypted data: {}", e);
-                            return None;
-                        }
-                    },
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        let is_permanent = err_str.contains("Not enough shares")
-                            || err_str.contains("decrypt failed");
-                        if is_permanent {
-                            tracing::warn!(
+                            let err_str = e.to_string();
+                            let is_permanent = err_str.contains("Not enough shares")
+                                || err_str.contains("decrypt failed");
+                            if is_permanent {
+                                tracing::warn!(
                                 "MYDATA decrypt permanently failed for blob {}, cleaning up: {}",
                                 blob_id,
                                 e
                             );
-                            cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
-                        } else {
-                            tracing::warn!("Failed to MYDATA decrypt blob {}: {}", blob_id, e);
+                                cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
+                            } else {
+                                tracing::warn!("Failed to MYDATA decrypt blob {}: {}", blob_id, e);
+                            }
+                            None
                         }
-                        None
                     }
                 }
-            }
-        })
-        .collect();
+            })
+            .collect();
 
     let task_results = futures::future::join_all(tasks).await;
     let attempted = task_results.len();
@@ -627,7 +1034,9 @@ pub async fn remember_manual(
     } else {
         let encrypted_bytes = base64::engine::general_purpose::STANDARD
             .decode(&body.encrypted_data)
-            .map_err(|e| AppError::BadRequest(format!("encrypted_data is not valid base64: {}", e)))?;
+            .map_err(|e| {
+                AppError::BadRequest(format!("encrypted_data is not valid base64: {}", e))
+            })?;
 
         rate_limit::check_storage_quota(&state, owner, encrypted_bytes.len() as i64).await?;
 
@@ -654,7 +1063,10 @@ pub async fn remember_manual(
         )
         .await?;
 
-        tracing::info!("remember_manual: file storage upload ok blob_id={}", upload.blob_id);
+        tracing::info!(
+            "remember_manual: file storage upload ok blob_id={}",
+            upload.blob_id
+        );
         (upload.blob_id, encrypted_bytes.len() as i64)
     };
     let id = uuid::Uuid::new_v4().to_string();
@@ -799,17 +1211,30 @@ pub async fn analyze(
 
     let llm_model = resolve_llm_model(&state.config, body.model_id.as_deref());
 
-    // Step 1: Extract facts using LLM
-    let extracted =
-        extract_facts_llm(&state.http_client, &state.config, &body.text, &llm_model).await?;
-    crate::ai_spend::record_inference_usage(
-        &state,
-        &auth,
-        &llm_model,
-        extracted.prompt_tokens,
-        extracted.completion_tokens,
-    )
-    .await?;
+    // Step 1: production billing owns provider access. The gateway finalizes a MIST
+    // reservation before OpenRouter is called and captures the actual reported cost.
+    let inference_key = body
+        .idempotency_key
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let extracted = if state.config.ai_credit_enabled {
+        let completion = crate::ai_spend::run_gateway_inference(
+            &state,
+            &auth,
+            &llm_model,
+            Some(FACT_EXTRACTION_PROMPT),
+            &body.text,
+            ANALYZE_MAX_OUTPUT_TOKENS,
+            &inference_key,
+        )
+        .await?;
+        let mut parsed = parse_extracted_facts(&completion.content);
+        parsed.prompt_tokens = completion.tokens_in;
+        parsed.completion_tokens = completion.tokens_out;
+        parsed
+    } else {
+        extract_facts_llm(&state.http_client, &state.config, &body.text, &llm_model).await?
+    };
     let raw_fact_count = extracted.raw_count;
     let facts = extracted.facts;
     let reserved_additional_weight = rate_limit::analyze_additional_weight(facts.len());
@@ -832,13 +1257,8 @@ pub async fn analyze(
         }));
     }
 
-    rate_limit::charge_explicit_weight(
-        &state,
-        &auth,
-        reserved_additional_weight,
-        "/api/analyze",
-    )
-    .await?;
+    rate_limit::charge_explicit_weight(&state, &auth, reserved_additional_weight, "/api/analyze")
+        .await?;
 
     // Check storage quota before processing all facts
     let total_text_bytes: i64 = facts.iter().map(|f| f.len() as i64).sum();
@@ -1200,10 +1620,38 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
 /// `packageId` to their `MemoryConfig` — preserving backward-compatible
 /// UX for v0.3.x apps that only passed `{ key, accountId }`.
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
+    let package_id = crate::memory_contract::normalize_object_id(&state.config.package_id);
+    let social_chain = state
+        .config
+        .social_chain
+        .is_configured()
+        .then(|| PublicSocialChainConfig {
+            package_id: package_id.clone(),
+            username_registry_id: state.config.social_chain.username_registry_id.clone(),
+            platform_registry_id: state.config.social_chain.platform_registry_id.clone(),
+            platform_object_id: state.config.social_chain.platform_object_id.clone(),
+            block_list_registry_id: state.config.social_chain.block_list_registry_id.clone(),
+            post_config_id: state.config.social_chain.post_config_id.clone(),
+            memory_config_id: state.config.social_chain.memory_config_id.clone(),
+            mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
+            social_graph_id: state.config.social_chain.social_graph_id.clone(),
+            messaging_package_id: state.config.social_chain.messaging_package_id.clone(),
+            messaging_version_id: state.config.social_chain.messaging_version_id.clone(),
+            messaging_config_id: state.config.social_chain.messaging_config_id.clone(),
+            messaging_namespace_id: state.config.social_chain.messaging_namespace_id.clone(),
+            messaging_group_manager_id: state
+                .config
+                .social_chain
+                .messaging_group_manager_id
+                .clone(),
+            messaging_group_leaver_id: state.config.social_chain.messaging_group_leaver_id.clone(),
+            clock_id: "0x6",
+        });
     Json(ConfigResponse {
-        package_id: crate::memory_contract::normalize_object_id(&state.config.package_id),
+        package_id,
         network: state.config.myso_network.clone(),
         myso_rpc_url: state.config.myso_rpc_url.clone(),
+        social_chain,
     })
 }
 
@@ -1473,7 +1921,6 @@ mod tests {
     }
 }
 
-
 /// POST /api/ask
 ///
 /// Full AI-with-memory demo:
@@ -1561,10 +2008,7 @@ pub async fn ask(
         );
     }
 
-    let weights = body
-        .scoring_weights
-        .clone()
-        .unwrap_or_default();
+    let weights = body.scoring_weights.clone().unwrap_or_default();
     let ranked = CompositeRanker::rank(hits, &weights, chrono::Utc::now());
     let hits_to_fetch: Vec<_> = ranked.into_iter().take(limit).collect();
 
@@ -1583,105 +2027,102 @@ pub async fn ask(
     // Download + MYDATA decrypt all memories concurrently
     let db = &state.db;
     let ask_organization_id = search_scope.organization_id.clone();
-    let ask_org_memory_group_id = resolve_org_memory_group_id(
-        &state,
-        ask_organization_id.as_deref(),
-    )
-    .await;
-    let tasks: Vec<_> = hits_to_fetch
-        .iter()
-        .map(|hit| {
-            let http_client = state.http_client.clone();
-            let aggregator_url = state.config.file_storage_aggregator_url.clone();
-            let sidecar_url = state.config.sidecar_url.clone();
-            let sidecar_secret = state.config.sidecar_secret.clone();
-            let blob_id = hit.blob_id.clone();
-            let distance = hit.distance;
-            let score = hit.score;
-            let hit_visibility = hit.visibility;
-            let hit_source_agent = hit.source_agent_object_id.clone();
-            let hit_importance = hit.importance;
-            let hit_created_at = hit.created_at;
-            let credential = credential.clone();
-            let package_id = state.config.package_id.clone();
-            let account_id = auth.account_id.clone();
-            let platform_scope = auth.platform_scope.clone();
-            let platform_id = auth.platform_id.clone();
-            let owner_for_cleanup = owner.clone();
-            let owner_for_decrypt = owner.clone();
-            let hit_organization_id = if hit_visibility == crate::types::VISIBILITY_ORG {
-                ask_organization_id.clone()
-            } else {
-                None
-            };
-            let hit_org_memory_group_id = if hit_visibility == crate::types::VISIBILITY_ORG {
-                ask_org_memory_group_id.clone()
-            } else {
-                None
-            };
-            async move {
-                tracing::debug!(
-                    blob_id = %blob_id,
-                    importance = hit_importance,
-                    created_at = ?hit_created_at,
-                    "recall decrypt candidate"
-                );
-                let encrypted_data = match file_storage::download_blob(
-                    &http_client,
-                    &aggregator_url,
-                    &blob_id,
-                ).await {
-                    Ok(data) => data,
-                    Err(AppError::BlobNotFound(msg)) => {
-                        // Blob expired on File Storage — clean up from DB reactively
-                        tracing::warn!("Blob expired, cleaning up: {}", msg);
-                        cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
-                        return None;
-                    }
-                    Err(e) => {
-                        tracing::warn!("Download failed for {}: {}", blob_id, e);
-                        return None;
-                    }
+    let ask_org_memory_group_id =
+        resolve_org_memory_group_id(&state, ask_organization_id.as_deref()).await;
+    let tasks: Vec<_> =
+        hits_to_fetch
+            .iter()
+            .map(|hit| {
+                let http_client = state.http_client.clone();
+                let aggregator_url = state.config.file_storage_aggregator_url.clone();
+                let sidecar_url = state.config.sidecar_url.clone();
+                let sidecar_secret = state.config.sidecar_secret.clone();
+                let blob_id = hit.blob_id.clone();
+                let distance = hit.distance;
+                let score = hit.score;
+                let hit_visibility = hit.visibility;
+                let hit_source_agent = hit.source_agent_object_id.clone();
+                let hit_importance = hit.importance;
+                let hit_created_at = hit.created_at;
+                let credential = credential.clone();
+                let package_id = state.config.package_id.clone();
+                let account_id = auth.account_id.clone();
+                let platform_scope = auth.platform_scope.clone();
+                let platform_id = auth.platform_id.clone();
+                let owner_for_cleanup = owner.clone();
+                let owner_for_decrypt = owner.clone();
+                let hit_organization_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                    ask_organization_id.clone()
+                } else {
+                    None
                 };
-                match mydata::mydata_decrypt(
-                    &http_client,
-                    &sidecar_url,
-                    sidecar_secret.as_deref(),
-                    &encrypted_data,
-                    &credential,
-                    &package_id,
-                    &account_id,
-                    platform_id.as_deref(),
-                    platform_scope.as_deref(),
-                    hit_visibility,
-                    &owner_for_decrypt,
-                    hit_organization_id.as_deref(),
-                    hit_org_memory_group_id.as_deref(),
-                )
-                .await
-                {
-                    Ok(plaintext) => match String::from_utf8(plaintext) {
-                        Ok(text) => Some(RecallResult {
-                            blob_id,
-                            text,
-                            distance,
-                            score,
-                            visibility: Some(hit_visibility),
-                            source_agent_id: hit_source_agent,
-                        }),
+                let hit_org_memory_group_id = if hit_visibility == crate::types::VISIBILITY_ORG {
+                    ask_org_memory_group_id.clone()
+                } else {
+                    None
+                };
+                async move {
+                    tracing::debug!(
+                        blob_id = %blob_id,
+                        importance = hit_importance,
+                        created_at = ?hit_created_at,
+                        "recall decrypt candidate"
+                    );
+                    let encrypted_data =
+                        match file_storage::download_blob(&http_client, &aggregator_url, &blob_id)
+                            .await
+                        {
+                            Ok(data) => data,
+                            Err(AppError::BlobNotFound(msg)) => {
+                                // Blob expired on File Storage — clean up from DB reactively
+                                tracing::warn!("Blob expired, cleaning up: {}", msg);
+                                cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
+                                return None;
+                            }
+                            Err(e) => {
+                                tracing::warn!("Download failed for {}: {}", blob_id, e);
+                                return None;
+                            }
+                        };
+                    match mydata::mydata_decrypt(
+                        &http_client,
+                        &sidecar_url,
+                        sidecar_secret.as_deref(),
+                        &encrypted_data,
+                        &credential,
+                        &package_id,
+                        &account_id,
+                        platform_id.as_deref(),
+                        platform_scope.as_deref(),
+                        hit_visibility,
+                        &owner_for_decrypt,
+                        hit_organization_id.as_deref(),
+                        hit_org_memory_group_id.as_deref(),
+                    )
+                    .await
+                    {
+                        Ok(plaintext) => match String::from_utf8(plaintext) {
+                            Ok(text) => Some(RecallResult {
+                                blob_id,
+                                text,
+                                distance,
+                                score,
+                                visibility: Some(hit_visibility),
+                                source_agent_id: hit_source_agent,
+                            }),
+                            Err(e) => {
+                                tracing::warn!("Invalid UTF-8: {}", e);
+                                None
+                            }
+                        },
                         Err(e) => {
-                            tracing::warn!("Invalid UTF-8: {}", e);
+                            tracing::warn!("MYDATA decrypt failed for {}: {}", blob_id, e);
                             None
                         }
-                    },
-                    Err(e) => {
-                        tracing::warn!("MYDATA decrypt failed for {}: {}", blob_id, e);
-                        None
                     }
                 }
-            }
-        })
-        .collect();
+            })
+            .collect();
 
     let memories: Vec<RecallResult> = futures::future::join_all(tasks)
         .await
@@ -1726,71 +2167,74 @@ pub async fn ask(
         memory_context
     );
 
-    // Step 3: Call LLM
-    let api_key = state
-        .config
-        .openai_api_key
-        .as_ref()
-        .ok_or_else(|| AppError::Internal("OPENAI_API_KEY required for /api/ask".into()))?;
-    let url = format!("{}/chat/completions", state.config.openai_api_base);
-
-    let resp = state
-        .http_client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&ChatCompletionRequest {
-            model: llm_model.clone(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: system_prompt,
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: body.question.clone(),
-                },
-            ],
-            temperature: 0.7,
-            max_tokens: 512,
-        })
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("LLM request failed: {}", e)))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body_text = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "LLM error ({}): {}",
-            status, body_text
-        )));
-    }
-
-    let api_resp: ChatCompletionResponse = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to parse LLM response: {}", e)))?;
-
-    let usage = api_resp.usage.unwrap_or(ChatUsage {
-        prompt_tokens: estimate_tokens_from_chars(body.question.len()) + 1500,
-        completion_tokens: 512,
-    });
-
-    let answer = api_resp
-        .choices
-        .first()
-        .map(|c| c.message.content.trim().to_string())
-        .unwrap_or_else(|| "No response from LLM".to_string());
-
-    crate::ai_spend::record_inference_usage(
-        &state,
-        &auth,
-        &llm_model,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-    )
-    .await?;
+    // Step 3: Call the reservation-owning gateway in production. Direct provider
+    // access remains only for local development with AI credit enforcement disabled.
+    let answer = if state.config.ai_credit_enabled {
+        let inference_key = body
+            .idempotency_key
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        crate::ai_spend::run_gateway_inference(
+            &state,
+            &auth,
+            &llm_model,
+            Some(&system_prompt),
+            &body.question,
+            512,
+            &inference_key,
+        )
+        .await?
+        .content
+        .trim()
+        .to_string()
+    } else {
+        let api_key = state
+            .config
+            .openai_api_key
+            .as_ref()
+            .ok_or_else(|| AppError::Internal("OPENAI_API_KEY required for /api/ask".into()))?;
+        let url = format!("{}/chat/completions", state.config.openai_api_base);
+        let resp = state
+            .http_client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&ChatCompletionRequest {
+                model: llm_model.clone(),
+                messages: vec![
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: system_prompt,
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: body.question.clone(),
+                    },
+                ],
+                temperature: 0.7,
+                max_tokens: 512,
+            })
+            .send()
+            .await
+            .map_err(|e| AppError::Internal(format!("LLM request failed: {}", e)))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(AppError::Internal(format!(
+                "LLM error ({}): {}",
+                status, body_text
+            )));
+        }
+        let api_resp: ChatCompletionResponse = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to parse LLM response: {}", e)))?;
+        api_resp
+            .choices
+            .first()
+            .map(|c| c.message.content.trim().to_string())
+            .unwrap_or_else(|| "No response from LLM".to_string())
+    };
 
     tracing::info!("ask complete: answer length={} chars", answer.len());
 
@@ -1804,11 +2248,51 @@ pub async fn ask(
 /// POST /api/ai-credit/record-inference
 ///
 /// Record LLM token usage after inference completed outside memory-server (e.g. chatbot streamText).
+pub async fn gateway_inference_route(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(body): Json<GatewayInferenceRequest>,
+) -> Result<Json<GatewayInferenceResponse>, AppError> {
+    if body.model_id.trim().is_empty() || body.prompt.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "model_id and prompt cannot be empty".into(),
+        ));
+    }
+    let idempotency_key = body
+        .idempotency_key
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let result = crate::ai_spend::run_gateway_inference(
+        &state,
+        &auth,
+        body.model_id.trim(),
+        body.system_prompt.as_deref(),
+        &body.prompt,
+        body.max_tokens.unwrap_or(512),
+        &idempotency_key,
+    )
+    .await?;
+    Ok(Json(GatewayInferenceResponse {
+        content: result.content,
+        tokens_in: result.tokens_in,
+        tokens_out: result.tokens_out,
+        amount_mist: result.amount_mist,
+        billing_state: result.billing_state,
+        reservation_nonce: result.reservation_nonce,
+        reserve_digest: result.reserve_digest,
+        capture_digest: result.capture_digest,
+    }))
+}
+
 pub async fn record_inference_usage_route(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RecordInferenceUsageRequest>,
 ) -> Result<Json<RecordInferenceUsageResponse>, AppError> {
+    if state.config.ai_credit_enabled {
+        return Err(AppError::BadRequest(
+            "post-hoc inference metering is disabled; use /api/ai-credit/inference so funds are reserved before provider spend".into(),
+        ));
+    }
     if body.model_id.trim().is_empty() {
         return Err(AppError::BadRequest("model_id cannot be empty".into()));
     }
@@ -1941,8 +2425,7 @@ pub async fn restore(
     for (_, (_, org_id)) in blob_visibility.iter() {
         if let Some(org_id) = org_id.as_deref() {
             if !restore_org_group_ids.contains_key(org_id) {
-                let group_id =
-                    resolve_org_memory_group_id(&state, Some(org_id)).await;
+                let group_id = resolve_org_memory_group_id(&state, Some(org_id)).await;
                 restore_org_group_ids.insert(org_id.to_string(), group_id);
             }
         }
@@ -2216,6 +2699,1148 @@ pub async fn restore(
 }
 
 // ============================================================
+// Registry-only chain action prepare / submit
+// ============================================================
+
+const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.3.0";
+
+fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
+    use crate::memory_contract::{
+        CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_COMMENT, CAP_MEMORY_READ,
+        CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT, CAP_SOCIAL_GRAPH,
+    };
+    match action {
+        "social.create_post.v1"
+        | "social.edit_post.v1"
+        | "social.create_repost.v1"
+        | "social.remove_repost.v1" => Some((CAP_POST_PUBLISH, "1B")),
+        "social.create_comment.v1" | "social.edit_comment.v1" => Some((CAP_COMMENT, "1B")),
+        "social.react_to_post.v1"
+        | "social.remove_post_reaction.v1"
+        | "social.react_to_comment.v1"
+        | "social.remove_comment_reaction.v1" => Some((CAP_REACT, "1A")),
+        "social.follow_profile.v1"
+        | "social.unfollow_profile.v1"
+        | "social.block_profile.v1"
+        | "social.unblock_profile.v1" => Some((CAP_SOCIAL_GRAPH, "1A")),
+        "messaging.send_message.v1" | "messaging.create_group.v1" => Some((CAP_MESSAGE_SEND, "1B")),
+        "organization.accept_invitation.v1" | "organization.decline_invitation.v1" => {
+            Some((CAP_MEMORY_READ, "1B"))
+        }
+        "organization.create.v1" | "agent.register_agent.v1" => Some((CAP_AGENT_REGISTER, "3")),
+        "agent.register_child.v1" => Some((CAP_AGENT_REGISTER, "1B")),
+        "organization.update_metadata.v1"
+        | "organization.update_category.v1"
+        | "organization.deactivate.v1"
+        | "organization.ensure_memory_group.v1"
+        | "organization.define_role.v1"
+        | "organization.assign_role.v1"
+        | "organization.revoke_role.v1"
+        | "organization.create_invitation.v1" => Some((CAP_AGENT_UPDATE, "3")),
+        "agent.update_child.v1" => Some((CAP_AGENT_UPDATE, "1B")),
+        "agent.deactivate_child.v1" | "agent.revoke_child.v1" => Some((CAP_AGENT_REVOKE, "1B")),
+        "social.delete_post.v1" => Some((CAP_POST_PUBLISH, "3")),
+        "social.delete_comment.v1" => Some((CAP_COMMENT, "3")),
+        _ => None,
+    }
+}
+
+fn registered_action_package_id<'a>(state: &'a AppState, action: &str) -> Option<&'a str> {
+    if action.starts_with("messaging.") {
+        (!state.config.social_chain.messaging_package_id.is_empty())
+            .then_some(state.config.social_chain.messaging_package_id.as_str())
+    } else {
+        Some(state.config.package_id.as_str())
+    }
+}
+
+fn valid_chain_idempotency_key(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_:./".contains(&byte))
+}
+
+fn valid_sha256_identifier(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sha256_identifier(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("sha256:{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => {
+            serde_json::to_string(value).expect("serializing a JSON string cannot fail")
+        }
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let entries = keys
+                .into_iter()
+                .map(|key| {
+                    let encoded_key = serde_json::to_string(key)
+                        .expect("serializing a JSON object key cannot fail");
+                    format!("{encoded_key}:{}", canonical_json(&values[key]))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{entries}}}")
+        }
+    }
+}
+
+fn chain_action_idempotency_scope(auth: &AuthInfo, action: &str, key: &str) -> String {
+    use sha2::Digest;
+    let mut hash = sha2::Sha256::new();
+    for part in [
+        auth.account_id.as_bytes(),
+        auth.agent_object_id.as_bytes(),
+        action.as_bytes(),
+        key.as_bytes(),
+    ] {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    hex::encode(hash.finalize())
+}
+
+fn assert_registered_action_policy(
+    state: &AppState,
+    auth: &AuthInfo,
+    action: &str,
+    registry_version: &str,
+    parameters: Option<&serde_json::Value>,
+) -> Result<(u64, &'static str), AppError> {
+    use crate::memory_contract::has_cap;
+
+    if registry_version != SOCIAL_ACTION_REGISTRY_VERSION {
+        return Err(AppError::Conflict(
+            "unsupported social action registry version".into(),
+        ));
+    }
+    let policy = registered_action_policy(action)
+        .ok_or_else(|| AppError::BadRequest("unsupported registered action".into()))?;
+    if !state.config.social_chain.is_configured() {
+        return Err(AppError::Internal(
+            "social chain context is not configured".into(),
+        ));
+    }
+    if action.starts_with("messaging.")
+        && (state.config.social_chain.messaging_package_id.is_empty()
+            || state.config.social_chain.messaging_version_id.is_empty()
+            || state.config.social_chain.messaging_config_id.is_empty())
+    {
+        return Err(AppError::Internal(
+            "messaging action objects are not configured".into(),
+        ));
+    }
+    if action == "messaging.create_group.v1"
+        && (state.config.social_chain.messaging_namespace_id.is_empty()
+            || state
+                .config
+                .social_chain
+                .messaging_group_manager_id
+                .is_empty()
+            || state
+                .config
+                .social_chain
+                .messaging_group_leaver_id
+                .is_empty())
+    {
+        return Err(AppError::Internal(
+            "messaging group objects are not configured".into(),
+        ));
+    }
+    if matches!(
+        action,
+        "social.follow_profile.v1"
+            | "social.unfollow_profile.v1"
+            | "social.block_profile.v1"
+            | "social.unblock_profile.v1"
+    ) && state.config.social_chain.social_graph_id.is_empty()
+    {
+        return Err(AppError::Internal(
+            "social graph action object is not configured".into(),
+        ));
+    }
+    if !has_cap(auth.capabilities, policy.0) {
+        return Err(AppError::Forbidden(
+            "agent lacks the registered action capability".into(),
+        ));
+    }
+    let requested_platform = auth.platform_id.as_deref().ok_or_else(|| {
+        AppError::Forbidden("x-platform-id is required for social actions".into())
+    })?;
+    if !crate::memory_contract::addresses_equal(
+        requested_platform,
+        &state.config.social_chain.platform_object_id,
+    ) {
+        return Err(AppError::Forbidden(
+            "registered action is outside the configured platform".into(),
+        ));
+    }
+    if let Some(parameters) = parameters {
+        let object = parameters
+            .as_object()
+            .ok_or_else(|| AppError::BadRequest("parameters must be a JSON object".into()))?;
+        if let Some(platform) = object.get("platformObjectId") {
+            let platform = platform
+                .as_str()
+                .ok_or_else(|| AppError::BadRequest("platformObjectId must be a string".into()))?;
+            if !crate::memory_contract::addresses_equal(
+                platform,
+                &state.config.social_chain.platform_object_id,
+            ) {
+                return Err(AppError::Forbidden(
+                    "parameter platformObjectId is outside the configured platform".into(),
+                ));
+            }
+        }
+        if matches!(
+            action,
+            "organization.accept_invitation.v1" | "organization.decline_invitation.v1"
+        ) {
+            let invitee = object
+                .get("invitee")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| AppError::BadRequest("invitee must be a string".into()))?;
+            if !crate::memory_contract::addresses_equal(invitee, &auth.derived_address) {
+                return Err(AppError::Forbidden(
+                    "an agent may only accept or decline its own invitation".into(),
+                ));
+            }
+        }
+        if action == "agent.register_child.v1" {
+            let parent = object
+                .get("parentAgentObjectId")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    AppError::BadRequest("parentAgentObjectId must be a string".into())
+                })?;
+            if !crate::memory_contract::addresses_equal(parent, &auth.agent_object_id) {
+                return Err(AppError::Forbidden(
+                    "delegated registration must use the authenticated agent as parent".into(),
+                ));
+            }
+        }
+    }
+    Ok(policy)
+}
+
+async fn enforce_sponsor_sender_limit(state: &Arc<AppState>, sender: &str) -> Result<(), AppError> {
+    let config = &state.config.sponsor_rate_limit;
+    match rate_limit::check_sender_rate_limit(state, sender, config.per_minute, config.per_hour)
+        .await
+    {
+        Ok(rate_limit::SponsorRlResult::Allowed) => Ok(()),
+        Ok(rate_limit::SponsorRlResult::MinuteLimitExceeded)
+        | Ok(rate_limit::SponsorRlResult::HourLimitExceeded) => Err(AppError::RateLimited(
+            "sponsorship rate limit exceeded".into(),
+        )),
+        Err(()) => {
+            tracing::error!("sponsor sender rate limiter unavailable");
+            Err(AppError::Internal(
+                "sponsor rate limiter unavailable".into(),
+            ))
+        }
+    }
+}
+
+async fn sidecar_json<T: serde::de::DeserializeOwned>(
+    state: &Arc<AppState>,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<T, AppError> {
+    let url = format!("{}{}", state.config.sidecar_url.trim_end_matches('/'), path);
+    let mut request = state.http_client.post(url).json(body);
+    if let Some(secret) = state.config.sidecar_secret.as_deref() {
+        request = request.header("authorization", format!("Bearer {secret}"));
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| AppError::Internal(format!("sidecar {path} transport failed: {error}")))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::Internal(format!("sidecar {path} read failed: {error}")))?;
+    if !status.is_success() {
+        tracing::error!(%status, path, "trusted sidecar rejected registered action request");
+        return Err(AppError::BadRequest(
+            "registered action validation failed".into(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::Internal(format!("sidecar {path} response invalid: {error}")))
+}
+
+async fn sponsor_registered_kind(
+    state: &Arc<AppState>,
+    sender: &str,
+    transaction_kind_bytes: &str,
+) -> Result<SponsoredTransactionResponse, AppError> {
+    let sponsored: SponsoredTransactionResponse = sidecar_json(
+        state,
+        "/sponsor",
+        &serde_json::json!({
+            "sender": sender,
+            "transactionBlockKindBytes": transaction_kind_bytes,
+        }),
+    )
+    .await?;
+    if !validate_digest(&sponsored.digest) {
+        return Err(AppError::Internal(
+            "sponsor returned an invalid transaction digest".into(),
+        ));
+    }
+    let full_bytes = decode_base64(&sponsored.bytes)
+        .ok_or_else(|| AppError::Internal("sponsor returned invalid transaction bytes".into()))?;
+    if full_bytes.len() < 10 || full_bytes.len() > 128 * 1024 {
+        return Err(AppError::Internal(
+            "sponsor returned out-of-range transaction bytes".into(),
+        ));
+    }
+    Ok(sponsored)
+}
+
+fn prepare_response_from_row(
+    row: &crate::chain_actions::ChainActionRow,
+) -> Result<RegisteredActionPrepareResponse, AppError> {
+    let bytes = row
+        .sponsored_bytes
+        .clone()
+        .ok_or_else(|| AppError::Conflict("registered action is not yet sponsored".into()))?;
+    let digest = row
+        .digest
+        .clone()
+        .ok_or_else(|| AppError::Conflict("registered action is not yet sponsored".into()))?;
+    Ok(RegisteredActionPrepareResponse {
+        registry_action: row.registry_action.clone(),
+        registry_version: row.registry_version.clone(),
+        idempotency_key: row.idempotency_key.clone(),
+        parameter_hash: row.parameter_hash.clone(),
+        transaction_kind_hash: row.transaction_kind_hash.clone(),
+        package_id: row.package_id.clone(),
+        package_version: row.package_version.clone(),
+        bytes,
+        digest,
+        status: row.status.clone(),
+        simulation: row.simulation_response.as_ref().map(simulation_summary),
+        expires_at_ms: row.expires_at_ms,
+    })
+}
+
+fn simulation_summary(simulation: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "status": simulation
+            .get("effects")
+            .and_then(|effects| effects.get("status"))
+            .and_then(|status| status.get("status"))
+            .and_then(|status| status.as_str())
+            .unwrap_or("unknown"),
+        "gasUsed": simulation
+            .get("effects")
+            .and_then(|effects| effects.get("gasUsed"))
+            .cloned(),
+    })
+}
+
+async fn simulate_sponsored_transaction(
+    state: &Arc<AppState>,
+    transaction_bytes: &str,
+) -> Result<serde_json::Value, AppError> {
+    let response = state
+        .http_client
+        .post(&state.config.myso_rpc_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "myso_dryRunTransactionBlock",
+            "params": [transaction_bytes]
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("registered action simulation failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "registered action simulation RPC returned {}",
+            response.status()
+        )));
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| AppError::Internal(format!("simulation response invalid: {error}")))?;
+    if let Some(error) = body.get("error") {
+        tracing::warn!(error = %error, "registered action dry run was rejected");
+        return Err(AppError::BadRequest(
+            "registered action simulation was rejected".into(),
+        ));
+    }
+    let result = body
+        .get("result")
+        .cloned()
+        .ok_or_else(|| AppError::Internal("simulation result missing".into()))?;
+    let status = result
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(|status| status.as_str());
+    if status != Some("success") {
+        return Err(AppError::BadRequest(
+            "registered action simulation failed".into(),
+        ));
+    }
+    Ok(result)
+}
+
+fn approval_response(row: &crate::action_approvals::ActionApprovalRow) -> ActionApprovalResponse {
+    ActionApprovalResponse {
+        approval_id: row.approval_id.clone(),
+        registry_action: row.registry_action.clone(),
+        registry_version: row.registry_version.clone(),
+        idempotency_key: row.idempotency_key.clone(),
+        parameter_hash: row.parameter_hash.clone(),
+        risk_tier: row.risk_tier.clone(),
+        required_capability: row.required_capability as u64,
+        approval_intent: row.approval_intent.clone(),
+        status: row.status.clone(),
+        expires_at_ms: row.expires_at_ms,
+    }
+}
+
+pub async fn request_action_approval(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(request): Json<ActionApprovalRequest>,
+) -> Result<Json<ActionApprovalResponse>, AppError> {
+    let (required_capability, risk_tier) = assert_registered_action_policy(
+        &state,
+        &auth,
+        &request.registry_action,
+        &request.registry_version,
+        Some(&request.parameters),
+    )?;
+    if !valid_chain_idempotency_key(&request.idempotency_key) {
+        return Err(AppError::BadRequest("invalid idempotencyKey".into()));
+    }
+    let ttl_seconds = request.expires_in_seconds.unwrap_or(600);
+    if !(60..=900).contains(&ttl_seconds) {
+        return Err(AppError::BadRequest(
+            "expiresInSeconds must be between 60 and 900".into(),
+        ));
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let expires_at_ms = now_ms
+        .checked_add((ttl_seconds as i64) * 1000)
+        .ok_or_else(|| AppError::BadRequest("approval expiry overflow".into()))?;
+    let parameter_hash = sha256_identifier(canonical_json(&request.parameters).as_bytes());
+    let approval_id = uuid::Uuid::new_v4().to_string();
+    let approval_intent = format!(
+        "mysocial-action-approval-v1|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        approval_id,
+        auth.account_id,
+        auth.agent_object_id,
+        request.registry_version,
+        request.registry_action,
+        request.idempotency_key,
+        parameter_hash,
+        required_capability,
+        risk_tier,
+        auth.platform_id.as_deref().unwrap_or("unscoped"),
+        expires_at_ms,
+    );
+    let row = crate::action_approvals::create_or_get(
+        &state.db,
+        &crate::action_approvals::NewActionApproval {
+            approval_id: &approval_id,
+            account_id: &auth.account_id,
+            agent_object_id: &auth.agent_object_id,
+            registry_action: &request.registry_action,
+            registry_version: &request.registry_version,
+            idempotency_key: &request.idempotency_key,
+            parameter_hash: &parameter_hash,
+            required_capability,
+            risk_tier,
+            owner_address: &auth.owner,
+            approval_intent: &approval_intent,
+            expires_at_ms,
+        },
+    )
+    .await?;
+    Ok(Json(approval_response(&row)))
+}
+
+pub async fn approve_action_request(
+    State(state): State<Arc<AppState>>,
+    Path(approval_id): Path<String>,
+    Json(request): Json<ActionApprovalDecisionRequest>,
+) -> Result<Json<ActionApprovalResponse>, AppError> {
+    if approval_id.len() != 36 {
+        return Err(AppError::BadRequest("invalid approval id".into()));
+    }
+    let pending = crate::action_approvals::get(&state.db, &approval_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("unknown approval request".into()))?;
+    let current_owner = crate::myso::fetch_memory_account_owner(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        &pending.account_id,
+    )
+    .await
+    .map_err(|error| AppError::Forbidden(format!("account owner verification failed: {error}")))?;
+    if !crate::memory_contract::addresses_equal(&current_owner, &pending.owner_address) {
+        return Err(AppError::Conflict(
+            "account ownership changed after approval was requested".into(),
+        ));
+    }
+    if request.wallet_signature.len() < 80 || request.wallet_signature.len() > 4096 {
+        return Err(AppError::BadRequest(
+            "walletSignature has an invalid length".into(),
+        ));
+    }
+    let verified: SidecarWalletVerificationResponse = sidecar_json(
+        &state,
+        "/social/verify-owner-approval",
+        &serde_json::json!({
+            "message": pending.approval_intent,
+            "signature": request.wallet_signature,
+        }),
+    )
+    .await?;
+    if !crate::memory_contract::addresses_equal(&verified.signer_address, &current_owner) {
+        return Err(AppError::Forbidden(
+            "wallet approval signer is not the current account owner".into(),
+        ));
+    }
+    let row = crate::action_approvals::approve(
+        &state.db,
+        &approval_id,
+        &verified.signer_address,
+        &verified.public_key_hex,
+        &request.wallet_signature,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    Ok(Json(approval_response(&row)))
+}
+
+struct RegisteredActionAuthorization {
+    required_capability: u64,
+    risk_tier: &'static str,
+    sender: String,
+    approval: Option<crate::action_approvals::ActionApprovalRow>,
+}
+
+fn policy_requires_owner_approval(
+    risk_tier: &str,
+    approval_required_caps: u64,
+    required_capability: u64,
+) -> bool {
+    matches!(risk_tier, "2" | "3")
+        || crate::memory_contract::cap_requires_approval(
+            approval_required_caps,
+            required_capability,
+        )
+}
+
+async fn authorize_registered_action(
+    state: &Arc<AppState>,
+    auth: &AuthInfo,
+    registry_action: &str,
+    registry_version: &str,
+    idempotency_key: &str,
+    parameter_hash: &str,
+    parameters: Option<&serde_json::Value>,
+    approval_id: Option<&str>,
+) -> Result<RegisteredActionAuthorization, AppError> {
+    let (required_capability, risk_tier) = assert_registered_action_policy(
+        state,
+        auth,
+        registry_action,
+        registry_version,
+        parameters,
+    )?;
+    let approval_required =
+        policy_requires_owner_approval(risk_tier, auth.approval_required_caps, required_capability);
+    if !approval_required {
+        if approval_id.is_some() {
+            return Err(AppError::BadRequest(
+                "approvalId is not accepted for an automatic action".into(),
+            ));
+        }
+        return Ok(RegisteredActionAuthorization {
+            required_capability,
+            risk_tier,
+            sender: auth.derived_address.clone(),
+            approval: None,
+        });
+    }
+    let approval_id = approval_id.ok_or_else(|| {
+        AppError::ActionApprovalRequired(
+            "request and approve an exact-input owner authorization".into(),
+        )
+    })?;
+    let approval = crate::action_approvals::get(&state.db, approval_id)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("unknown approvalId".into()))?;
+    crate::action_approvals::assert_matches(
+        &approval,
+        &auth.account_id,
+        &auth.agent_object_id,
+        registry_action,
+        registry_version,
+        idempotency_key,
+        parameter_hash,
+        required_capability,
+        risk_tier,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+    let current_owner = crate::myso::fetch_memory_account_owner(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        &auth.account_id,
+    )
+    .await
+    .map_err(|error| AppError::Forbidden(format!("account owner verification failed: {error}")))?;
+    if !crate::memory_contract::addresses_equal(&current_owner, &approval.owner_address) {
+        return Err(AppError::Conflict(
+            "account ownership changed after approval".into(),
+        ));
+    }
+    Ok(RegisteredActionAuthorization {
+        required_capability,
+        risk_tier,
+        sender: approval.owner_address.clone(),
+        approval: Some(approval),
+    })
+}
+
+pub async fn prepare_registered_action(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(request): Json<RegisteredActionPrepareRequest>,
+) -> Result<Json<RegisteredActionPrepareResponse>, AppError> {
+    if !valid_chain_idempotency_key(&request.idempotency_key) {
+        return Err(AppError::BadRequest("invalid idempotencyKey".into()));
+    }
+    let request_parameter_hash = sha256_identifier(canonical_json(&request.parameters).as_bytes());
+    let authorization = authorize_registered_action(
+        &state,
+        &auth,
+        &request.registry_action,
+        &request.registry_version,
+        &request.idempotency_key,
+        &request_parameter_hash,
+        Some(&request.parameters),
+        request.approval_id.as_deref(),
+    )
+    .await?;
+    if let Some(existing) = crate::chain_actions::get_by_identity(
+        &state.db,
+        &auth.account_id,
+        &auth.agent_object_id,
+        &request.registry_action,
+        &request.idempotency_key,
+    )
+    .await?
+    {
+        if existing.registry_version != request.registry_version
+            || existing.parameter_hash != request_parameter_hash
+            || existing.sender != authorization.sender
+            || existing.approval_id.as_deref() != request.approval_id.as_deref()
+        {
+            return Err(AppError::Conflict(
+                "idempotencyKey was already used with different action input".into(),
+            ));
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if existing.expires_at_ms <= now_ms
+            && existing.status != crate::chain_actions::STATUS_EXECUTED
+        {
+            return Err(AppError::Conflict(
+                "the registered action preparation expired".into(),
+            ));
+        }
+        return match existing.status.as_str() {
+            crate::chain_actions::STATUS_SPONSORED
+            | crate::chain_actions::STATUS_SUBMITTING
+            | crate::chain_actions::STATUS_EXECUTED => {
+                Ok(Json(prepare_response_from_row(&existing)?))
+            }
+            crate::chain_actions::STATUS_PREPARING => Err(AppError::Conflict(
+                "registered action preparation is already in progress".into(),
+            )),
+            _ => Err(AppError::Conflict(
+                "the original registered action preparation failed closed".into(),
+            )),
+        };
+    }
+    enforce_sponsor_sender_limit(&state, &authorization.sender).await?;
+
+    let prepared: SidecarPreparedAction = sidecar_json(
+        &state,
+        "/social/prepare-registered",
+        &serde_json::json!({
+            "registryAction": request.registry_action,
+            "registryVersion": request.registry_version,
+            "idempotencyKey": request.idempotency_key,
+            "parameters": request.parameters,
+            "memoryAccountId": auth.account_id,
+            "authorizationClass": if authorization.approval.is_some() { "owner-approved" } else { "automatic" },
+        }),
+    )
+    .await?;
+    if prepared.registry_action != request.registry_action
+        || prepared.registry_version != SOCIAL_ACTION_REGISTRY_VERSION
+        || prepared.required_capability != authorization.required_capability
+        || prepared.risk_tier != authorization.risk_tier
+        || !valid_sha256_identifier(&prepared.parameter_hash)
+        || prepared.parameter_hash != request_parameter_hash
+        || !valid_sha256_identifier(&prepared.transaction_bytes_hash)
+        || !registered_action_package_id(&state, &request.registry_action).is_some_and(
+            |package_id| crate::memory_contract::addresses_equal(&prepared.package_id, package_id),
+        )
+        || prepared.package_version.parse::<u64>().is_err()
+    {
+        return Err(AppError::Internal(
+            "sidecar returned inconsistent registered action metadata".into(),
+        ));
+    }
+    let transaction_kind = decode_base64(&prepared.transaction_block_kind_bytes)
+        .ok_or_else(|| AppError::Internal("sidecar returned invalid transaction kind".into()))?;
+    if transaction_kind.len() < 10
+        || transaction_kind.len() > 7_000
+        || sha256_identifier(&transaction_kind) != prepared.transaction_bytes_hash
+    {
+        return Err(AppError::Internal(
+            "sidecar transaction kind failed integrity validation".into(),
+        ));
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if prepared.prepared_at_ms > now_ms + 5_000
+        || prepared.expires_at_ms <= now_ms
+        || prepared.expires_at_ms > prepared.prepared_at_ms + 5 * 60_000
+    {
+        return Err(AppError::Internal(
+            "sidecar returned invalid preparation lifetime".into(),
+        ));
+    }
+
+    let scope =
+        chain_action_idempotency_scope(&auth, &request.registry_action, &request.idempotency_key);
+    let new_action = crate::chain_actions::NewChainAction {
+        idempotency_scope: &scope,
+        account_id: &auth.account_id,
+        agent_object_id: &auth.agent_object_id,
+        registry_action: &request.registry_action,
+        registry_version: &request.registry_version,
+        idempotency_key: &request.idempotency_key,
+        parameter_hash: &prepared.parameter_hash,
+        transaction_kind_hash: &prepared.transaction_bytes_hash,
+        package_id: &prepared.package_id,
+        package_version: &prepared.package_version,
+        sender: &authorization.sender,
+        approval_id: request.approval_id.as_deref(),
+        prepared_at_ms: prepared.prepared_at_ms,
+        expires_at_ms: prepared.expires_at_ms,
+    };
+    match crate::chain_actions::claim_preparation(&state.db, &new_action, now_ms).await? {
+        crate::chain_actions::PrepareClaim::Existing(row) => {
+            return Ok(Json(prepare_response_from_row(&row)?));
+        }
+        crate::chain_actions::PrepareClaim::InProgress => {
+            return Err(AppError::Conflict(
+                "registered action preparation is already in progress".into(),
+            ));
+        }
+        crate::chain_actions::PrepareClaim::Conflict => {
+            return Err(AppError::Conflict(
+                "idempotencyKey was already used with different action input".into(),
+            ));
+        }
+        crate::chain_actions::PrepareClaim::Failed => {
+            return Err(AppError::Conflict(
+                "the original registered action preparation failed closed".into(),
+            ));
+        }
+        crate::chain_actions::PrepareClaim::Expired => {
+            return Err(AppError::Conflict(
+                "the registered action preparation expired".into(),
+            ));
+        }
+        crate::chain_actions::PrepareClaim::Created => {}
+    }
+
+    let sponsored = match sponsor_registered_kind(
+        &state,
+        &authorization.sender,
+        &prepared.transaction_block_kind_bytes,
+    )
+    .await
+    {
+        Ok(sponsored) => sponsored,
+        Err(error) => {
+            let _ =
+                crate::chain_actions::mark_failed(&state.db, &scope, "sponsor outcome unavailable")
+                    .await;
+            return Err(error);
+        }
+    };
+    let simulation = match simulate_sponsored_transaction(&state, &sponsored.bytes).await {
+        Ok(simulation) => simulation,
+        Err(error) => {
+            let _ = crate::chain_actions::mark_failed(
+                &state.db,
+                &scope,
+                "registered action simulation failed",
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    crate::chain_actions::complete_preparation(
+        &state.db,
+        &scope,
+        &sponsored.bytes,
+        &sponsored.digest,
+        &simulation,
+    )
+    .await?;
+
+    Ok(Json(RegisteredActionPrepareResponse {
+        registry_action: request.registry_action,
+        registry_version: request.registry_version,
+        idempotency_key: request.idempotency_key,
+        parameter_hash: prepared.parameter_hash,
+        transaction_kind_hash: prepared.transaction_bytes_hash,
+        package_id: prepared.package_id,
+        package_version: prepared.package_version,
+        bytes: sponsored.bytes,
+        digest: sponsored.digest,
+        status: crate::chain_actions::STATUS_SPONSORED.into(),
+        simulation: Some(simulation_summary(&simulation)),
+        expires_at_ms: prepared.expires_at_ms,
+    }))
+}
+
+async fn current_package_version(
+    state: &Arc<AppState>,
+    package_id: &str,
+) -> Result<String, AppError> {
+    let response = state
+        .http_client
+        .post(&state.config.myso_rpc_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "myso_getObject",
+            "params": [package_id, { "showType": true }]
+        }))
+        .send()
+        .await
+        .map_err(|error| AppError::Internal(format!("package version RPC failed: {error}")))?;
+    if !response.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "package version RPC returned {}",
+            response.status()
+        )));
+    }
+    let body: serde_json::Value = response.json().await.map_err(|error| {
+        AppError::Internal(format!("package version response invalid: {error}"))
+    })?;
+    let version = body
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(|data| data.get("version"))
+        .ok_or_else(|| AppError::Internal("package version missing from RPC response".into()))?;
+    if let Some(version) = version.as_str() {
+        return Ok(version.to_string());
+    }
+    version
+        .as_u64()
+        .map(|version| version.to_string())
+        .ok_or_else(|| AppError::Internal("package version has an invalid type".into()))
+}
+
+pub async fn submit_registered_action(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthInfo>,
+    Json(request): Json<RegisteredActionSubmitRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !valid_chain_idempotency_key(&request.idempotency_key) || !validate_digest(&request.digest) {
+        return Err(AppError::BadRequest(
+            "invalid registered action submission".into(),
+        ));
+    }
+    let prepared_row = crate::chain_actions::get_by_identity(
+        &state.db,
+        &auth.account_id,
+        &auth.agent_object_id,
+        &request.registry_action,
+        &request.idempotency_key,
+    )
+    .await?
+    .ok_or_else(|| AppError::Conflict("registered action was not prepared".into()))?;
+    let authorization = authorize_registered_action(
+        &state,
+        &auth,
+        &request.registry_action,
+        &request.registry_version,
+        &request.idempotency_key,
+        &prepared_row.parameter_hash,
+        None,
+        request.approval_id.as_deref(),
+    )
+    .await?;
+    if prepared_row.sender != authorization.sender
+        || prepared_row.approval_id.as_deref() != request.approval_id.as_deref()
+    {
+        return Err(AppError::Conflict(
+            "registered action approval changed before submission".into(),
+        ));
+    }
+    if let Some(approval) = &authorization.approval {
+        let expected_scope = prepared_row.idempotency_scope.as_str();
+        if approval.consumed_action_scope.as_deref() != Some(expected_scope) {
+            return Err(AppError::Conflict(
+                "owner approval is not bound to this action".into(),
+            ));
+        }
+    }
+    let signature = decode_base64(&request.signature)
+        .ok_or_else(|| AppError::BadRequest("signature must be valid base64".into()))?;
+    if !validate_sponsored_signature_len(signature.len()) {
+        return Err(AppError::BadRequest(
+            "signature has unexpected length".into(),
+        ));
+    }
+    let signature_hash = sha256_identifier(&signature);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let row = match crate::chain_actions::claim_submission(
+        &state.db,
+        &auth.account_id,
+        &auth.agent_object_id,
+        &request.registry_action,
+        &request.idempotency_key,
+        &request.digest,
+        &signature_hash,
+        now_ms,
+    )
+    .await?
+    {
+        crate::chain_actions::SubmitClaim::Execute(row) => row,
+        crate::chain_actions::SubmitClaim::Existing(response) => return Ok(Json(response)),
+        crate::chain_actions::SubmitClaim::Conflict => {
+            return Err(AppError::Conflict(
+                "registered action submission does not match its preparation".into(),
+            ));
+        }
+        crate::chain_actions::SubmitClaim::Failed => {
+            return Err(AppError::Conflict(
+                "registered action is in a failed-closed state".into(),
+            ));
+        }
+        crate::chain_actions::SubmitClaim::Expired => {
+            return Err(AppError::Conflict(
+                "registered action preparation expired".into(),
+            ));
+        }
+    };
+    if row.sender != authorization.sender
+        || row.registry_version != request.registry_version
+        || !registered_action_package_id(&state, &request.registry_action).is_some_and(
+            |package_id| crate::memory_contract::addresses_equal(&row.package_id, package_id),
+        )
+    {
+        return Err(AppError::Conflict(
+            "prepared action identity changed before submission".into(),
+        ));
+    }
+    let current_version = current_package_version(&state, &row.package_id).await?;
+    if current_version != row.package_version {
+        crate::chain_actions::mark_failed(
+            &state.db,
+            &row.idempotency_scope,
+            "package version changed before submission",
+        )
+        .await?;
+        return Err(AppError::Conflict(
+            "social package version changed; prepare the action again".into(),
+        ));
+    }
+
+    enforce_sponsor_sender_limit(&state, &authorization.sender).await?;
+    let executed: serde_json::Value = sidecar_json(
+        &state,
+        "/sponsor/execute",
+        &serde_json::json!({
+            "digest": request.digest,
+            "signature": request.signature,
+        }),
+    )
+    .await?;
+    if executed.get("digest").and_then(|value| value.as_str()) != Some(request.digest.as_str()) {
+        return Err(AppError::Internal(
+            "sponsor execution returned an unexpected digest".into(),
+        ));
+    }
+    let response = serde_json::json!({
+        "registryAction": request.registry_action,
+        "registryVersion": request.registry_version,
+        "idempotencyKey": request.idempotency_key,
+        "digest": request.digest,
+        "chain": { "status": "submitted", "digest": request.digest },
+        "indexer": { "status": "pending" },
+    });
+    crate::chain_actions::complete_submission(&state.db, &row.idempotency_scope, &response).await?;
+    Ok(Json(response))
+}
+
+// ============================================================
+// Chain action status — chain truth remains available without the indexer
+// ============================================================
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainActionStatusResponse {
+    pub chain: ChainActionTruth,
+    pub indexer: ChainActionIndexerState,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainActionTruth {
+    pub status: &'static str,
+    pub digest: String,
+    pub checkpoint: Option<String>,
+    pub error: Option<String>,
+    pub effects: Option<serde_json::Value>,
+    pub object_changes: Option<serde_json::Value>,
+    pub events: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainActionIndexerState {
+    pub status: &'static str,
+    pub checkpoint_lag: Option<u64>,
+    pub enrichment: Option<serde_json::Value>,
+}
+
+/// Fetch transaction truth directly from the fullnode. Indexed enrichment is
+/// deliberately optional so an indexer outage cannot hide finality.
+pub async fn chain_action_status(
+    State(state): State<Arc<AppState>>,
+    Extension(_auth): Extension<AuthInfo>,
+    Path(digest): Path<String>,
+) -> Result<Json<ChainActionStatusResponse>, AppError> {
+    if !validate_digest(&digest) {
+        return Err(AppError::BadRequest("Invalid transaction digest".into()));
+    }
+
+    let rpc_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "myso_getTransactionBlock",
+        "params": [
+            digest,
+            {
+                "showEffects": true,
+                "showObjectChanges": true,
+                "showEvents": true
+            }
+        ]
+    });
+    let rpc = state
+        .http_client
+        .post(&state.config.myso_rpc_url)
+        .json(&rpc_body)
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("chain status RPC failed: {e}")))?;
+    if !rpc.status().is_success() {
+        return Err(AppError::Internal(format!(
+            "chain status RPC returned {}",
+            rpc.status()
+        )));
+    }
+    let body: serde_json::Value = rpc
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("chain status response invalid: {e}")))?;
+
+    let result = body.get("result");
+    let rpc_error = body
+        .get("error")
+        .and_then(|v| v.get("message"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let effects = result.and_then(|v| v.get("effects")).cloned();
+    let execution_status = effects
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str());
+    let status = match execution_status {
+        Some("success") => "finalized",
+        Some("failure") => "failed",
+        Some(_) => "finalized",
+        None if result.is_some() => "submitted",
+        None => "pending",
+    };
+    let execution_error = effects
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.get("error"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or(rpc_error);
+
+    Ok(Json(ChainActionStatusResponse {
+        chain: ChainActionTruth {
+            status,
+            digest: rpc_body["params"][0]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            checkpoint: result
+                .and_then(|v| v.get("checkpoint"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            error: execution_error,
+            effects,
+            object_changes: result.and_then(|v| v.get("objectChanges")).cloned(),
+            events: result.and_then(|v| v.get("events")).cloned(),
+        },
+        indexer: ChainActionIndexerState {
+            status: "not_requested",
+            checkpoint_lag: None,
+            enrichment: None,
+        },
+    }))
+}
+
+// ============================================================
 // Enoki Sponsor Proxy — forwards FE requests to internal sidecar
 // ============================================================
 
@@ -2234,7 +3859,10 @@ fn mask_upstream(status: u16) -> (axum::http::StatusCode, &'static str) {
             "Sponsor service misconfigured",
         ),
         500..=599 => (axum::http::StatusCode::BAD_GATEWAY, "Sponsor service error"),
-        _ => (axum::http::StatusCode::BAD_REQUEST, "Sponsor request rejected"),
+        _ => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "Sponsor request rejected",
+        ),
     }
 }
 
@@ -2242,9 +3870,7 @@ fn json_error_response(status: axum::http::StatusCode, msg: &'static str) -> Res
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Body::from(
-            serde_json::json!({ "error": msg }).to_string(),
-        ))
+        .body(Body::from(serde_json::json!({ "error": msg }).to_string()))
         .unwrap()
 }
 
@@ -2291,10 +3917,13 @@ pub async fn sponsor_proxy(
         return Err(AppError::BadRequest("Invalid sender address".into()));
     }
 
-    let tx_bytes = decode_base64(&req.transaction_block_kind_bytes)
-        .ok_or_else(|| AppError::BadRequest("transactionBlockKindBytes must be valid base64".into()))?;
+    let tx_bytes = decode_base64(&req.transaction_block_kind_bytes).ok_or_else(|| {
+        AppError::BadRequest("transactionBlockKindBytes must be valid base64".into())
+    })?;
     if tx_bytes.len() < 10 || tx_bytes.len() > 7000 {
-        return Err(AppError::BadRequest("transactionBlockKindBytes out of range".into()));
+        return Err(AppError::BadRequest(
+            "transactionBlockKindBytes out of range".into(),
+        ));
     }
 
     // Per-sender rate limit — second axis that a distributed IP attack cannot bypass.
@@ -2310,14 +3939,20 @@ pub async fn sponsor_proxy(
         .await
         {
             Ok(rate_limit::SponsorRlResult::MinuteLimitExceeded) => {
-                tracing::warn!("sponsor rate limit [sender/min]: sender={}...", &req.sender[..16]);
+                tracing::warn!(
+                    "sponsor rate limit [sender/min]: sender={}...",
+                    &req.sender[..16]
+                );
                 return Ok(json_error_response(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     "Rate limit exceeded",
                 ));
             }
             Ok(rate_limit::SponsorRlResult::HourLimitExceeded) => {
-                tracing::warn!("sponsor rate limit [sender/hr]: sender={}...", &req.sender[..16]);
+                tracing::warn!(
+                    "sponsor rate limit [sender/hr]: sender={}...",
+                    &req.sender[..16]
+                );
                 return Ok(json_error_response(
                     axum::http::StatusCode::TOO_MANY_REQUESTS,
                     "Rate limit exceeded",
@@ -2326,7 +3961,9 @@ pub async fn sponsor_proxy(
             Ok(rate_limit::SponsorRlResult::Allowed) => {}
             Err(_) => {
                 // HIGH-2: Redis and in-memory fallback both unavailable — deny to fail-closed.
-                tracing::error!("sponsor sender rate limit unavailable for sponsor_proxy, denying request");
+                tracing::error!(
+                    "sponsor sender rate limit unavailable for sponsor_proxy, denying request"
+                );
                 return Ok(json_error_response(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "Rate limiter temporarily unavailable",
@@ -2405,14 +4042,33 @@ pub async fn sponsor_execute_proxy(
             return Err(AppError::BadRequest("Invalid sender address".into()));
         }
         let config = &state.config.sponsor_rate_limit;
-        match rate_limit::check_sender_rate_limit(&state, sender, config.per_minute, config.per_hour).await {
+        match rate_limit::check_sender_rate_limit(
+            &state,
+            sender,
+            config.per_minute,
+            config.per_hour,
+        )
+        .await
+        {
             Ok(rate_limit::SponsorRlResult::MinuteLimitExceeded) => {
-                tracing::warn!("sponsor/execute rate limit [sender/min]: sender={}...", &sender[..16]);
-                return Ok(json_error_response(axum::http::StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
+                tracing::warn!(
+                    "sponsor/execute rate limit [sender/min]: sender={}...",
+                    &sender[..16]
+                );
+                return Ok(json_error_response(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "Rate limit exceeded",
+                ));
             }
             Ok(rate_limit::SponsorRlResult::HourLimitExceeded) => {
-                tracing::warn!("sponsor/execute rate limit [sender/hr]: sender={}...", &sender[..16]);
-                return Ok(json_error_response(axum::http::StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
+                tracing::warn!(
+                    "sponsor/execute rate limit [sender/hr]: sender={}...",
+                    &sender[..16]
+                );
+                return Ok(json_error_response(
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    "Rate limit exceeded",
+                ));
             }
             Ok(rate_limit::SponsorRlResult::Allowed) => {}
             Err(_) => {
@@ -2475,6 +4131,94 @@ pub async fn sponsor_execute_proxy(
 #[cfg(test)]
 mod more_tests {
     use super::*;
+
+    #[test]
+    fn registered_action_policy_has_no_arbitrary_move_escape_hatch() {
+        assert_eq!(
+            registered_action_policy("social.react_to_post.v1"),
+            Some((crate::memory_contract::CAP_REACT, "1A"))
+        );
+        assert_eq!(
+            registered_action_policy("social.create_post.v1"),
+            Some((crate::memory_contract::CAP_POST_PUBLISH, "1B"))
+        );
+        assert!(registered_action_policy("0x2::coin::transfer").is_none());
+        assert_eq!(
+            registered_action_policy("social.delete_post.v1"),
+            Some((crate::memory_contract::CAP_POST_PUBLISH, "3"))
+        );
+        for action in [
+            "social.remove_post_reaction.v1",
+            "social.remove_comment_reaction.v1",
+        ] {
+            assert_eq!(
+                registered_action_policy(action),
+                Some((crate::memory_contract::CAP_REACT, "1A"))
+            );
+        }
+        for action in [
+            "social.follow_profile.v1",
+            "social.unfollow_profile.v1",
+            "social.block_profile.v1",
+            "social.unblock_profile.v1",
+        ] {
+            assert_eq!(
+                registered_action_policy(action),
+                Some((crate::memory_contract::CAP_SOCIAL_GRAPH, "1A"))
+            );
+        }
+        assert_eq!(
+            registered_action_policy("messaging.send_message.v1"),
+            Some((crate::memory_contract::CAP_MESSAGE_SEND, "1B"))
+        );
+        assert_eq!(
+            registered_action_policy("messaging.create_group.v1"),
+            Some((crate::memory_contract::CAP_MESSAGE_SEND, "1B"))
+        );
+        assert_eq!(
+            registered_action_policy("organization.create.v1"),
+            Some((crate::memory_contract::CAP_AGENT_REGISTER, "3"))
+        );
+        assert_eq!(
+            registered_action_policy("agent.register_child.v1"),
+            Some((crate::memory_contract::CAP_AGENT_REGISTER, "1B"))
+        );
+        assert_eq!(
+            registered_action_policy("organization.assign_role.v1"),
+            Some((crate::memory_contract::CAP_AGENT_UPDATE, "3"))
+        );
+        assert_eq!(
+            registered_action_policy("agent.revoke_child.v1"),
+            Some((crate::memory_contract::CAP_AGENT_REVOKE, "1B"))
+        );
+        assert!(registered_action_policy("social.mute_profile.v1").is_none());
+        assert!(registered_action_policy("social.unmute_profile.v1").is_none());
+    }
+
+    #[test]
+    fn chain_action_idempotency_and_hash_formats_are_bounded() {
+        assert!(valid_chain_idempotency_key("agent-action-0001"));
+        assert!(!valid_chain_idempotency_key("short"));
+        assert!(!valid_chain_idempotency_key("contains spaces"));
+        assert!(valid_sha256_identifier(&format!(
+            "sha256:{}",
+            "a".repeat(64)
+        )));
+        assert!(!valid_sha256_identifier("sha256:not-a-hash"));
+        let parameters = serde_json::json!({ "reaction": "like", "postId": "0x1" });
+        assert_eq!(
+            sha256_identifier(canonical_json(&parameters).as_bytes()),
+            "sha256:37fd8e3be85dc3cb242b1a087db2ea2995dc230d20eb7cc8b36a22b1761d222c"
+        );
+    }
+
+    #[test]
+    fn tier_two_tier_three_and_capability_policy_require_owner_approval() {
+        assert!(policy_requires_owner_approval("2", 0, 16));
+        assert!(policy_requires_owner_approval("3", 0, 16));
+        assert!(policy_requires_owner_approval("1B", 16, 16));
+        assert!(!policy_requires_owner_approval("1B", 0, 16));
+    }
 
     // ---- validate_derived_address ----
 

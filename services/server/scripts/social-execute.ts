@@ -6,7 +6,16 @@ import { Ed25519Keypair } from "@socialproof/myso/keypairs/ed25519";
 import { decodeMySoPrivateKey } from "@socialproof/myso/cryptography";
 import { Transaction } from "@socialproof/myso/transactions";
 import { MySoJsonRpcClient, getJsonRpcFullnodeUrl } from "@socialproof/myso/jsonRpc";
-import type { SocialChainConfig, SocialExecuteAction } from "@socialproof/social";
+import { createHash, randomUUID } from "node:crypto";
+import { verifyPersonalMessageSignature } from "@socialproof/myso/verify";
+import type { SocialActionId, SocialChainConfig, SocialExecuteAction } from "@socialproof/social";
+import {
+    SOCIAL_ACTION_REGISTRY_VERSION,
+    buildRegisteredSocialAction,
+    createSocialActionRequestMetadata,
+    finalizeSocialActionPreparation,
+    getSocialActionDescriptor,
+} from "@socialproof/social";
 import {
     buildCreatePostTx,
     buildCreateCommentTx,
@@ -115,7 +124,15 @@ export function loadSocialChainConfig(): SocialChainConfig {
         platformObjectId: required("PLATFORM_OBJECT_ID"),
         blockListRegistryId: required("BLOCK_LIST_REGISTRY_ID"),
         postConfigId: required("POST_CONFIG_ID"),
+        memoryConfigId: required("MEMORY_CONFIG_ID"),
         mydataRegistryId: required("MYDATA_REGISTRY_ID"),
+        socialGraphId: process.env.SOCIAL_GRAPH_ID?.trim() || undefined,
+        messagingPackageId: process.env.MESSAGING_PACKAGE_ID?.trim() || undefined,
+        messagingVersionId: process.env.MESSAGING_VERSION_ID?.trim() || undefined,
+        messagingConfigId: process.env.MESSAGING_CONFIG_ID?.trim() || undefined,
+        messagingNamespaceId: process.env.MESSAGING_NAMESPACE_ID?.trim() || undefined,
+        messagingGroupManagerId: process.env.MESSAGING_GROUP_MANAGER_ID?.trim() || undefined,
+        messagingGroupLeaverId: process.env.MESSAGING_GROUP_LEAVER_ID?.trim() || undefined,
     };
 }
 
@@ -126,6 +143,102 @@ export interface SocialExecuteRequest {
     senderPrivateKey: string;
     ownerPrivateKey?: string;
     gasBudget?: number;
+}
+
+export interface RegisteredSocialPrepareRequest {
+    registryAction: SocialActionId;
+    registryVersion: typeof SOCIAL_ACTION_REGISTRY_VERSION;
+    parameters: unknown;
+    memoryAccountId: string;
+    idempotencyKey: string;
+    authorizationClass: "automatic" | "owner-approved";
+}
+
+/** Build only a shared-registry action; arbitrary Move targets and PTBs are impossible. */
+export async function prepareRegisteredSocialAction(
+    req: RegisteredSocialPrepareRequest,
+) {
+    if (req.registryVersion !== SOCIAL_ACTION_REGISTRY_VERSION) {
+        throw new Error("Unsupported social action registry version");
+    }
+    if (
+        typeof req.memoryAccountId !== "string" ||
+        typeof req.idempotencyKey !== "string" ||
+        req.idempotencyKey.length < 8 ||
+        req.idempotencyKey.length > 128
+    ) {
+        throw new Error("Invalid registered action identity or idempotency key");
+    }
+
+    const descriptor = getSocialActionDescriptor(req.registryAction);
+    const automatic = descriptor.riskTier === "1A" || descriptor.riskTier === "1B";
+    if (automatic && req.authorizationClass !== "automatic") {
+        throw new Error("Automatic actions cannot use owner approval mode");
+    }
+    if (!automatic && req.authorizationClass !== "owner-approved") {
+        throw new Error("This registered action requires owner approval mode");
+    }
+    const requestMetadata = await createSocialActionRequestMetadata(
+        req.registryAction,
+        req.parameters,
+        req.idempotencyKey,
+    );
+    const chain = loadSocialChainConfig();
+    const tx = buildRegisteredSocialAction(
+        req.registryAction,
+        { Transaction, chain, memoryAccountId: req.memoryAccountId },
+        req.parameters,
+    ) as Transaction;
+    const bytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
+    if (bytes.byteLength < 10 || bytes.byteLength > 7_000) {
+        throw new Error("Registered action produced invalid transaction-kind bytes");
+    }
+
+    const actionPackageId = req.registryAction.startsWith("messaging.")
+        ? chain.messagingPackageId
+        : chain.packageId;
+    if (!actionPackageId) throw new Error("The action package ID is not configured");
+    const packageObject = await mysoClient.getObject({
+        id: actionPackageId,
+        options: { showType: true },
+    });
+    const packageVersion = String((packageObject as any)?.data?.version ?? "");
+    if (!packageVersion || !/^\d+$/.test(packageVersion)) {
+        throw new Error("Unable to pin the social package version");
+    }
+    const preparedAtMs = Date.now();
+    const transactionBytesHash = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
+    const prepared = finalizeSocialActionPreparation(requestMetadata, {
+        actionId: randomUUID(),
+        packageId: actionPackageId,
+        packageVersion,
+        transactionBytesHash,
+        preparedAtMs,
+        expiresAtMs: preparedAtMs + 5 * 60_000,
+    });
+
+    return {
+        ...prepared,
+        registryVersion: SOCIAL_ACTION_REGISTRY_VERSION,
+        transactionBlockKindBytes: Buffer.from(bytes).toString("base64"),
+    };
+}
+
+export async function verifyOwnerApproval(message: string, signature: string) {
+    if (!message.startsWith("mysocial-action-approval-v1|") || message.length > 4096) {
+        throw new Error("Invalid owner approval intent");
+    }
+    if (typeof signature !== "string" || signature.length < 80 || signature.length > 4096) {
+        throw new Error("Invalid owner wallet signature");
+    }
+    const publicKey = await verifyPersonalMessageSignature(
+        new TextEncoder().encode(message),
+        signature,
+    );
+    return {
+        signerAddress: publicKey.toMySoAddress(),
+        publicKeyHex: Buffer.from(publicKey.toRawBytes()).toString("hex"),
+    };
 }
 
 export async function executeSocialAction(req: SocialExecuteRequest) {

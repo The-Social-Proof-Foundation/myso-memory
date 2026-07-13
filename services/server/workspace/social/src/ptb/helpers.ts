@@ -18,23 +18,31 @@ export function resolvePlatformObjectId(
 }
 
 export function optBool(tx: any, value: boolean | undefined): unknown {
-    return value === undefined ? null : value;
+    return tx.pure("option<bool>", value ?? null);
 }
 
 export function optString(tx: any, value: string | undefined): unknown {
-    return value === undefined ? null : value;
+    return tx.pure("option<string>", value ?? null);
 }
 
 export function optAddress(tx: any, value: string | undefined): unknown {
-    return value === undefined ? null : value;
+    return tx.pure("option<address>", value ?? null);
 }
 
 export function optAddressVec(tx: any, values: string[] | undefined): unknown {
-    if (!values || values.length === 0) return null;
-    return values;
+    return tx.pure(
+        "option<vector<address>>",
+        values && values.length > 0 ? values : null,
+    );
 }
 
 export function optStringVec(tx: any, values: string[] | undefined): unknown {
-    if (!values || values.length === 0) return null;
-    return values;
+    return tx.pure(
+        "option<vector<string>>",
+        values && values.length > 0 ? values : null,
+    );
+}
+
+export function optU64(tx: any, value: number | undefined): unknown {
+    return tx.pure("option<u64>", value ?? null);
 }

@@ -7,12 +7,18 @@ import type {
     ReactToPostParams,
 } from "../types.js";
 import {
+    POST_ACCESS_MARKETPLACE_ONE_TIME,
+    POST_ACCESS_PROFILE_SUBSCRIPTION,
+    POST_ACCESS_PUBLIC,
+} from "../contract.js";
+import {
     MYSO_CLOCK,
     optAddress,
     optAddressVec,
     optBool,
     optString,
     optStringVec,
+    optU64,
     postModuleTarget,
     resolvePlatformObjectId,
 } from "./helpers.js";
@@ -35,9 +41,88 @@ function sharedObjects(
         platform: tx.object(platformObjectId),
         blockList: tx.object(chain.blockListRegistryId),
         postConfig: tx.object(chain.postConfigId),
+        memoryConfig: tx.object(chain.memoryConfigId),
         mydataRegistry: tx.object(chain.mydataRegistryId),
         memoryAccount: tx.object(memoryAccountId),
         clock: tx.object(chain.clockId ?? MYSO_CLOCK),
+    };
+}
+
+interface ResolvedPostAccess {
+    accessKind: 1 | 2 | 3;
+    subscriptionServiceId?: string;
+    linkedMydataId?: string;
+    subscriptionMinTierLevel?: number;
+}
+
+/** Resolves legacy aliases and enforces the field combinations accepted by Move. */
+export function resolveCreatePostAccess(
+    params: CreatePostParams,
+): ResolvedPostAccess {
+    if (params.enablePoc === true) {
+        throw new TypeError("enablePoc is no longer accepted by post::create_post");
+    }
+    if (
+        params.mydataId !== undefined &&
+        params.linkedMydataId !== undefined &&
+        params.mydataId !== params.linkedMydataId
+    ) {
+        throw new TypeError("mydataId and linkedMydataId must not disagree");
+    }
+
+    const linkedMydataId = params.linkedMydataId ?? params.mydataId;
+    const hasAccessFields =
+        params.subscriptionServiceId !== undefined ||
+        linkedMydataId !== undefined ||
+        params.subscriptionMinTierLevel !== undefined;
+    if (params.accessKind === undefined && hasAccessFields) {
+        throw new TypeError(
+            "accessKind is required when subscription or linked MyData fields are supplied",
+        );
+    }
+
+    const accessKind = params.accessKind ?? POST_ACCESS_PUBLIC;
+    if (accessKind === POST_ACCESS_PUBLIC) {
+        if (hasAccessFields) {
+            throw new TypeError("Public posts cannot include subscription or linked MyData fields");
+        }
+    } else if (accessKind === POST_ACCESS_PROFILE_SUBSCRIPTION) {
+        if (!params.subscriptionServiceId) {
+            throw new TypeError(
+                "subscriptionServiceId is required for profile-subscription posts",
+            );
+        }
+    } else if (accessKind === POST_ACCESS_MARKETPLACE_ONE_TIME) {
+        if (!linkedMydataId) {
+            throw new TypeError(
+                "linkedMydataId is required for marketplace one-time posts",
+            );
+        }
+        if (
+            params.subscriptionServiceId !== undefined ||
+            params.subscriptionMinTierLevel !== undefined
+        ) {
+            throw new TypeError(
+                "Marketplace one-time posts cannot include subscription fields",
+            );
+        }
+    } else {
+        throw new TypeError(`Unsupported post accessKind: ${String(accessKind)}`);
+    }
+
+    if (
+        params.subscriptionMinTierLevel !== undefined &&
+        (!Number.isSafeInteger(params.subscriptionMinTierLevel) ||
+            params.subscriptionMinTierLevel < 0)
+    ) {
+        throw new TypeError("subscriptionMinTierLevel must be a non-negative safe integer");
+    }
+
+    return {
+        accessKind,
+        subscriptionServiceId: params.subscriptionServiceId,
+        linkedMydataId,
+        subscriptionMinTierLevel: params.subscriptionMinTierLevel,
     };
 }
 
@@ -49,6 +134,7 @@ export function buildCreatePostTx(
     const tx = new Transaction();
     const platformId = resolvePlatformObjectId(chain, params.platformObjectId);
     const objs = sharedObjects(tx, chain, platformId, memoryAccountId);
+    const access = resolveCreatePostAccess(params);
 
     tx.moveCall({
         target: postModuleTarget(chain, "create_post"),
@@ -58,6 +144,7 @@ export function buildCreatePostTx(
             objs.platform,
             objs.blockList,
             objs.postConfig,
+            objs.memoryConfig,
             tx.pure("string", params.content),
             optStringVec(tx, params.mediaUrls),
             optAddressVec(tx, params.mentions),
@@ -68,9 +155,11 @@ export function buildCreatePostTx(
             optBool(tx, params.allowQuotes),
             optBool(tx, params.allowTips),
             optBool(tx, params.enableSpt),
-            optBool(tx, params.enablePoc),
             optBool(tx, params.enableSpot),
-            optAddress(tx, params.mydataId),
+            tx.pure("u8", access.accessKind),
+            optAddress(tx, access.subscriptionServiceId),
+            optAddress(tx, access.linkedMydataId),
+            optU64(tx, access.subscriptionMinTierLevel),
             objs.mydataRegistry,
             objs.memoryAccount,
             objs.clock,
@@ -97,13 +186,14 @@ export function buildCreateCommentTx(
             objs.platform,
             objs.blockList,
             objs.postConfig,
+            objs.memoryConfig,
+            objs.memoryAccount,
             tx.object(params.postId),
             optAddress(tx, params.parentCommentId),
             tx.pure("string", params.content),
             optStringVec(tx, params.mediaUrls),
             optAddressVec(tx, params.mentions),
             optString(tx, params.metadataJson),
-            objs.memoryAccount,
             objs.clock,
         ],
     });
@@ -128,6 +218,7 @@ export function buildReactToPostTx(
             objs.platform,
             objs.blockList,
             objs.postConfig,
+            objs.memoryConfig,
             objs.memoryAccount,
             tx.pure("string", params.reaction),
             objs.clock,
@@ -154,6 +245,7 @@ export function buildReactToCommentTx(
             objs.platform,
             objs.blockList,
             objs.postConfig,
+            objs.memoryConfig,
             objs.memoryAccount,
             tx.pure("string", params.reaction),
             objs.clock,
@@ -170,6 +262,9 @@ export function buildCreateRepostTx(
     const tx = new Transaction();
     const platformId = resolvePlatformObjectId(chain, params.platformObjectId);
     const objs = sharedObjects(tx, chain, platformId, memoryAccountId);
+    if (params.enablePoc === true) {
+        throw new TypeError("enablePoc is no longer accepted by post::create_repost");
+    }
 
     tx.moveCall({
         target: postModuleTarget(chain, "create_repost"),
@@ -179,6 +274,7 @@ export function buildCreateRepostTx(
             objs.platform,
             objs.blockList,
             objs.postConfig,
+            objs.memoryConfig,
             tx.object(params.originalPostId),
             optString(tx, params.content),
             optStringVec(tx, params.mediaUrls),
@@ -190,7 +286,6 @@ export function buildCreateRepostTx(
             optBool(tx, params.allowQuotes),
             optBool(tx, params.allowTips),
             optBool(tx, params.enableSpt),
-            optBool(tx, params.enablePoc),
             optBool(tx, params.enableSpot),
             objs.memoryAccount,
             objs.clock,
@@ -207,7 +302,10 @@ export function buildDeletePostTx(
     const tx = new Transaction();
     tx.moveCall({
         target: postModuleTarget(chain, "delete_post"),
-        arguments: [tx.object(postId)],
+        arguments: [
+            tx.object(postId),
+            tx.object(chain.clockId ?? MYSO_CLOCK),
+        ],
     });
     return tx;
 }
@@ -221,7 +319,11 @@ export function buildDeleteCommentTx(
     const tx = new Transaction();
     tx.moveCall({
         target: postModuleTarget(chain, "delete_comment"),
-        arguments: [tx.object(postId), tx.object(commentId)],
+        arguments: [
+            tx.object(postId),
+            tx.object(commentId),
+            tx.object(chain.clockId ?? MYSO_CLOCK),
+        ],
     });
     return tx;
 }

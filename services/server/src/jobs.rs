@@ -75,15 +75,12 @@ pub async fn execute_remember_text(
 
     rate_limit::check_storage_quota(state, owner, encrypted.len() as i64).await?;
 
-    let key_index = state
-        .key_pool
-        .next_index()
-        .ok_or_else(|| {
-            AppError::Internal(
-                "No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)"
-                    .into(),
-            )
-        })?;
+    let key_index = state.key_pool.next_index().ok_or_else(|| {
+        AppError::Internal(
+            "No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)"
+                .into(),
+        )
+    })?;
     let upload_result = file_storage::upload_blob(
         &state.http_client,
         &state.config.sidecar_url,
@@ -173,8 +170,7 @@ pub fn spawn_remember_job(
 
         match result {
             Ok((id, blob_id, _owner)) => {
-                if let Err(e) =
-                    set_job_status(&state, &job_id, "done", Some(&blob_id), None).await
+                if let Err(e) = set_job_status(&state, &job_id, "done", Some(&blob_id), None).await
                 {
                     tracing::error!("remember job {} failed to mark done: {}", job_id, e);
                 }
@@ -182,8 +178,7 @@ pub fn spawn_remember_job(
             }
             Err(e) => {
                 let msg = format!("{}", e);
-                if let Err(err) =
-                    set_job_status(&state, &job_id, "failed", None, Some(&msg)).await
+                if let Err(err) = set_job_status(&state, &job_id, "failed", None, Some(&msg)).await
                 {
                     tracing::error!("remember job {} failed to mark failed: {}", job_id, err);
                 }

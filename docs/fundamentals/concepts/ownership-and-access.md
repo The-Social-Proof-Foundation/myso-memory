@@ -51,8 +51,8 @@ Sub-agent authorization is enforced on-chain by the MySo `memory` module — not
 - The relayer resolves `derived_address → SubAgent`, checks capabilities, expiry, ancestry, and platform scope
 - Social **deletes** additionally require the human owner to co-sign HTTP requests and sign the chain transaction
 
-In v1, `approval_required_caps` and `max_action_spend` exist on-chain but are **not** enforced by the relayer. See [sub-agent-v1.md](../../contract/sub-agent-v1.md).
+For registry actions, `approval_required_caps` is enforced through an exact-input owner-wallet approval. `max_action_spend` is enforced only on routes with a deterministic spend estimate. See [sub-agent-v1.md](../../contract/sub-agent-v1.md).
 
 ## Social delete pattern
 
-On-chain post deletion is authorized by `post.owner` (the principal), not the sub-agent address. Clients must supply `ownerCoSignKey` for `deletePost` / `deleteComment` only — not for creates or reactions.
+On-chain post deletion is authorized by `post.owner` (the principal), not the sub-agent address. Clients supply an `ownerWallet` adapter: the wallet signs the approval intent and then the exact sponsored owner-sent transaction. Owner private keys are never sent to the relayer.

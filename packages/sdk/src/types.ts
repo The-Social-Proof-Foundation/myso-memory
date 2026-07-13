@@ -323,6 +323,11 @@ interface MemoryTxOpts {
     mysoNetwork?: "testnet" | "mainnet";
 }
 
+interface MemoryConfigTxOpts extends MemoryTxOpts {
+    /** Shared `memory::MemoryConfig` object required by the current Move ABI. */
+    memoryConfigId: string;
+}
+
 /** Options for ensureMemoryAccount() */
 export interface EnsureMemoryAccountOpts extends MemoryTxOpts {
     /** MemoryRegistry shared object ID */
@@ -362,9 +367,10 @@ interface SubAgentRegistrationFields {
 }
 
 /** Options for createAgenticOrganization() */
-export interface CreateAgenticOrganizationOpts extends MemoryTxOpts {
+export interface CreateAgenticOrganizationOpts extends MemoryConfigTxOpts {
     accountId: string;
     label: string;
+    description?: string;
     orgType: number;
 }
 
@@ -375,14 +381,14 @@ export interface CreateAgenticOrganizationResult {
 }
 
 /** Options for updateAgenticOrganizationLabel() */
-export interface UpdateAgenticOrganizationLabelOpts extends MemoryTxOpts {
+export interface UpdateAgenticOrganizationLabelOpts extends MemoryConfigTxOpts {
     accountId: string;
     organizationId: string;
     label: string;
 }
 
 /** Options for updateAgenticOrganizationCategory() */
-export interface UpdateAgenticOrganizationCategoryOpts extends MemoryTxOpts {
+export interface UpdateAgenticOrganizationCategoryOpts extends MemoryConfigTxOpts {
     accountId: string;
     organizationId: string;
     orgType: number;
@@ -395,12 +401,12 @@ export interface DeactivateAgenticOrganizationOpts extends MemoryTxOpts {
 }
 
 /** Options for registerSubAgent() */
-export interface RegisterSubAgentOpts extends MemoryTxOpts, SubAgentRegistrationFields {
+export interface RegisterSubAgentOpts extends MemoryConfigTxOpts, SubAgentRegistrationFields {
     organizationId: string;
 }
 
 /** Options for registerSubAgentDelegated() */
-export interface RegisterSubAgentDelegatedOpts extends MemoryTxOpts, SubAgentRegistrationFields {
+export interface RegisterSubAgentDelegatedOpts extends MemoryConfigTxOpts, SubAgentRegistrationFields {
     parentAgentObjectId: string;
     registerRelation: number;
 }
@@ -431,7 +437,7 @@ export interface UpdateSubAgentOpts extends MemoryTxOpts, SubAgentRegistrationFi
 }
 
 /** Options for updateSubAgentLabel() */
-export interface UpdateSubAgentLabelOpts extends MemoryTxOpts {
+export interface UpdateSubAgentLabelOpts extends MemoryConfigTxOpts {
     accountId: string;
     agentObjectId: string;
     label: string;
@@ -461,7 +467,7 @@ export interface ApproveKeyPolicyOpts extends MemoryTxOpts {
  * on the organization's memory share group. Used by org-visible blob decrypt
  * when the caller is not the account owner.
  */
-export interface ApproveOrgKeyPolicyOpts extends MemoryTxOpts {
+export interface ApproveOrgKeyPolicyOpts extends MemoryConfigTxOpts {
     accountId: string;
     organizationId: string;
     /** PermissionedGroup<MemorySharePackage> shared object for the org */
@@ -494,6 +500,7 @@ export interface RevokeOrgMemoryPermissionOpts extends OrgGroupTxBase {
 }
 
 export interface DefineCustomOrgRoleOpts extends OrgGroupTxBase {
+    memoryConfigId: string;
     roleName: string;
     mask: number;
 }

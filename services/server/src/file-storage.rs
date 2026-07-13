@@ -92,39 +92,46 @@ pub async fn upload_blob(
     let url = format!("{}/file-storage/upload", sidecar_url);
     let data_b64 = BASE64.encode(data);
 
-    let mut req = client
-        .post(&url)
-        .json(&FileStorageUploadRequest {
-            data: data_b64,
-            key_index,
-            owner: owner_address.to_string(),
-            namespace: namespace.to_string(),
-            package_id: package_id.to_string(),
-            epochs,
-            agent_id: agent_id.map(|s| s.to_string()),
-            visibility,
-            organization_id: organization_id.map(|s| s.to_string()),
-        });
+    let mut req = client.post(&url).json(&FileStorageUploadRequest {
+        data: data_b64,
+        key_index,
+        owner: owner_address.to_string(),
+        namespace: namespace.to_string(),
+        package_id: package_id.to_string(),
+        epochs,
+        agent_id: agent_id.map(|s| s.to_string()),
+        visibility,
+        organization_id: organization_id.map(|s| s.to_string()),
+    });
     if let Some(secret) = sidecar_secret {
         req = req.header("authorization", format!("Bearer {}", secret));
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Sidecar file-storage/upload request failed: {}. Is the sidecar running?", e))
-        })?;
+    let resp = req.send().await.map_err(|e| {
+        AppError::Internal(format!(
+            "Sidecar file-storage/upload request failed: {}. Is the sidecar running?",
+            e
+        ))
+    })?;
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         if let Ok(err) = serde_json::from_str::<SidecarError>(&body) {
-            return Err(AppError::Internal(format!("file-storage upload failed: {}", err.error)));
+            return Err(AppError::Internal(format!(
+                "file-storage upload failed: {}",
+                err.error
+            )));
         }
-        return Err(AppError::Internal(format!("file-storage upload failed: {}", body)));
+        return Err(AppError::Internal(format!(
+            "file-storage upload failed: {}",
+            body
+        )));
     }
 
     let result: FileStorageUploadResponse = resp.json().await.map_err(|e| {
-        AppError::Internal(format!("Failed to parse file storage/upload response: {}", e))
+        AppError::Internal(format!(
+            "Failed to parse file storage/upload response: {}",
+            e
+        ))
     })?;
 
     tracing::info!(
@@ -164,31 +171,32 @@ pub async fn query_blobs_by_owner(
         body["packageId"] = serde_json::json!(pkg);
     }
 
-    let mut req = client
-        .post(&url)
-        .json(&body);
+    let mut req = client.post(&url).json(&body);
     if let Some(secret) = sidecar_secret {
         req = req.header("authorization", format!("Bearer {}", secret));
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Sidecar file storage/query-blobs failed: {}", e))
-        })?;
+    let resp = req.send().await.map_err(|e| {
+        AppError::Internal(format!("Sidecar file storage/query-blobs failed: {}", e))
+    })?;
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!("file storage query-blobs failed: {}", body)));
+        return Err(AppError::Internal(format!(
+            "file storage query-blobs failed: {}",
+            body
+        )));
     }
 
-    let result: QueryBlobsResponse = resp.json().await.map_err(|e| {
-        AppError::Internal(format!("Failed to parse query-blobs response: {}", e))
-    })?;
+    let result: QueryBlobsResponse = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to parse query-blobs response: {}", e)))?;
 
     tracing::info!(
         "file storage query-blobs ok: {} blobs for owner={}, ns={:?}",
-        result.total, owner_address, namespace
+        result.total,
+        owner_address,
+        namespace
     );
 
     Ok(result.blobs)
@@ -211,7 +219,10 @@ pub async fn download_blob(
     let resp = match tokio::time::timeout(std::time::Duration::from_secs(15), download_fut).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
-            return Err(AppError::Internal(format!("File Storage download failed: {}", e)));
+            return Err(AppError::Internal(format!(
+                "File Storage download failed: {}",
+                e
+            )));
         }
         Err(_) => {
             return Err(AppError::Internal(format!(
@@ -246,4 +257,3 @@ pub async fn download_blob(
     );
     Ok(bytes.to_vec())
 }
-

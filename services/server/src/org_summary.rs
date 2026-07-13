@@ -70,9 +70,7 @@ impl OrgSummaryCache {
                 break;
             }
         }
-        guard
-            .order
-            .push(summary.organization_id.clone());
+        guard.order.push(summary.organization_id.clone());
         guard
             .entries
             .insert(summary.organization_id.clone(), summary);
@@ -110,9 +108,10 @@ pub async fn fetch_org_summary(
     if let Some(secret) = internal_sync_secret {
         req = req.header("x-internal-sync-secret", secret);
     }
-    let resp = req.send().await.map_err(|e| {
-        AppError::Internal(format!("org summary fetch failed: {e}"))
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("org summary fetch failed: {e}")))?;
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -124,9 +123,10 @@ pub async fn fetch_org_summary(
         )));
     }
 
-    let summary: OrgSummary = resp.json().await.map_err(|e| {
-        AppError::Internal(format!("org summary decode failed: {e}"))
-    })?;
+    let summary: OrgSummary = resp
+        .json()
+        .await
+        .map_err(|e| AppError::Internal(format!("org summary decode failed: {e}")))?;
     cache.insert(summary.clone()).await;
     Ok(Some(summary))
 }

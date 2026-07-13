@@ -1,5 +1,5 @@
-use blake2::Blake2b;
 use blake2::digest::{consts::U32, Digest};
+use blake2::Blake2b;
 use serde::Deserialize;
 
 use crate::memory_contract::E_ACCOUNT_DEACTIVATED;
@@ -38,7 +38,9 @@ pub async fn verify_sub_agent_onchain(
     let memory_account_id = agent_fields
         .get("memory_account_id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| OnchainVerifyError::RpcError("Missing memory_account_id on SubAgent".into()))?;
+        .ok_or_else(|| {
+            OnchainVerifyError::RpcError("Missing memory_account_id on SubAgent".into())
+        })?;
     if memory_account_id != account_object_id {
         return Err(OnchainVerifyError::RpcError(
             "SubAgent memory_account_id mismatch".into(),
@@ -121,7 +123,10 @@ async fn verify_memory_account_active(
         .ok_or_else(|| OnchainVerifyError::RpcError("Missing owner on MemoryAccount".into()))?
         .to_string();
 
-    let active = fields.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+    let active = fields
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     if !active {
         return Err(OnchainVerifyError::MemoryAccountDeactivated(format!(
             "Account {} has been deactivated (code={})",
@@ -141,9 +146,9 @@ fn verify_public_key_field(
         .map(|&b| serde_json::Value::Number(b.into()))
         .collect();
 
-    let stored_key = fields.get("public_key").ok_or_else(|| {
-        OnchainVerifyError::RpcError("Missing public_key on SubAgent".into())
-    })?;
+    let stored_key = fields
+        .get("public_key")
+        .ok_or_else(|| OnchainVerifyError::RpcError("Missing public_key on SubAgent".into()))?;
 
     if let Some(stored_arr) = stored_key.as_array() {
         if *stored_arr == pk_as_numbers {
@@ -175,10 +180,9 @@ async fn fetch_object_fields(
         .await
         .map_err(|e| OnchainVerifyError::RpcError(format!("HTTP request failed: {}", e)))?;
 
-    let rpc_response: RpcResponse = response
-        .json()
-        .await
-        .map_err(|e| OnchainVerifyError::RpcError(format!("Failed to parse RPC response: {}", e)))?;
+    let rpc_response: RpcResponse = response.json().await.map_err(|e| {
+        OnchainVerifyError::RpcError(format!("Failed to parse RPC response: {}", e))
+    })?;
 
     if let Some(error) = rpc_response.error {
         return Err(OnchainVerifyError::RpcError(format!(
@@ -250,7 +254,9 @@ impl std::fmt::Display for OnchainVerifyError {
         match self {
             OnchainVerifyError::RpcError(msg) => write!(f, "MySo RPC error: {}", msg),
             OnchainVerifyError::KeyNotFound(msg) => write!(f, "Key not found: {}", msg),
-            OnchainVerifyError::MemoryAccountDeactivated(msg) => write!(f, "Account deactivated: {}", msg),
+            OnchainVerifyError::MemoryAccountDeactivated(msg) => {
+                write!(f, "Account deactivated: {}", msg)
+            }
             OnchainVerifyError::SubAgentInactive(msg) => write!(f, "Sub-agent inactive: {}", msg),
             OnchainVerifyError::MissingCapability(msg) => write!(f, "Missing capability: {}", msg),
         }
@@ -262,7 +268,7 @@ impl std::error::Error for OnchainVerifyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_contract::{CAP_AI_SPEND, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MYDATA_READ, has_cap};
+    use crate::memory_contract::{has_cap, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MYDATA_READ};
 
     #[test]
     fn derived_address_is_deterministic() {

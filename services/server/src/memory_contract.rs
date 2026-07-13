@@ -7,9 +7,16 @@ pub const CAP_MYDATA_READ: u64 = 4;
 pub const CAP_POST_PUBLISH: u64 = 16;
 pub const CAP_MESSAGE_READ: u64 = 32;
 pub const CAP_MESSAGE_SEND: u64 = 64;
+pub const CAP_TRADE_MONITOR: u64 = 128;
+pub const CAP_TRADE_EXECUTE: u64 = 256;
 pub const CAP_COMMENT: u64 = 512;
 pub const CAP_REACT: u64 = 1024;
+pub const CAP_AGENT_REVOKE: u64 = 2048;
+pub const CAP_AGENT_UPDATE: u64 = 4096;
+pub const CAP_AGENT_REGISTER: u64 = 8192;
 pub const CAP_AI_SPEND: u64 = 16384;
+pub const CAP_BUDGET_MANAGE: u64 = 32768;
+pub const CAP_SOCIAL_GRAPH: u64 = 65536;
 
 pub const CLASS_HUMAN: u8 = 0;
 pub const CLASS_DELEGATED_AI: u8 = 1;
@@ -110,9 +117,16 @@ pub fn capability_label(cap: u64) -> &'static str {
         CAP_POST_PUBLISH => "post_publish",
         CAP_MESSAGE_READ => "message_read",
         CAP_MESSAGE_SEND => "message_send",
+        CAP_TRADE_MONITOR => "trade_monitor",
+        CAP_TRADE_EXECUTE => "trade_execute",
         CAP_COMMENT => "comment",
         CAP_REACT => "react",
+        CAP_AGENT_REVOKE => "agent_revoke",
+        CAP_AGENT_UPDATE => "agent_update",
+        CAP_AGENT_REGISTER => "agent_register",
         CAP_AI_SPEND => "ai_spend",
+        CAP_BUDGET_MANAGE => "budget_manage",
+        CAP_SOCIAL_GRAPH => "social_graph",
         _ => "unknown",
     }
 }
@@ -181,12 +195,7 @@ mod tests {
             check_direct_execution_allowed(CAP_MEMORY_WRITE, CAP_MEMORY_WRITE, false),
             Err(E_SUB_AGENT_APPROVAL_REQUIRED)
         );
-        assert!(check_direct_execution_allowed(
-            CAP_MEMORY_WRITE,
-            CAP_MEMORY_WRITE,
-            true
-        )
-        .is_ok());
+        assert!(check_direct_execution_allowed(CAP_MEMORY_WRITE, CAP_MEMORY_WRITE, true).is_ok());
     }
 
     #[test]
@@ -200,7 +209,10 @@ mod tests {
     fn spend_limit_mirror_matches_move_semantics() {
         assert!(check_spend_limit(None, 100).is_ok());
         assert!(check_spend_limit(Some(100), 50).is_ok());
-        assert_eq!(check_spend_limit(Some(10), 50), Err(E_SUB_AGENT_SPEND_EXCEEDED));
+        assert_eq!(
+            check_spend_limit(Some(10), 50),
+            Err(E_SUB_AGENT_SPEND_EXCEEDED)
+        );
     }
 
     #[test]

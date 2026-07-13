@@ -59,7 +59,11 @@ pub fn spawn_audit_push(state: &Arc<AppState>, entries: Vec<AuditEntry>) {
         return;
     }
     let client = state.http_client.clone();
-    let base_url = state.config.social_server_url.trim_end_matches('/').to_string();
+    let base_url = state
+        .config
+        .social_server_url
+        .trim_end_matches('/')
+        .to_string();
     let secret = state.config.audit_sync_secret.clone();
     tokio::spawn(async move {
         let url = format!("{}/internal/audit/logs", base_url);

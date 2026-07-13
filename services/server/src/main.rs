@@ -1,9 +1,14 @@
 mod access_request_client;
+mod action_approvals;
 mod ai_spend;
 mod audit_push;
 mod auth;
+mod chain_actions;
+mod chain_discovery;
 mod compatibility;
 mod db;
+#[path = "file-storage.rs"]
+mod file_storage;
 mod jobs;
 mod lifecycle;
 mod memory_contract;
@@ -21,12 +26,15 @@ mod social_routes;
 mod types;
 mod usage_stats;
 mod vault;
-#[path = "file-storage.rs"]
-mod file_storage;
 
-use axum::{extract::DefaultBodyLimit, middleware, routing::{delete, get, post}, Router};
-use std::net::SocketAddr;
 use axum::http::{header, HeaderValue, Method};
+use axum::{
+    extract::DefaultBodyLimit,
+    middleware,
+    routing::{delete, get, post},
+    Router,
+};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -48,22 +56,61 @@ async fn main() {
         .init();
 
     // Load config
-    let config = Config::from_env();
+    let mut config = Config::from_env();
     tracing::info!("starting memory server on port {}", config.port);
     tracing::info!("  MySo RPC: {}", config.myso_rpc_url);
     tracing::info!("  package id: {}", config.package_id);
     tracing::info!("  social server: {}", config.social_server_url);
-    tracing::info!("  memory account: {}", config.memory_account_id.as_deref().unwrap_or("(from client header)"));
-    tracing::info!("  rate limit: burst={}/min, sustained={}/hr, per-key={}/min, quota={}MB/user",
+    tracing::info!(
+        "  memory account: {}",
+        config
+            .memory_account_id
+            .as_deref()
+            .unwrap_or("(from client header)")
+    );
+    tracing::info!(
+        "  rate limit: burst={}/min, sustained={}/hr, per-key={}/min, quota={}MB/user",
         config.rate_limit.max_requests_per_minute,
         config.rate_limit.max_requests_per_hour,
         config.rate_limit.max_requests_per_delegate_key,
         config.rate_limit.max_storage_bytes / 1_048_576
     );
-    tracing::info!("  sponsor rate limit: {}/min, {}/hr per IP+sender",
+    tracing::info!(
+        "  sponsor rate limit: {}/min, {}/hr per IP+sender",
         config.sponsor_rate_limit.per_minute,
         config.sponsor_rate_limit.per_hour,
     );
+
+    // Build the shared HTTP client before sidecar startup so localnet can fill
+    // missing shared-object IDs from GraphQL and verify each result on the fullnode.
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Failed to build HTTP client");
+    if config.social_chain_auto_discovery {
+        match chain_discovery::discover_missing_chain_ids(&mut config, &http_client).await {
+            Ok(report) => {
+                if !report.discovered.is_empty() {
+                    tracing::info!(
+                        "  social chain: auto-discovered {}",
+                        report.discovered.join(", ")
+                    );
+                }
+                if !report.unresolved.is_empty() {
+                    tracing::warn!(
+                        "  social chain: unresolved {} — bootstrap/create required objects or set explicit env overrides",
+                        report.unresolved.join(", ")
+                    );
+                }
+            }
+            Err(error) => tracing::warn!("  social chain auto-discovery skipped: {error}"),
+        }
+    }
+    if !config.social_chain.is_configured() {
+        tracing::warn!(
+            "  social chain is incomplete; /config will omit socialChain and MCP organization actions will remain unavailable"
+        );
+    }
 
     // Start TS sidecar HTTP server (MYDATA + File Storage operations)
     let sidecar_url = config.sidecar_url.clone();
@@ -72,20 +119,23 @@ async fn main() {
     let scripts_dir = std::env::var("SIDECAR_SCRIPTS_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts"));
-    let mut sidecar_child = tokio::process::Command::new("npx")
+    let mut sidecar_command = tokio::process::Command::new("npx");
+    sidecar_command
         .args(["tsx", "sidecar-server.ts"])
         .current_dir(&scripts_dir)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    for (name, value) in config.social_chain.env_pairs() {
+        if !value.is_empty() {
+            sidecar_command.env(name, value);
+        }
+    }
+    let mut sidecar_child = sidecar_command
         .spawn()
         .expect("Failed to start TS sidecar. Is Node.js installed?");
 
     // Wait for sidecar to be ready (health check with retry)
     // LOW-9: Set 30s timeout on HTTP client to prevent hanging LLM/File Storage requests
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("Failed to build HTTP client");
     let health_url = format!("{}/health", sidecar_url);
     let mut ready = false;
     for attempt in 1..=30 {
@@ -113,12 +163,22 @@ async fn main() {
         .await
         .expect("Failed to connect to PostgreSQL");
 
-    tracing::info!("  File Storage publisher: {}", config.file_storage_publisher_url);
-    tracing::info!("  File Storage aggregator: {}", config.file_storage_aggregator_url);
+    tracing::info!(
+        "  File Storage publisher: {}",
+        config.file_storage_publisher_url
+    );
+    tracing::info!(
+        "  File Storage aggregator: {}",
+        config.file_storage_aggregator_url
+    );
     // Log upload key pool status
     let pool_size = config.myso_private_keys.len();
     if pool_size > 0 {
-        tracing::info!("  File Storage upload: {} key(s) in pool (parallel uploads up to {}x)", pool_size, pool_size);
+        tracing::info!(
+            "  File Storage upload: {} key(s) in pool (parallel uploads up to {}x)",
+            pool_size,
+            pool_size
+        );
     } else {
         tracing::warn!("  File Storage upload: no MySo private keys configured, uploads will fail");
     }
@@ -165,16 +225,45 @@ async fn main() {
     // + base64 overhead + JSON framing) while blocking abusive uploads before
     // auth + rate-limit middleware even sees the request.
     let protected_routes = Router::new()
+        .route("/api/agent/context", get(routes::agent_context))
+        .route("/api/messaging/inbox", get(routes::messaging_inbox))
+        .route("/api/messaging/wait", get(routes::messaging_wait))
+        .route(
+            "/api/organizations/{organization_id}/control",
+            get(routes::organization_control),
+        )
+        .route(
+            "/api/chain/actions/{digest}",
+            get(routes::chain_action_status),
+        )
+        .route(
+            "/api/chain/actions/prepare",
+            post(routes::prepare_registered_action),
+        )
+        .route(
+            "/api/chain/actions/submit",
+            post(routes::submit_registered_action),
+        )
+        .route(
+            "/api/chain/approvals/request",
+            post(routes::request_action_approval),
+        )
         .route("/api/remember", post(routes::remember))
         .route("/api/remember/{job_id}", get(routes::remember_status))
         .route("/api/remember/bulk", post(routes::remember_bulk))
-        .route("/api/remember/bulk/status", post(routes::remember_bulk_status))
+        .route(
+            "/api/remember/bulk/status",
+            post(routes::remember_bulk_status),
+        )
         .route("/api/recall", post(routes::recall))
         .route("/api/remember/manual", post(routes::remember_manual))
         .route("/api/recall/manual", post(routes::recall_manual))
-
         .route("/api/analyze", post(routes::analyze))
         .route("/api/ask", post(routes::ask))
+        .route(
+            "/api/ai-credit/inference",
+            post(routes::gateway_inference_route),
+        )
         .route(
             "/api/ai-credit/record-inference",
             post(routes::record_inference_usage_route),
@@ -183,7 +272,10 @@ async fn main() {
         .route("/api/social/post", post(social_routes::create_post))
         .route("/api/social/comment", post(social_routes::create_comment))
         .route("/api/social/react/post", post(social_routes::react_to_post))
-        .route("/api/social/react/comment", post(social_routes::react_to_comment))
+        .route(
+            "/api/social/react/comment",
+            post(social_routes::react_to_comment),
+        )
         .route("/api/social/repost", post(social_routes::create_repost))
         .route(
             "/api/social/post/{post_id}",
@@ -226,11 +318,37 @@ async fn main() {
     // ENG-1697: /config exposes non-secret deployment parameters (packageId,
     // network, myso_rpc_url) so the SDK can build MYDATA SessionKey without
     // the user adding packageId to MemoryConfig.
-    let public_routes = Router::new()
-        .route("/health", get(routes::health).layer(DefaultBodyLimit::max(16 * 1024)))
-        .route("/version", get(routes::version).layer(DefaultBodyLimit::max(16 * 1024)))
-        .route("/config", get(routes::get_config).layer(DefaultBodyLimit::max(16 * 1024)))
-        .merge(sponsor_routes);
+    let mut public_routes = Router::new()
+        .route(
+            "/health",
+            get(routes::health).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/version",
+            get(routes::version).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/config",
+            get(routes::get_config).layer(DefaultBodyLimit::max(16 * 1024)),
+        );
+    let owner_approval_routes = Router::new()
+        .route(
+            "/api/chain/approvals/{approval_id}/approve",
+            post(routes::approve_action_request),
+        )
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::sponsor_rate_limit_middleware,
+        ));
+    public_routes = public_routes.merge(owner_approval_routes);
+    if config.allow_public_generic_sponsor {
+        tracing::warn!(
+            target: "memory::security",
+            "ALLOW_PUBLIC_GENERIC_SPONSOR is enabled; arbitrary signed TransactionKind sponsorship is exposed"
+        );
+        public_routes = public_routes.merge(sponsor_routes);
+    }
 
     // CORS — restrict to configured origins.
     // Safe default is deny-all (no Access-Control-Allow-Origin header returned),
@@ -242,7 +360,9 @@ async fn main() {
             .split(',')
             .filter_map(|s| {
                 let s = s.trim();
-                if s.is_empty() { return None; }
+                if s.is_empty() {
+                    return None;
+                }
                 s.parse::<HeaderValue>().ok()
             })
             .collect();
@@ -252,26 +372,35 @@ async fn main() {
             CorsLayer::new() // deny-all: no Allow-Origin header emitted
         } else {
             tracing::info!("  CORS origins: {}", config.allowed_origins);
+            let mut allowed_headers = vec![
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                // SDK auth headers (required for Ed25519 signed requests)
+                "x-public-key".parse::<header::HeaderName>().unwrap(),
+                "x-signature".parse::<header::HeaderName>().unwrap(),
+                "x-timestamp".parse::<header::HeaderName>().unwrap(),
+                "x-nonce".parse::<header::HeaderName>().unwrap(),
+                "x-account-id".parse::<header::HeaderName>().unwrap(),
+                "x-platform-id".parse::<header::HeaderName>().unwrap(),
+                "x-owner-public-key".parse::<header::HeaderName>().unwrap(),
+                "x-owner-signature".parse::<header::HeaderName>().unwrap(),
+                // SessionKey envelope used instead of forwarding a private key.
+                "x-mydata-session".parse::<header::HeaderName>().unwrap(),
+            ];
+            if config.allow_legacy_delegate_key_forwarding {
+                allowed_headers.push("x-delegate-key".parse::<header::HeaderName>().unwrap());
+            }
+            if config.allow_legacy_social_key_forwarding {
+                allowed_headers.push(
+                    "x-owner-delegate-key"
+                        .parse::<header::HeaderName>()
+                        .unwrap(),
+                );
+            }
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(origins))
                 .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-                .allow_headers([
-                    header::CONTENT_TYPE,
-                    header::AUTHORIZATION,
-                    // SDK auth headers (required for Ed25519 signed requests)
-                    "x-public-key".parse::<header::HeaderName>().unwrap(),
-                    "x-signature".parse::<header::HeaderName>().unwrap(),
-                    "x-timestamp".parse::<header::HeaderName>().unwrap(),
-                    "x-nonce".parse::<header::HeaderName>().unwrap(),
-                    "x-account-id".parse::<header::HeaderName>().unwrap(),
-                    "x-delegate-key".parse::<header::HeaderName>().unwrap(),
-                    "x-platform-id".parse::<header::HeaderName>().unwrap(),
-                    "x-owner-public-key".parse::<header::HeaderName>().unwrap(),
-                    "x-owner-signature".parse::<header::HeaderName>().unwrap(),
-                    "x-owner-delegate-key".parse::<header::HeaderName>().unwrap(),
-                    // ENG-1697: SessionKey envelope replacing x-delegate-key
-                    "x-mydata-session".parse::<header::HeaderName>().unwrap(),
-                ])
+                .allow_headers(allowed_headers)
         }
     };
 
@@ -290,7 +419,10 @@ async fn main() {
 
     tracing::info!("memory server listening on {}", addr);
     tracing::info!("  health: http://localhost:{}/health", config.port);
-    tracing::info!("  api:    http://localhost:{}/api/{{remember,recall,analyze}}", config.port);
+    tracing::info!(
+        "  api:    http://localhost:{}/api/{{remember,recall,analyze}}",
+        config.port
+    );
 
     // Graceful shutdown: kill sidecar when server stops
     let shutdown = async {
@@ -298,10 +430,13 @@ async fn main() {
         tracing::info!("shutting down...");
     };
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown)
-        .await
-        .expect("Server failed");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .expect("Server failed");
 
     // Cleanup sidecar after shutdown
     sidecar_child.kill().await.ok();

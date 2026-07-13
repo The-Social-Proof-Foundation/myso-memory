@@ -26,8 +26,10 @@ All `/api/*` routes require signed headers. The SDK handles this automatically.
 | Header | Description |
 |--------|-------------|
 | `x-account-id` | MemoryAccount object ID hint — speeds up account resolution when not cached |
-| `x-delegate-key` | Sub-agent private key (hex) — legacy header for MYDATA decrypt flows |
 | `x-mydata-session` | Preferred MYDATA SessionKey export (base64 JSON) |
+| `x-platform-id` | Platform scope for registered social actions |
+
+Raw `x-delegate-key` and `x-owner-delegate-key` headers are rejected by default. Their emergency compatibility switches are local-development only.
 
 ### Signature Format
 
@@ -52,13 +54,35 @@ Service health check. No authentication required.
 
 ### `POST /sponsor`
 
-Proxy to the MYDATA/File Storage sidecar's `/sponsor` endpoint for sponsored transactions. No authentication required.
+Compatibility-only arbitrary TransactionKind sponsorship. This route is absent unless `ALLOW_PUBLIC_GENERIC_SPONSOR=true`; keep it disabled for agent deployments.
 
 ### `POST /sponsor/execute`
 
-Proxy to the sidecar's `/sponsor/execute` endpoint. No authentication required.
+Compatibility-only arbitrary sponsored transaction submission. This route is absent unless `ALLOW_PUBLIC_GENERIC_SPONSOR=true`.
 
 ## Protected Routes
+
+### `POST /api/chain/actions/prepare`
+
+Validate an exact registry action, capability, approval policy, platform scope, and idempotency key. The trusted gateway builds the transaction from the shared action registry, pins registry/package/parameter/byte hashes in PostgreSQL, sponsors it, and returns bytes for local signing. Arbitrary Move targets and PTBs are not accepted.
+
+Approval-gated calls include `approvalId`. The approval must match the exact parameter hash and is atomically bound to the prepared action. Tier 3 and approval-gated actions use the current account owner as transaction sender.
+
+### `POST /api/chain/approvals/request`
+
+Authenticated agent endpoint that creates an idempotent, expiring owner approval intent bound to account, agent, registry action/version, parameters, capability, and platform.
+
+### `POST /api/chain/approvals/{approvalId}/approve`
+
+Accepts a serialized MySo wallet personal-message signature. The trusted sidecar verifies the intent signature, and the server rechecks the current on-chain account owner before recording approval.
+
+### `POST /api/chain/actions/submit`
+
+Submit a local signature for the matching prepared digest. Replays with the same identity are idempotent; conflicting metadata or a package-version change fails closed.
+
+### `GET /api/chain/actions/{digest}`
+
+Read finality directly from chain RPC. Indexed enrichment is separately labeled and optional.
 
 ### `POST /api/remember`
 

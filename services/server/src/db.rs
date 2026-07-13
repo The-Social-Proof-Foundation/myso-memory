@@ -28,18 +28,27 @@ impl VectorDb {
             ("001", include_str!("../migrations/001_init.sql")),
             ("002", include_str!("../migrations/002_add_namespace.sql")),
             ("003", include_str!("../migrations/003_rate_limiter.sql")),
-            ("004", include_str!("../migrations/004_delegate_key_cache_expires.sql")),
+            (
+                "004",
+                include_str!("../migrations/004_delegate_key_cache_expires.sql"),
+            ),
             ("005", include_str!("../migrations/005_sub_agent_cache.sql")),
             ("006", include_str!("../migrations/006_agent_scope.sql")),
-            ("007", include_str!("../migrations/007_sub_agent_policy_cache.sql")),
+            (
+                "007",
+                include_str!("../migrations/007_sub_agent_policy_cache.sql"),
+            ),
             ("008", include_str!("../migrations/008_remember_jobs.sql")),
             ("009", include_str!("../migrations/009_importance.sql")),
             ("010", include_str!("../migrations/010_visibility.sql")),
+            (
+                "011",
+                include_str!("../migrations/011_chain_action_requests.sql"),
+            ),
         ] {
-            sqlx::raw_sql(sql)
-                .execute(&pool)
-                .await
-                .map_err(|e| AppError::Internal(format!("Failed to run migration {}: {}", name, e)))?;
+            sqlx::raw_sql(sql).execute(&pool).await.map_err(|e| {
+                AppError::Internal(format!("Failed to run migration {}: {}", name, e))
+            })?;
         }
 
         tracing::info!("database connected and migrations applied");
@@ -232,14 +241,14 @@ impl VectorDb {
     }
 
     pub async fn delete_by_blob_id(&self, blob_id: &str, owner: &str) -> Result<u64, AppError> {
-        let result = sqlx::query(
-            "DELETE FROM vector_entries WHERE blob_id = $1 AND owner = $2",
-        )
-        .bind(blob_id)
-        .bind(owner)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to delete vector by blob_id: {}", e)))?;
+        let result = sqlx::query("DELETE FROM vector_entries WHERE blob_id = $1 AND owner = $2")
+            .bind(blob_id)
+            .bind(owner)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to delete vector by blob_id: {}", e))
+            })?;
 
         let rows = result.rows_affected();
         if rows > 0 {
@@ -327,7 +336,9 @@ impl VectorDb {
         let result = sqlx::query("DELETE FROM sub_agent_cache WHERE expires_at <= NOW()")
             .execute(&self.pool)
             .await
-            .map_err(|e| AppError::Internal(format!("Failed to evict expired sub-agents: {}", e)))?;
+            .map_err(|e| {
+                AppError::Internal(format!("Failed to evict expired sub-agents: {}", e))
+            })?;
         Ok(result.rows_affected())
     }
 
@@ -340,7 +351,10 @@ impl VectorDb {
         Ok(result.rows_affected())
     }
 
-    pub async fn delete_cached_sub_agent_by_derived(&self, derived_address: &str) -> Result<u64, AppError> {
+    pub async fn delete_cached_sub_agent_by_derived(
+        &self,
+        derived_address: &str,
+    ) -> Result<u64, AppError> {
         let result = sqlx::query("DELETE FROM sub_agent_cache WHERE derived_address = $1")
             .bind(derived_address)
             .execute(&self.pool)
@@ -349,14 +363,16 @@ impl VectorDb {
         Ok(result.rows_affected())
     }
 
-    pub async fn get_vault_for_agent(&self, agent_object_id: &str) -> Result<Option<String>, AppError> {
-        let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT vault_id FROM agent_vaults WHERE agent_object_id = $1",
-        )
-        .bind(agent_object_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to query agent vault: {}", e)))?;
+    pub async fn get_vault_for_agent(
+        &self,
+        agent_object_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT vault_id FROM agent_vaults WHERE agent_object_id = $1")
+                .bind(agent_object_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to query agent vault: {}", e)))?;
 
         Ok(row.and_then(|(vault_id,)| vault_id))
     }
@@ -383,12 +399,13 @@ impl VectorDb {
     }
 
     pub async fn list_cached_derived_agents(&self) -> Result<Vec<(String, String)>, AppError> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT derived_address, agent_object_id FROM sub_agent_cache",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to list cached sub-agents: {}", e)))?;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT derived_address, agent_object_id FROM sub_agent_cache")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    AppError::Internal(format!("Failed to list cached sub-agents: {}", e))
+                })?;
         Ok(rows)
     }
 
@@ -402,8 +419,15 @@ impl VectorDb {
         Ok(rows)
     }
 
-    pub async fn get_storage_used_with_lock(&self, owner: &str, lock_key: i64) -> Result<i64, AppError> {
-        let mut tx = self.pool.begin().await
+    pub async fn get_storage_used_with_lock(
+        &self,
+        owner: &str,
+        lock_key: i64,
+    ) -> Result<i64, AppError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
             .map_err(|e| AppError::Internal(format!("Failed to begin tx: {}", e)))?;
 
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
@@ -420,7 +444,9 @@ impl VectorDb {
         .await
         .map_err(|e| AppError::Internal(format!("Failed to get storage used: {}", e)))?;
 
-        tx.commit().await.map_err(|e| AppError::Internal(format!("Failed to commit tx: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to commit tx: {}", e)))?;
 
         Ok(row.0)
     }

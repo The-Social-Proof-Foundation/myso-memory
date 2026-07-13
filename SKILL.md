@@ -271,6 +271,8 @@ import {
 } from "@socialproof/memory/account";
 
 await registerSubAgent({
+  memoryConfigId: "0x...",
+  organizationId: "0x...",
   capabilities: CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_POST_PUBLISH | CAP_COMMENT | CAP_REACT,
   // ...
 });

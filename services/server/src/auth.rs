@@ -10,12 +10,12 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::memory_contract::{
-    self, capability_label, CAP_COMMENT, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MYDATA_READ,
-    CAP_POST_PUBLISH, CAP_REACT, E_SUB_AGENT_APPROVAL_REQUIRED, check_direct_execution_allowed,
-    check_spend_limit,
+    self, capability_label, check_direct_execution_allowed, check_spend_limit, CAP_AI_SPEND,
+    CAP_COMMENT, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MESSAGE_READ, CAP_MYDATA_READ,
+    CAP_POST_PUBLISH, CAP_REACT, E_SUB_AGENT_APPROVAL_REQUIRED,
 };
 use crate::myso::{derived_address_from_public_key, verify_sub_agent_onchain};
-use crate::policy::{PolicyError, RequestPolicyInput, validate_agent_policy};
+use crate::policy::{validate_agent_policy, PolicyError, RequestPolicyInput};
 use crate::social::{
     fetch_ancestor_chain, fetch_sub_agent_by_derived_address, fetch_sub_agent_by_object_id,
     SocialApiError, SocialSubAgent,
@@ -65,9 +65,7 @@ fn verify_owner_co_signature(
         return false;
     };
     let signature = Signature::from_bytes(&sig_array);
-    verifying_key
-        .verify(message.as_bytes(), &signature)
-        .is_ok()
+    verifying_key.verify(message.as_bytes(), &signature).is_ok()
 }
 
 pub async fn verify_signature(
@@ -100,10 +98,24 @@ pub async fn verify_signature(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    let sub_agent_key_hex = headers
-        .get("x-delegate-key")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    if headers.contains_key("x-delegate-key") && !state.config.allow_legacy_delegate_key_forwarding
+    {
+        tracing::warn!(
+            target: "memory::security",
+            "rejected legacy x-delegate-key transport"
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let sub_agent_key_hex = state
+        .config
+        .allow_legacy_delegate_key_forwarding
+        .then(|| {
+            headers
+                .get("x-delegate-key")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .flatten();
 
     let mydata_session = headers
         .get("x-mydata-session")
@@ -140,16 +152,12 @@ pub async fn verify_signature(
     }
 
     let pk_bytes = hex::decode(&public_key_hex).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let pk_array: [u8; 32] = pk_bytes
-        .try_into()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let pk_array: [u8; 32] = pk_bytes.try_into().map_err(|_| StatusCode::UNAUTHORIZED)?;
     let verifying_key =
         VerifyingKey::from_bytes(&pk_array).map_err(|_| StatusCode::UNAUTHORIZED)?;
 
     let sig_bytes = hex::decode(&signature_hex).map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let sig_array: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| StatusCode::UNAUTHORIZED)?;
     let signature = Signature::from_bytes(&sig_array);
 
     let method = request.method().as_str().to_string();
@@ -168,10 +176,25 @@ pub async fn verify_signature(
         .get("x-owner-signature")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
-    let owner_delegate_key = headers
-        .get("x-owner-delegate-key")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
+    if headers.contains_key("x-owner-delegate-key")
+        && !state.config.allow_legacy_social_key_forwarding
+    {
+        tracing::warn!(
+            target: "memory::security",
+            "rejected legacy x-owner-delegate-key transport"
+        );
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let owner_delegate_key = state
+        .config
+        .allow_legacy_social_key_forwarding
+        .then(|| {
+            headers
+                .get("x-owner-delegate-key")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .flatten();
 
     let (mut parts, body) = request.into_parts();
 
@@ -239,7 +262,7 @@ pub async fn verify_signature(
         }
     };
 
-    if is_write {
+    if is_write && required_cap != 0 {
         if let Err(code) = check_direct_execution_allowed(
             resolved.agent.approval_required_caps as u64,
             required_cap,
@@ -251,22 +274,26 @@ pub async fn verify_signature(
                 }));
             }
         }
-        if let Err(code) = check_spend_limit(
-            resolved.agent.max_action_spend.map(|v| v as u64),
-            ESTIMATED_FILE_STORAGE_UPLOAD_MIST,
-        ) {
-            tracing::warn!(
-                "max_action_spend exceeded for agent {} (code={})",
-                resolved.agent.agent_object_id,
-                code
-            );
-            return Err(policy_reject(PolicyError::SpendLimitExceeded {
-                limit_mist: resolved.agent.max_action_spend.map(|v| v as u64),
-            }));
+        if requires_file_storage_spend(method.as_str(), &path_only) {
+            if let Err(code) = check_spend_limit(
+                resolved.agent.max_action_spend.map(|v| v as u64),
+                ESTIMATED_FILE_STORAGE_UPLOAD_MIST,
+            ) {
+                tracing::warn!(
+                    "max_action_spend exceeded for agent {} (code={})",
+                    resolved.agent.agent_object_id,
+                    code
+                );
+                return Err(policy_reject(PolicyError::SpendLimitExceeded {
+                    limit_mist: resolved.agent.max_action_spend.map(|v| v as u64),
+                }));
+            }
         }
     }
 
-    if !memory_contract::has_cap(resolved.agent.capabilities as u64, CAP_MYDATA_READ) {
+    if requires_mydata_access(&path_only)
+        && !memory_contract::has_cap(resolved.agent.capabilities as u64, CAP_MYDATA_READ)
+    {
         tracing::warn!(
             "agent {} missing {}",
             resolved.agent.agent_object_id,
@@ -317,11 +344,38 @@ fn is_write_route(method: &str, path: &str) -> bool {
     }
     method == "POST"
         && (path.starts_with("/api/remember")
+            || path == "/api/chain/actions/prepare"
+            || path == "/api/chain/actions/submit"
+            || path == "/api/chain/approvals/request"
             || path == "/api/analyze"
+            || path == "/api/ask"
+            || path == "/api/ai-credit/inference"
+            || path == "/api/ai-credit/record-inference"
             || path == "/api/restore")
 }
 
+fn requires_mydata_access(path: &str) -> bool {
+    path.starts_with("/api/remember") || path.starts_with("/api/recall") || path == "/api/restore"
+}
+
+fn requires_file_storage_spend(method: &str, path: &str) -> bool {
+    method == "POST" && (path.starts_with("/api/remember") || path == "/api/restore")
+}
+
 fn required_capability_for_path(method: &str, path: &str) -> u64 {
+    if path.starts_with("/api/messaging/") {
+        return CAP_MESSAGE_READ;
+    }
+    if path == "/api/agent/context" || path.starts_with("/api/chain/actions/") {
+        return 0;
+    }
+    if path == "/api/analyze"
+        || path == "/api/ask"
+        || path == "/api/ai-credit/inference"
+        || path == "/api/ai-credit/record-inference"
+    {
+        return CAP_AI_SPEND;
+    }
     if path.starts_with("/api/social/") {
         if method == "DELETE" {
             if path.starts_with("/api/social/post/") {
@@ -348,10 +402,7 @@ fn required_capability_for_path(method: &str, path: &str) -> u64 {
     if method != "POST" {
         return CAP_MEMORY_READ;
     }
-    if path.starts_with("/api/remember")
-        || path == "/api/analyze"
-        || path == "/api/restore"
-    {
+    if path.starts_with("/api/remember") || path == "/api/analyze" || path == "/api/restore" {
         CAP_MEMORY_WRITE
     } else {
         CAP_MEMORY_READ
@@ -407,11 +458,7 @@ async fn resolve_sub_agent(
                         let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
                     }
                     Err(e) => {
-                        tracing::debug!(
-                            "cached sub-agent {} stale: {}",
-                            cached.agent_object_id,
-                            e
-                        );
+                        tracing::debug!("cached sub-agent {} stale: {}", cached.agent_object_id, e);
                     }
                 }
             }
@@ -471,25 +518,23 @@ async fn resolve_sub_agent(
     }
 
     let agent = agent.expect("agent resolved");
-    let ancestors = fetch_ancestor_chain(
-        &state.http_client,
-        &state.config.social_server_url,
-        &agent,
-    )
-    .await
-    .map_err(|e| ResolveError::Other(e.to_string()))?;
+    let ancestors =
+        fetch_ancestor_chain(&state.http_client, &state.config.social_server_url, &agent)
+            .await
+            .map_err(|e| ResolveError::Other(e.to_string()))?;
 
     let owner_co_signed = match (owner_pk, owner_sig) {
-        (Some(pk), Some(sig)) if is_write => {
-            verify_owner_co_signature(pk, sig, message, &owner)
-        }
+        (Some(pk), Some(sig)) if is_write => verify_owner_co_signature(pk, sig, message, &owner),
         _ => false,
     };
 
     validate_agent_policy(&agent, &ancestors, required_cap, &policy_input)
         .map_err(ResolveError::Policy)?;
 
-    let _ = state.db.cache_sub_agent(public_key_hex, &agent, &owner).await;
+    let _ = state
+        .db
+        .cache_sub_agent(public_key_hex, &agent, &owner)
+        .await;
 
     Ok(ResolvedSubAgent {
         agent,
@@ -507,6 +552,18 @@ mod tests {
         assert_eq!(
             required_capability_for_path("POST", "/api/remember"),
             CAP_MEMORY_WRITE
+        );
+    }
+
+    #[test]
+    fn messaging_inbox_requires_message_read() {
+        assert_eq!(
+            required_capability_for_path("GET", "/api/messaging/inbox"),
+            CAP_MESSAGE_READ,
+        );
+        assert_eq!(
+            required_capability_for_path("GET", "/api/messaging/wait"),
+            CAP_MESSAGE_READ,
         );
     }
 
@@ -530,6 +587,38 @@ mod tests {
     fn is_write_route_social() {
         assert!(is_write_route("POST", "/api/social/post"));
         assert!(is_write_route("DELETE", "/api/social/post/0xabc"));
+    }
+
+    #[test]
+    fn context_is_available_to_any_authenticated_agent() {
+        assert_eq!(required_capability_for_path("GET", "/api/agent/context"), 0);
+        assert!(!requires_mydata_access("/api/agent/context"));
+    }
+
+    #[test]
+    fn registry_gateway_defers_action_capability_to_validated_body() {
+        assert_eq!(
+            required_capability_for_path("POST", "/api/chain/actions/prepare"),
+            0
+        );
+        assert!(is_write_route("POST", "/api/chain/actions/prepare"));
+        assert!(!requires_file_storage_spend(
+            "POST",
+            "/api/chain/actions/prepare"
+        ));
+    }
+
+    #[test]
+    fn inference_requires_ai_spend_without_file_storage_allowance() {
+        assert_eq!(
+            required_capability_for_path("POST", "/api/ai-credit/inference"),
+            CAP_AI_SPEND
+        );
+        assert!(is_write_route("POST", "/api/ai-credit/inference"));
+        assert!(!requires_file_storage_spend(
+            "POST",
+            "/api/ai-credit/inference"
+        ));
     }
 
     #[test]

@@ -4,6 +4,8 @@ export interface ParsedTxEffects {
     commentId?: string;
     repostId?: string;
     deleted?: boolean;
+    messageGroupId?: string;
+    messageSeq?: number;
 }
 
 export function parseSocialTxEffects(
@@ -32,6 +34,9 @@ export function parseSocialTxEffects(
             } else if (type.includes("::post::Comment")) {
                 out.deleted = true;
                 out.commentId = change.objectId;
+            } else if (type.includes("::post::Repost")) {
+                out.deleted = true;
+                out.repostId = change.objectId;
             }
         }
     }
@@ -57,6 +62,14 @@ export function parseSocialTxEffects(
         if (type.includes("CommentDeletedEvent")) {
             out.deleted = true;
             if (parsed.comment_id) out.commentId = parsed.comment_id;
+        }
+        if (type.includes("RepostRemovedEvent")) {
+            out.deleted = true;
+            if (parsed.repost_id) out.repostId = parsed.repost_id;
+        }
+        if (type.includes("MessageDigestSent")) {
+            if (parsed.group_id) out.messageGroupId = parsed.group_id;
+            if (typeof parsed.seq === "number") out.messageSeq = parsed.seq;
         }
     }
 

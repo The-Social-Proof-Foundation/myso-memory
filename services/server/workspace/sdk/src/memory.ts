@@ -36,6 +36,8 @@ import type {
     RecallResult,
     RecallMemory,
     RecallOptions,
+    RememberOptions,
+    MemoryVisibility,
     EmbedResult,
     AnalyzeResult,
     HealthResult,
@@ -51,6 +53,7 @@ import {
     compatibilityErrorFromStatus,
     MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
 } from "./compatibility.js";
+import { AI_CREDIT_APPROVAL_REQUIRED_CODE } from "./contract.js";
 import { sha256hex, hexToBytes, bytesToHex, normalizeServerUrl, sanitizeServerError } from "./utils.js";
 
 // ============================================================
@@ -90,6 +93,20 @@ const MYDATA_SESSION_TTL_MIN = 5;
 // the client thinks the session is valid but a just-received request hits
 // a key server that sees it as expired.
 const MYDATA_SESSION_SAFETY_MARGIN_MS = 30_000;
+
+/** Thrown when a spend exceeds the agent's approval threshold (HTTP 402). */
+export class AiCreditApprovalRequiredError extends Error {
+    readonly status = 402;
+    readonly serverCode = AI_CREDIT_APPROVAL_REQUIRED_CODE;
+    constructor(
+        message: string,
+        readonly thresholdMist: number,
+        readonly estimatedMist: number,
+    ) {
+        super(message);
+        this.name = "AiCreditApprovalRequiredError";
+    }
+}
 
 export class Memory {
     private privateKey: Uint8Array;
@@ -168,12 +185,18 @@ export class Memory {
     /**
      * Enqueue a remember job (returns 202 with job_id). Use rememberAndWait() for sync semantics.
      */
-    async remember(text: string, subLabel?: string): Promise<RememberAcceptedResponse> {
+    async remember(
+        text: string,
+        subLabelOrOpts?: string | RememberOptions,
+    ): Promise<RememberAcceptedResponse> {
         await this.ensureCompatibleRelayer();
+        const opts = typeof subLabelOrOpts === "string"
+            ? { subLabel: subLabelOrOpts }
+            : (subLabelOrOpts ?? {});
         return this.signedRequest<RememberAcceptedResponse>(
             "POST",
             "/api/remember",
-            { text, ...this.scopeFields(subLabel) },
+            { text, ...this.scopeFields(opts.subLabel), ...this.visibilityField(opts.visibility) },
             { acceptedStatuses: [202] },
         );
     }
@@ -214,12 +237,18 @@ export class Memory {
         return this.waitForRememberJob(accepted.job_id, opts);
     }
 
-    async rememberBulk(texts: string[], subLabel?: string): Promise<RememberBulkAcceptedResponse> {
+    async rememberBulk(
+        texts: string[],
+        subLabelOrOpts?: string | RememberOptions,
+    ): Promise<RememberBulkAcceptedResponse> {
         await this.ensureCompatibleRelayer();
+        const opts = typeof subLabelOrOpts === "string"
+            ? { subLabel: subLabelOrOpts }
+            : (subLabelOrOpts ?? {});
         return this.signedRequest<RememberBulkAcceptedResponse>(
             "POST",
             "/api/remember/bulk",
-            { texts, ...this.scopeFields(subLabel) },
+            { texts, ...this.scopeFields(opts.subLabel), ...this.visibilityField(opts.visibility) },
             { acceptedStatuses: [202] },
         );
     }
@@ -286,6 +315,9 @@ export class Memory {
                 query,
                 limit,
                 ...this.scopeFields(label),
+                ...(typeof limitOrOpts === "object" && limitOrOpts.scope
+                    ? { scope: limitOrOpts.scope }
+                    : {}),
                 ...(scoringWeights ? { scoring_weights: scoringWeights } : {}),
             }, { signal: ac.signal });
         } finally {
@@ -327,6 +359,7 @@ export class Memory {
                 blob_id: opts.blobId,
                 vector: opts.vector,
                 ...this.scopeFields(opts.namespace ?? opts.subLabel),
+                ...this.visibilityField(opts.visibility),
             },
             { includeDelegateKey: false },
         );
@@ -340,6 +373,7 @@ export class Memory {
                 vector: opts.vector,
                 limit: opts.limit ?? 10,
                 ...this.scopeFields(opts.namespace ?? opts.subLabel),
+                ...(opts.scope ? { scope: opts.scope } : {}),
             },
             { includeDelegateKey: false },
         );
@@ -368,11 +402,39 @@ export class Memory {
      * console.log(result.facts) // ["User loves coffee", "User lives in Tokyo"]
      * ```
      */
-    async analyze(text: string, subLabel?: string): Promise<AnalyzeResult> {
+    async analyze(
+        text: string,
+        subLabelOrOpts?: string | RememberOptions,
+    ): Promise<AnalyzeResult> {
+        const opts = typeof subLabelOrOpts === "string"
+            ? { subLabel: subLabelOrOpts }
+            : (subLabelOrOpts ?? {});
         return this.signedRequest<AnalyzeResult>("POST", "/api/analyze", {
             text,
-            ...this.scopeFields(subLabel),
+            ...this.scopeFields(opts.subLabel),
+            ...this.visibilityField(opts.visibility),
         });
+    }
+
+    /**
+     * Record inference token usage after LLM calls made outside memory-server (e.g. chatbot).
+     * Requires `AI_CREDIT_ENABLED=1` on the server; no-ops when credits are disabled.
+     */
+    async recordInferenceUsage(params: {
+        modelId: string;
+        tokensIn: number;
+        tokensOut: number;
+    }): Promise<{ ok: boolean }> {
+        await this.ensureCompatibleRelayer();
+        return this.signedRequest<{ ok: boolean }>(
+            "POST",
+            "/api/ai-credit/record-inference",
+            {
+                model_id: params.modelId,
+                tokens_in: params.tokensIn,
+                tokens_out: params.tokensOut,
+            },
+        );
     }
 
     /**
@@ -430,10 +492,15 @@ export class Memory {
         return {};
     }
 
+    private visibilityField(visibility?: MemoryVisibility): { visibility?: MemoryVisibility } {
+        return visibility ? { visibility } : {};
+    }
+
     private isWriteRoute(method: string, path: string): boolean {
         if (method !== "POST") return false;
         return path.startsWith("/api/remember")
             || path.startsWith("/api/analyze")
+            || path.startsWith("/api/ai-credit")
             || path.startsWith("/api/restore");
     }
 
@@ -711,6 +778,24 @@ export class Memory {
             if (compatErr) throw compatErr;
 
             const { message, serverCode } = sanitizeServerError(res.status, raw);
+            if (
+                res.status === 402
+                && serverCode === AI_CREDIT_APPROVAL_REQUIRED_CODE
+            ) {
+                let thresholdMist = 0;
+                let estimatedMist = 0;
+                try {
+                    const parsed = JSON.parse(raw) as {
+                        threshold_mist?: number;
+                        estimated_mist?: number;
+                    };
+                    thresholdMist = parsed.threshold_mist ?? 0;
+                    estimatedMist = parsed.estimated_mist ?? 0;
+                } catch {
+                    /* ignore malformed body */
+                }
+                throw new AiCreditApprovalRequiredError(message, thresholdMist, estimatedMist);
+            }
             const err = new Error(message) as Error & {
                 status?: number;
                 serverCode?: string;

@@ -99,8 +99,8 @@ impl CompositeRanker {
             if weights.recency_half_life_days <= 0.0 {
                 0.0
             } else {
-                let decay = (-age_days * std::f64::consts::LN_2 / weights.recency_half_life_days)
-                    .exp();
+                let decay =
+                    (-age_days * std::f64::consts::LN_2 / weights.recency_half_life_days).exp();
                 weights.recency * decay
             }
         } else {

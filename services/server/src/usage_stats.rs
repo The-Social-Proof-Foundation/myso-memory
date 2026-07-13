@@ -25,8 +25,7 @@ pub fn spawn_usage_stats_sync(state: Arc<AppState>) {
     }
     let interval_secs = state.config.memory_usage_sync_interval_secs.max(30);
     tokio::spawn(async move {
-        let mut ticker =
-            tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;

@@ -85,11 +85,7 @@ struct MyDataDecryptResponse {
 /// so org members share a cryptographic namespace gated by `approve_org_key_policy`.
 /// When org visibility is requested without an organization id, fall back to the
 /// owner address so legacy rows and callers keep working.
-pub fn select_mydata_owner(
-    visibility: i16,
-    owner: &str,
-    organization_id: Option<&str>,
-) -> String {
+pub fn select_mydata_owner(visibility: i16, owner: &str, organization_id: Option<&str>) -> String {
     if visibility == VISIBILITY_ORG {
         organization_id
             .filter(|id| !id.is_empty())
@@ -121,38 +117,42 @@ pub async fn mydata_encrypt(
     let url = format!("{}/mydata/encrypt", sidecar_url);
     let data_b64 = BASE64.encode(data);
 
-    let mut req = client
-        .post(&url)
-        .json(&MyDataEncryptRequest {
-            data: data_b64,
-            owner: mydata_owner,
-            package_id: package_id.to_string(),
-        });
+    let mut req = client.post(&url).json(&MyDataEncryptRequest {
+        data: data_b64,
+        owner: mydata_owner,
+        package_id: package_id.to_string(),
+    });
     if let Some(secret) = sidecar_secret {
         req = req.header("authorization", format!("Bearer {}", secret));
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Sidecar mydata/encrypt request failed: {}. Is the sidecar running?", e))
-        })?;
+    let resp = req.send().await.map_err(|e| {
+        AppError::Internal(format!(
+            "Sidecar mydata/encrypt request failed: {}. Is the sidecar running?",
+            e
+        ))
+    })?;
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         if let Ok(err) = serde_json::from_str::<SidecarError>(&body) {
-            return Err(AppError::Internal(format!("mydata encrypt failed: {}", err.error)));
+            return Err(AppError::Internal(format!(
+                "mydata encrypt failed: {}",
+                err.error
+            )));
         }
-        return Err(AppError::Internal(format!("mydata encrypt failed: {}", body)));
+        return Err(AppError::Internal(format!(
+            "mydata encrypt failed: {}",
+            body
+        )));
     }
 
     let result: MyDataEncryptResponse = resp.json().await.map_err(|e| {
         AppError::Internal(format!("Failed to parse mydata/encrypt response: {}", e))
     })?;
 
-    let encrypted_bytes = BASE64.decode(&result.encrypted_data).map_err(|e| {
-        AppError::Internal(format!("Failed to decode encrypted base64: {}", e))
-    })?;
+    let encrypted_bytes = BASE64
+        .decode(&result.encrypted_data)
+        .map_err(|e| AppError::Internal(format!("Failed to decode encrypted base64: {}", e)))?;
 
     tracing::info!(
         "mydata encrypt ok: {} bytes -> {} encrypted bytes (visibility={})",
@@ -310,18 +310,16 @@ async fn mydata_decrypt_with_owner_hint(
     let url = format!("{}/mydata/decrypt", sidecar_url);
     let data_b64 = BASE64.encode(encrypted_data);
 
-    let mut req = client
-        .post(&url)
-        .json(&MyDataDecryptRequest {
-            data: data_b64,
-            package_id: package_id.to_string(),
-            account_id: account_id.to_string(),
-            platform_id: platform_id.map(|s| s.to_string()),
-            platform_scope: platform_scope.map(|s| s.to_string()),
-            mydata_owner: mydata_owner_hint.map(|s| s.to_string()),
-            organization_id: organization_id.map(|s| s.to_string()),
-            org_memory_group_id: org_memory_group_id.map(|s| s.to_string()),
-        });
+    let mut req = client.post(&url).json(&MyDataDecryptRequest {
+        data: data_b64,
+        package_id: package_id.to_string(),
+        account_id: account_id.to_string(),
+        platform_id: platform_id.map(|s| s.to_string()),
+        platform_scope: platform_scope.map(|s| s.to_string()),
+        mydata_owner: mydata_owner_hint.map(|s| s.to_string()),
+        organization_id: organization_id.map(|s| s.to_string()),
+        org_memory_group_id: org_memory_group_id.map(|s| s.to_string()),
+    });
     req = match credential {
         MyDataCredential::Session(s) => req.header("x-mydata-session", s),
         MyDataCredential::MemoryDelegateKey(k) => req.header("x-delegate-key", k),
@@ -329,28 +327,34 @@ async fn mydata_decrypt_with_owner_hint(
     if let Some(secret) = sidecar_secret {
         req = req.header("authorization", format!("Bearer {}", secret));
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| {
-            AppError::Internal(format!("Sidecar mydata/decrypt request failed: {}. Is the sidecar running?", e))
-        })?;
+    let resp = req.send().await.map_err(|e| {
+        AppError::Internal(format!(
+            "Sidecar mydata/decrypt request failed: {}. Is the sidecar running?",
+            e
+        ))
+    })?;
 
     if !resp.status().is_success() {
         let body = resp.text().await.unwrap_or_default();
         if let Ok(err) = serde_json::from_str::<SidecarError>(&body) {
-            return Err(AppError::Internal(format!("mydata decrypt failed: {}", err.error)));
+            return Err(AppError::Internal(format!(
+                "mydata decrypt failed: {}",
+                err.error
+            )));
         }
-        return Err(AppError::Internal(format!("mydata decrypt failed: {}", body)));
+        return Err(AppError::Internal(format!(
+            "mydata decrypt failed: {}",
+            body
+        )));
     }
 
     let result: MyDataDecryptResponse = resp.json().await.map_err(|e| {
         AppError::Internal(format!("Failed to parse mydata/decrypt response: {}", e))
     })?;
 
-    let decrypted_bytes = BASE64.decode(&result.decrypted_data).map_err(|e| {
-        AppError::Internal(format!("Failed to decode decrypted base64: {}", e))
-    })?;
+    let decrypted_bytes = BASE64
+        .decode(&result.decrypted_data)
+        .map_err(|e| AppError::Internal(format!("Failed to decode decrypted base64: {}", e)))?;
 
     tracing::info!(
         "mydata decrypt ok: {} encrypted bytes -> {} decrypted bytes",

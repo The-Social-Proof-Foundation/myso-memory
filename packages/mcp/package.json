@@ -10,10 +10,13 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm run build && node --test test/*.test.mjs",
+    "pack:check": "pnpm run build && npm pack --dry-run"
   },
   "dependencies": {
     "@socialproof/memory": "workspace:*",
+    "@socialproof/myso": "0.0.4",
     "@socialproof/social": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
@@ -21,6 +24,15 @@
     "@types/node": "^20.0.0",
     "typescript": "^5.5.0"
   },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
   "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=22"
+  },
   "license": "Apache-2.0"
 }

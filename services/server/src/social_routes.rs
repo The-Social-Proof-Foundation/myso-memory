@@ -173,6 +173,12 @@ async fn forward_social_execute(
 ) -> Result<SocialActionResponse, AppError> {
     ensure_social_configured(state)?;
 
+    if !state.config.allow_legacy_social_key_forwarding {
+        return Err(AppError::BadRequest(
+            "legacy server-side social signing is disabled; build the registered transaction locally and use /sponsor + /sponsor/execute".into(),
+        ));
+    }
+
     let sub_agent_key = auth
         .sub_agent_key
         .as_ref()
@@ -186,15 +192,19 @@ async fn forward_social_execute(
         "ownerPrivateKey": owner_private_key,
     });
 
-    let url = format!("{}/social/execute", state.config.sidecar_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/social/execute",
+        state.config.sidecar_url.trim_end_matches('/')
+    );
     let mut req = state.http_client.post(&url).json(&payload);
     if let Some(secret) = &state.config.sidecar_secret {
         req = req.header("X-Sidecar-Secret", secret);
     }
 
-    let resp = req.send().await.map_err(|e| {
-        AppError::Internal(format!("sidecar social/execute transport error: {e}"))
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AppError::Internal(format!("sidecar social/execute transport error: {e}")))?;
 
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
@@ -204,9 +214,8 @@ async fn forward_social_execute(
         )));
     }
 
-    let parsed: Value = serde_json::from_str(&body_text).map_err(|e| {
-        AppError::Internal(format!("sidecar social/execute parse error: {e}"))
-    })?;
+    let parsed: Value = serde_json::from_str(&body_text)
+        .map_err(|e| AppError::Internal(format!("sidecar social/execute parse error: {e}")))?;
 
     Ok(SocialActionResponse {
         digest: parsed
@@ -338,14 +347,11 @@ pub async fn delete_post(
     Path(post_id): Path<String>,
 ) -> Result<Json<SocialActionResponse>, AppError> {
     require_delete_co_sign(&auth)?;
-    let owner_key = auth
-        .owner_delegate_key
-        .clone()
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "x-owner-delegate-key required for delete (owner signs the chain tx)".into(),
-            )
-        })?;
+    let owner_key = auth.owner_delegate_key.clone().ok_or_else(|| {
+        AppError::BadRequest(
+            "x-owner-delegate-key required for delete (owner signs the chain tx)".into(),
+        )
+    })?;
     let params = json!({ "postId": post_id });
     let result =
         forward_social_execute(&state, &auth, "delete_post", params, Some(owner_key)).await?;
@@ -359,14 +365,11 @@ pub async fn delete_comment(
     Json(body): Json<DeleteCommentBody>,
 ) -> Result<Json<SocialActionResponse>, AppError> {
     require_delete_co_sign(&auth)?;
-    let owner_key = auth
-        .owner_delegate_key
-        .clone()
-        .ok_or_else(|| {
-            AppError::BadRequest(
-                "x-owner-delegate-key required for delete (owner signs the chain tx)".into(),
-            )
-        })?;
+    let owner_key = auth.owner_delegate_key.clone().ok_or_else(|| {
+        AppError::BadRequest(
+            "x-owner-delegate-key required for delete (owner signs the chain tx)".into(),
+        )
+    })?;
     let params = json!({
         "postId": body.post_id,
         "commentId": comment_id,

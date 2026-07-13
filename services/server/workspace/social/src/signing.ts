@@ -29,5 +29,5 @@ export async function sha256hex(data: string): Promise<string> {
 }
 
 export function normalizeServerUrl(url: string): string {
-    return url.endsWith("/") ? url : `${url}/`;
+    return url.replace(/\/+$/, "");
 }
