@@ -3,6 +3,19 @@
   "kind": "memory",
   "name": "Memory",
   "description": "Encrypted, decentralized long-term memory via File Storage",
+  "contracts": {
+    "tools": [
+      "memory_search",
+      "memory_store",
+      "social_create_post",
+      "social_create_comment",
+      "social_react_post",
+      "social_react_comment",
+      "social_create_repost",
+      "social_delete_post",
+      "social_delete_comment"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

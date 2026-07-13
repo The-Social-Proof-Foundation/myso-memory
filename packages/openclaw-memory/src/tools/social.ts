@@ -1,4 +1,4 @@
-import type { SocialClient } from "@socialproof/social";
+import type { SocialClient } from "@socialproof/sub-agents";
 import type { PluginConfig } from "../types.js";
 
 export function registerSocialTools(

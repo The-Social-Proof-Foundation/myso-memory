@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { SocialChainConfig } from "@socialproof/social";
+import type { SocialChainConfig } from "@socialproof/sub-agents";
 import { McpRuntimeError } from "./errors.js";
 import type {
     CliSignerReference,

@@ -18,7 +18,7 @@
  */
 
 import { Memory } from "@socialproof/memory";
-import { SocialClient } from "@socialproof/social";
+import { SocialClient } from "@socialproof/sub-agents";
 import { parseConfig, keyPreview } from "./config.js";
 import { registerHooks } from "./hooks/index.js";
 import { registerTools, registerSocialTools } from "./tools/index.js";

@@ -1,6 +1,6 @@
 {
-    "name": "@socialproof/social",
-    "version": "0.1.0",
+    "name": "@socialproof/sub-agents",
+    "version": "0.0.2",
     "description": "Sub-agent social actions SDK for MySocial (post, comment, react, repost)",
     "type": "module",
     "main": "./dist/index.js",
@@ -27,7 +27,7 @@
     "dependencies": {
         "@noble/ed25519": "^2.3.0",
         "@noble/hashes": "^2.0.0",
-        "@socialproof/memory": "workspace:*"
+        "@socialproof/memory": "0.0.5"
     },
     "devDependencies": {
         "@types/node": "^20.0.0",
@@ -40,5 +40,9 @@
     "files": [
         "dist"
     ],
+    "publishConfig": {
+        "access": "public",
+        "registry": "https://registry.npmjs.org/"
+    },
     "license": "Apache-2.0"
 }

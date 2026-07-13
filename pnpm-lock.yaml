@@ -1006,14 +1006,14 @@ importers:
         specifier: ^1.0.0
         version: 1.29.0(zod@4.4.3)
       '@socialproof/memory':
-        specifier: workspace:*
-        version: link:../sdk
+        specifier: 0.0.5
+        version: 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)
       '@socialproof/myso':
         specifier: 0.0.4
         version: 0.0.4(typescript@5.9.3)
-      '@socialproof/social':
-        specifier: workspace:*
-        version: link:../social
+      '@socialproof/sub-agents':
+        specifier: 0.0.2
+        version: 0.0.2(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)
     devDependencies:
       '@types/node':
         specifier: ^20.0.0
@@ -1028,11 +1028,11 @@ importers:
         specifier: 0.34.48
         version: 0.34.48
       '@socialproof/memory':
-        specifier: workspace:*
-        version: link:../sdk
-      '@socialproof/social':
-        specifier: workspace:*
-        version: link:../social
+        specifier: 0.0.5
+        version: 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)
+      '@socialproof/sub-agents':
+        specifier: 0.0.2
+        version: 0.0.2(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)
       zod:
         specifier: ^3.25.76
         version: 3.25.76
@@ -1040,6 +1040,9 @@ importers:
       '@types/node':
         specifier: ^22.19.17
         version: 22.19.17
+      esbuild:
+        specifier: ~0.27.4
+        version: 0.27.7
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
@@ -1078,7 +1081,7 @@ importers:
         specifier: ^5.5.0
         version: 5.9.3
 
-  packages/social:
+  packages/sub-agents:
     dependencies:
       '@noble/ed25519':
         specifier: ^2.3.0
@@ -1087,8 +1090,8 @@ importers:
         specifier: ^2.0.0
         version: 2.2.0
       '@socialproof/memory':
-        specifier: workspace:*
-        version: link:../sdk
+        specifier: 0.0.5
+        version: 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)
       '@socialproof/myso':
         specifier: 0.0.4
         version: 0.0.4(typescript@5.9.3)
@@ -4673,6 +4676,22 @@ packages:
     peerDependencies:
       '@socialproof/myso': ^0.0.4
 
+  '@socialproof/memory@0.0.5':
+    resolution: {integrity: sha512-VEVfpi6k3nrojTmglL37moLcZv/BFBhsColPiJedQu2foKTfcMVT7DOgs9gA3v0yJlyKrif3vFvGjpqV7YiCdA==}
+    peerDependencies:
+      '@socialproof/file-storage': '>=0.0.4'
+      '@socialproof/mydata': 0.0.4
+      '@socialproof/myso': 0.0.4
+      ai: '>=4.0.0'
+      zod: ^3.23.0
+    peerDependenciesMeta:
+      '@socialproof/file-storage':
+        optional: true
+      ai:
+        optional: true
+      zod:
+        optional: true
+
   '@socialproof/mydata@0.0.4':
     resolution: {integrity: sha512-MJ3Bw+l91tLIUFkLAEWvez8deHlA2QPTluNc2vMLduHglHXzejRVLd3qEa2SQgphtPeXNlCttHCM6RN0zKSOKA==}
     peerDependencies:
@@ -4686,6 +4705,11 @@ packages:
     resolution: {integrity: sha512-yPvXqmiTl2Wc5SqjwP7LO8Qru7ACi4YpWyVzjSUIzmkBvLxH3Z3BjOTU2BYv4zBsbAYYQpsREpbeurlDf3/6fQ==}
     peerDependencies:
       '@socialproof/myso': ^0.0.4
+
+  '@socialproof/sub-agents@0.0.2':
+    resolution: {integrity: sha512-Ng2B3SOTWE6bebVuLDiBFZrnGD0e9qoWU6R4xbfdg5RZ1iH+IkliCS2Qs6a/mcqESAs3M5OtuvgK6gjDtT95HA==}
+    peerDependencies:
+      '@socialproof/myso': 0.0.4
 
   '@socialproof/utils@0.0.2':
     resolution: {integrity: sha512-J4mDPEQxUIbzNu9WDvLW21VRlh9F7W5GQtbjA+rit2+fdm+r5TszJ4DmvjkjfRBfFWyAl3nIaVzQGcasRIjOiw==}
@@ -11704,6 +11728,14 @@ snapshots:
       '@vercel/oidc': 3.2.0
       zod: 3.25.76
 
+  '@ai-sdk/gateway@3.0.110(zod@4.4.3)':
+    dependencies:
+      '@ai-sdk/provider': 3.0.10
+      '@ai-sdk/provider-utils': 4.0.26(zod@4.4.3)
+      '@vercel/oidc': 3.2.0
+      zod: 4.4.3
+    optional: true
+
   '@ai-sdk/gateway@3.0.15(zod@3.25.76)':
     dependencies:
       '@ai-sdk/provider': 3.0.3
@@ -16985,6 +17017,28 @@ snapshots:
       '@socialproof/utils': 0.0.2
       dataloader: 2.2.3
 
+  '@socialproof/memory@0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)':
+    dependencies:
+      '@noble/ed25519': 2.3.0
+      '@noble/hashes': 2.2.0
+      '@socialproof/mydata': 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
+      '@socialproof/myso': 0.0.4(typescript@5.9.3)
+    optionalDependencies:
+      '@socialproof/file-storage': 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
+      ai: 6.0.175(zod@3.25.76)
+      zod: 3.25.76
+
+  '@socialproof/memory@0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)':
+    dependencies:
+      '@noble/ed25519': 2.3.0
+      '@noble/hashes': 2.2.0
+      '@socialproof/mydata': 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
+      '@socialproof/myso': 0.0.4(typescript@5.9.3)
+    optionalDependencies:
+      '@socialproof/file-storage': 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
+      ai: 6.0.175(zod@4.4.3)
+      zod: 4.4.3
+
   '@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))':
     dependencies:
       '@noble/curves': 2.2.0
@@ -17023,6 +17077,30 @@ snapshots:
       valibot: 1.4.0(typescript@5.9.3)
     transitivePeerDependencies:
       - typescript
+
+  '@socialproof/sub-agents@0.0.2(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)':
+    dependencies:
+      '@noble/ed25519': 2.3.0
+      '@noble/hashes': 2.2.0
+      '@socialproof/memory': 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)
+      '@socialproof/myso': 0.0.4(typescript@5.9.3)
+    transitivePeerDependencies:
+      - '@socialproof/file-storage'
+      - '@socialproof/mydata'
+      - ai
+      - zod
+
+  '@socialproof/sub-agents@0.0.2(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)':
+    dependencies:
+      '@noble/ed25519': 2.3.0
+      '@noble/hashes': 2.2.0
+      '@socialproof/memory': 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)
+      '@socialproof/myso': 0.0.4(typescript@5.9.3)
+    transitivePeerDependencies:
+      - '@socialproof/file-storage'
+      - '@socialproof/mydata'
+      - ai
+      - zod
 
   '@socialproof/utils@0.0.2':
     dependencies:
@@ -18171,6 +18249,15 @@ snapshots:
       '@ai-sdk/provider-utils': 4.0.26(zod@3.25.76)
       '@opentelemetry/api': 1.9.0
       zod: 3.25.76
+
+  ai@6.0.175(zod@4.4.3):
+    dependencies:
+      '@ai-sdk/gateway': 3.0.110(zod@4.4.3)
+      '@ai-sdk/provider': 3.0.10
+      '@ai-sdk/provider-utils': 4.0.26(zod@4.4.3)
+      '@opentelemetry/api': 1.9.0
+      zod: 4.4.3
+    optional: true
 
   ai@6.0.37(zod@3.25.76):
     dependencies:

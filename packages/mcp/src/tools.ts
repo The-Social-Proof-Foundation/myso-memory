@@ -1,5 +1,5 @@
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { SOCIAL_ACTION_IDS } from "@socialproof/social";
+import { SOCIAL_ACTION_IDS } from "@socialproof/sub-agents";
 import { McpRuntimeError, toStructuredMcpError } from "./errors.js";
 import type { SocialGateway } from "./social-gateway.js";
 import type { AgentSignerProvisioner } from "./provisioning.js";

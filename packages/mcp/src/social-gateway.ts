@@ -19,7 +19,7 @@ import {
     type RegisterChildAgentParams,
     type UpdateManagedAgentParams,
     type ManagedAgentParams,
-} from "@socialproof/social";
+} from "@socialproof/sub-agents";
 import { McpRuntimeError, redactSensitiveText } from "./errors.js";
 import type { AgentSigner } from "./signers.js";
 

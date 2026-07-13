@@ -1,6 +1,6 @@
 {
   "name": "@socialproof/oc-memory",
-    "version": "0.5.0",
+  "version": "0.0.4",
   "type": "module",
   "description": "NemoClaw/OpenClaw memory plugin — encrypted, decentralized long-term memory via Memory + File Storage",
   "license": "Apache-2.0",
@@ -23,7 +23,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --target=node20 --external:ai --outfile=dist/index.js && tsc --emitDeclarationOnly",
     "typecheck": "tsc --noEmit",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
     "prepublishOnly": "npm run clean && npm run build"
@@ -31,15 +31,14 @@
   "engines": {
     "node": ">=20.0.0"
   },
-  "dependencies": {
-    "@sinclair/typebox": "0.34.48",
-    "@socialproof/memory": "workspace:*",
-    "@socialproof/social": "workspace:*",
-    "zod": "^3.25.76"
-  },
   "devDependencies": {
+    "@sinclair/typebox": "0.34.48",
+    "@socialproof/memory": "0.0.5",
+    "@socialproof/sub-agents": "0.0.2",
     "@types/node": "^22.19.17",
-    "typescript": "^5.9.3"
+    "esbuild": "~0.27.4",
+    "typescript": "^5.9.3",
+    "zod": "^3.25.76"
   },
   "openclaw": {
     "extensions": [

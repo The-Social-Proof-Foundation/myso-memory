@@ -1,6 +1,6 @@
 {
   "name": "@socialproof/memory-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server bridging Memory relayer tools for Cursor and other MCP clients",
   "type": "module",
   "bin": {
@@ -15,9 +15,9 @@
     "pack:check": "pnpm run build && npm pack --dry-run"
   },
   "dependencies": {
-    "@socialproof/memory": "workspace:*",
+    "@socialproof/memory": "0.0.5",
     "@socialproof/myso": "0.0.4",
-    "@socialproof/social": "workspace:*",
+    "@socialproof/sub-agents": "0.0.2",
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
@@ -33,6 +33,10 @@
   "files": ["dist", "README.md"],
   "engines": {
     "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "license": "Apache-2.0"
 }
