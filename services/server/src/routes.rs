@@ -443,11 +443,36 @@ pub async fn agent_context(
     })
 }
 
+fn is_openrouter_api_base(api_base: &str) -> bool {
+    api_base.contains("openrouter.ai")
+}
+
+/// Official OpenAI rejects vendor-prefixed ids (`openai/gpt-4o-mini`).
+/// OpenRouter requires that prefix. Strip `openai/` when the base is not OpenRouter.
+pub(crate) fn openai_compatible_model_id(api_base: &str, model: &str) -> String {
+    if is_openrouter_api_base(api_base) {
+        return model.to_string();
+    }
+    model
+        .strip_prefix("openai/")
+        .unwrap_or(model)
+        .to_string()
+}
+
+fn default_embedding_model(api_base: &str) -> &'static str {
+    if is_openrouter_api_base(api_base) {
+        "openai/text-embedding-3-small"
+    } else {
+        "text-embedding-3-small"
+    }
+}
+
 pub(crate) fn resolve_llm_model(config: &Config, model_id: Option<&str>) -> String {
-    model_id
+    let raw = model_id
         .filter(|m| !m.trim().is_empty())
         .map(String::from)
-        .unwrap_or_else(|| config.default_llm_model.clone())
+        .unwrap_or_else(|| config.default_llm_model.clone());
+    openai_compatible_model_id(&config.openai_api_base, &raw)
 }
 
 /// Look up `org_memory_group_id` for an org via social-server (canonical source).
@@ -538,7 +563,7 @@ pub(crate) async fn generate_embedding(
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("Content-Type", "application/json")
                 .json(&EmbeddingApiRequest {
-                    model: "openai/text-embedding-3-small".to_string(),
+                    model: default_embedding_model(&config.openai_api_base).to_string(),
                     input: text.to_string(),
                 })
                 .send()
@@ -1658,13 +1683,41 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigRespon
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_bounded_results, parse_extracted_facts, ANALYZE_CONCURRENCY, MAX_ANALYZE_FACTS,
+        collect_bounded_results, default_embedding_model, openai_compatible_model_id,
+        parse_extracted_facts, ANALYZE_CONCURRENCY, MAX_ANALYZE_FACTS,
     };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
     use std::time::Duration;
+
+    #[test]
+    fn openai_compatible_model_id_strips_prefix_for_official_openai() {
+        assert_eq!(
+            openai_compatible_model_id("https://api.openai.com/v1", "openai/gpt-4o-mini"),
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            openai_compatible_model_id("https://api.openai.com/v1", "gpt-4o-mini"),
+            "gpt-4o-mini"
+        );
+        assert_eq!(
+            openai_compatible_model_id(
+                "https://openrouter.ai/api/v1",
+                "openai/gpt-4o-mini"
+            ),
+            "openai/gpt-4o-mini"
+        );
+        assert_eq!(
+            default_embedding_model("https://api.openai.com/v1"),
+            "text-embedding-3-small"
+        );
+        assert_eq!(
+            default_embedding_model("https://openrouter.ai/api/v1"),
+            "openai/text-embedding-3-small"
+        );
+    }
 
     #[test]
     fn parse_extracted_facts_ignores_none_and_blank_lines() {

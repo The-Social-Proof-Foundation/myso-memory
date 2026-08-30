@@ -124,6 +124,57 @@ openclaw gateway   # terminal 1
 openclaw chat      # terminal 2
 ```
 
+### Local `web_search` (Perplexity via OpenRouter)
+
+Chat completions stay billed on the oracle. `web_search` runs **locally** in the OpenClaw process, so that process needs its own OpenRouter key. The embedded TUI (`openclaw chat` / `openclaw agent --local`) does **not** inherit the oracle process environment.
+
+Install the plugin, allow it, and point it at OpenRouter without pasting the key into config:
+
+```bash
+openclaw plugins install @openclaw/perplexity-plugin
+```
+
+```jsonc
+{
+  "plugins": {
+    "allow": ["memory", "perplexity"],
+    "entries": {
+      "perplexity": {
+        "enabled": true,
+        "config": {
+          "webSearch": {
+            "apiKey": "${OPENROUTER_API_KEY}",
+            "baseUrl": "https://openrouter.ai/api/v1",
+            "model": "perplexity/sonar-pro"
+          }
+        }
+      }
+    }
+  },
+  "tools": {
+    "web": {
+      "search": {
+        "enabled": true,
+        "provider": "perplexity"
+      }
+    }
+  }
+}
+```
+
+`myso-core/network.config/ai-credit/openrouter.env` exports `AI_CREDIT_OPENROUTER_API_KEY`. Map it before starting the TUI (or put `OPENROUTER_API_KEY` in `~/.openclaw/.env`):
+
+```bash
+set -a
+source /path/to/myso-core/network.config/ai-credit/openrouter.env
+set +a
+export OPENROUTER_API_KEY="$AI_CREDIT_OPENROUTER_API_KEY"
+
+openclaw chat   # restart after config changes; use /new so old tool_call_ids are not replayed
+```
+
+Do **not** grant `CAP_AI_SPEND` on the memory agent. Chat billing stays on the separate AI-credit agent.
+
 If your OpenClaw build rejects the custom provider id via `paste-api-key`, store the token with:
 
 ```bash
@@ -165,11 +216,14 @@ curl -s http://127.0.0.1:8095/v1/chat/completions \
 6. Expected proof:
    - OpenClaw receives an assistant reply
    - Oracle logs show reserve + capture
-   - OpenClaw is **not** configured with a direct OpenAI/OpenRouter API key for this model
-   - The OpenRouter API key exists only on the oracle
+   - OpenClaw is **not** configured with a direct OpenAI/OpenRouter API key for the **chat model** (that key stays on the oracle)
+   - Local `web_search` uses Perplexity via OpenRouter in the TUI/gateway env (`OPENROUTER_API_KEY`), not the memory agent
 
 ## Notes
 
-- Streaming is not supported in the first version of the bridge (`stream: true` returns `400`).
-- Native signed Memory routes (`POST /api/ai-credit/inference`) remain unchanged and should still be used by the Memory SDK.
-- OpenClaw should **not** have a direct OpenAI/OpenRouter key for this path; only the oracle holds provider credentials.
+- Spend-policy rejects (`insufficient_balance`, agent budget, approval required) return **HTTP 402** with `type: insufficient_quota`. OpenClaw maps any 400 + `type: invalid_request_error` to a fake “schema or tool payload” error, so those must not be 400s.
+- Streaming is not supported (`stream: true` returns `400`). OpenClaw should send non-streaming `/v1/responses` requests.
+- Tool calling is forwarded. OpenClaw `tools` (including `web_search`) are passed to OpenRouter. If the model returns `tool_calls`, `/v1/responses` emits `function_call` output items and OpenClaw executes those tools locally. The next request should include `function_call` + `function_call_output` so the oracle can bill the follow-up hop.
+- Each LLM hop is billed with the existing reserve → OpenRouter → capture path. Local tool execution (web search, memory tools) is not billed by the oracle.
+- Native signed Memory routes (`POST /api/ai-credit/inference`) remain text-only and should still be used by the Memory SDK.
+- The chat model should **not** use a direct OpenAI/OpenRouter key; only the oracle holds that provider credential. Local `web_search` is the exception: the TUI/gateway needs `OPENROUTER_API_KEY` for Perplexity/OpenRouter.

@@ -355,7 +355,11 @@ fn is_write_route(method: &str, path: &str) -> bool {
 }
 
 fn requires_mydata_access(path: &str) -> bool {
-    path.starts_with("/api/remember") || path.starts_with("/api/recall") || path == "/api/restore"
+    path.starts_with("/api/remember")
+        || path.starts_with("/api/recall")
+        || path == "/api/restore"
+        || path == "/api/analyze"
+        || path == "/api/ask"
 }
 
 fn requires_file_storage_spend(method: &str, path: &str) -> bool {
@@ -369,11 +373,7 @@ fn required_capability_for_path(method: &str, path: &str) -> u64 {
     if path == "/api/agent/context" || path.starts_with("/api/chain/actions/") {
         return 0;
     }
-    if path == "/api/analyze"
-        || path == "/api/ask"
-        || path == "/api/ai-credit/inference"
-        || path == "/api/ai-credit/record-inference"
-    {
+    if path == "/api/ai-credit/inference" || path == "/api/ai-credit/record-inference" {
         return CAP_AI_SPEND;
     }
     if path.starts_with("/api/social/") {
@@ -402,7 +402,11 @@ fn required_capability_for_path(method: &str, path: &str) -> u64 {
     if method != "POST" {
         return CAP_MEMORY_READ;
     }
-    if path.starts_with("/api/remember") || path == "/api/analyze" || path == "/api/restore" {
+    if path.starts_with("/api/remember")
+        || path == "/api/analyze"
+        || path == "/api/ask"
+        || path == "/api/restore"
+    {
         CAP_MEMORY_WRITE
     } else {
         CAP_MEMORY_READ
@@ -606,6 +610,24 @@ mod tests {
             "POST",
             "/api/chain/actions/prepare"
         ));
+    }
+
+    #[test]
+    fn analyze_and_ask_require_memory_write_and_mydata() {
+        assert_eq!(
+            required_capability_for_path("POST", "/api/analyze"),
+            CAP_MEMORY_WRITE
+        );
+        assert_eq!(
+            required_capability_for_path("POST", "/api/ask"),
+            CAP_MEMORY_WRITE
+        );
+        assert!(requires_mydata_access("/api/analyze"));
+        assert!(requires_mydata_access("/api/ask"));
+        assert!(is_write_route("POST", "/api/analyze"));
+        assert!(is_write_route("POST", "/api/ask"));
+        assert!(!requires_file_storage_spend("POST", "/api/analyze"));
+        assert!(!requires_file_storage_spend("POST", "/api/ask"));
     }
 
     #[test]
