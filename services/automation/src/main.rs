@@ -106,12 +106,12 @@ fn spawn_tick_loop(
                 source_service: "automation_engine".into(),
             };
             if let Ok(jobs) = store.list_enabled_jobs().await {
+                let now = chrono::Utc::now();
                 for job in jobs {
-                    let has_time_trigger = job.trigger_set.triggers.iter().any(|t| {
-                        t.kind == myso_automation::TriggerKind::Cron
-                            || t.kind == myso_automation::TriggerKind::Interval
-                    });
-                    if has_time_trigger {
+                    let last_success = store.latest_success_at(job.id).await.ok().flatten();
+                    if myso_automation::trigger_eval::due_window(&job.trigger_set, last_success, now)
+                        .is_some()
+                    {
                         let _ = run_ctx.run_job(&job, Some(&tick)).await;
                     }
                 }

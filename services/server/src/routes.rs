@@ -871,6 +871,7 @@ pub async fn recall(
             .map(|hit| {
                 let http_client = state.http_client.clone();
                 let aggregator_url = state.config.file_storage_aggregator_url.clone();
+                let r2 = state.r2.clone();
                 let sidecar_url = state.config.sidecar_url.clone();
                 let sidecar_secret = state.config.sidecar_secret.clone();
                 let blob_id = hit.blob_id.clone();
@@ -905,7 +906,13 @@ pub async fn recall(
                         "recall decrypt candidate"
                     );
                     let encrypted_data =
-                        match file_storage::download_blob(&http_client, &aggregator_url, &blob_id)
+                        match crate::blob_store::fetch_encrypted_blob(
+                            &http_client,
+                            &aggregator_url,
+                            r2.as_ref(),
+                            &owner_for_cleanup,
+                            &blob_id,
+                        )
                             .await
                         {
                             Ok(data) => data,
@@ -2102,6 +2109,7 @@ pub async fn ask(
             .map(|hit| {
                 let http_client = state.http_client.clone();
                 let aggregator_url = state.config.file_storage_aggregator_url.clone();
+                let r2 = state.r2.clone();
                 let sidecar_url = state.config.sidecar_url.clone();
                 let sidecar_secret = state.config.sidecar_secret.clone();
                 let blob_id = hit.blob_id.clone();
@@ -2136,7 +2144,13 @@ pub async fn ask(
                         "recall decrypt candidate"
                     );
                     let encrypted_data =
-                        match file_storage::download_blob(&http_client, &aggregator_url, &blob_id)
+                        match crate::blob_store::fetch_encrypted_blob(
+                            &http_client,
+                            &aggregator_url,
+                            r2.as_ref(),
+                            &owner_for_cleanup,
+                            &blob_id,
+                        )
                             .await
                         {
                             Ok(data) => data,
@@ -2553,10 +2567,18 @@ pub async fn restore(
         .map(|blob_id| {
             let http_client = state.http_client.clone();
             let aggregator_url = state.config.file_storage_aggregator_url.clone();
+            let r2 = state.r2.clone();
             let blob_id = blob_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
-                match file_storage::download_blob(&http_client, &aggregator_url, &blob_id).await {
+                match crate::blob_store::fetch_encrypted_blob(
+                    &http_client,
+                    &aggregator_url,
+                    r2.as_ref(),
+                    &owner_for_cleanup,
+                    &blob_id,
+                )
+                .await {
                     Ok(data) => Some((blob_id, data)),
                     Err(AppError::BlobNotFound(msg)) => {
                         tracing::warn!("restore: blob expired, skipping: {}", msg);

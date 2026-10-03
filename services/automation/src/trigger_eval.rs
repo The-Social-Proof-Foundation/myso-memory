@@ -90,6 +90,70 @@ pub fn replay_allows(
     }
 }
 
+/// Window key when a cron or interval trigger should fire. `None` means not due.
+/// A job with no successful run is due. Event triggers are ignored here.
+pub fn due_window(
+    set: &TriggerSet,
+    last_success: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    set.triggers.iter().find_map(|trigger| match trigger.kind {
+        TriggerKind::Cron => cron_window(trigger.cron_expr.as_deref()?, last_success, now),
+        TriggerKind::Interval => {
+            interval_window(trigger.interval_ms.unwrap_or(0), last_success, now)
+        }
+        TriggerKind::Conditional | TriggerKind::Event => None,
+    })
+}
+
+fn cron_window(
+    expr: &str,
+    last_success: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let schedule = parse_cron(expr)?;
+    let Some(last) = last_success else {
+        return Some("initial".into());
+    };
+    let next = schedule.after(&last).next()?;
+    if next <= now {
+        Some(next.timestamp().to_string())
+    } else {
+        None
+    }
+}
+
+fn interval_window(
+    interval_ms: i64,
+    last_success: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    if interval_ms <= 0 {
+        return None;
+    }
+    let Some(last) = last_success else {
+        return Some("0".into());
+    };
+    let elapsed = now.signed_duration_since(last).num_milliseconds();
+    if elapsed >= interval_ms {
+        Some((now.timestamp_millis() / interval_ms).to_string())
+    } else {
+        None
+    }
+}
+
+/// Accepts 5-field (min hour dom month dow), 6-field, or the crate's 7-field form.
+fn parse_cron(expr: &str) -> Option<cron::Schedule> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    let normalized = match fields.len() {
+        5 => format!("0 {} *", expr.trim()),
+        6 => format!("{} *", expr.trim()),
+        7 => expr.trim().to_string(),
+        _ => return None,
+    };
+    normalized.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +236,58 @@ mod tests {
         };
         assert!(!trigger_set_should_fire(&set, &[1], &[], 1000, None));
         assert!(trigger_set_should_fire(&set, &[], &[0, 1], 1000, Some(500)));
+    }
+
+    fn time_trigger(kind: TriggerKind, cron_expr: Option<&str>, interval_ms: Option<i64>) -> EventTrigger {
+        EventTrigger {
+            kind,
+            cron_expr: cron_expr.map(str::to_string),
+            interval_ms,
+            condition: None,
+            event_family: "automation".into(),
+            event_type: "tick".into(),
+            organization_id: None,
+            account_id: None,
+            agent_object_id: None,
+            payload_filter: None,
+            debounce_window_ms: 0,
+            cooldown_ms: 0,
+            max_executions_per_window: None,
+            deduplication_key: None,
+            replay_behavior: ReplayBehavior::Skip,
+        }
+    }
+
+    #[test]
+    fn interval_is_due_until_a_success_is_inside_the_window() {
+        let set = TriggerSet {
+            match_mode: MatchMode::Any,
+            evaluation_window_ms: 0,
+            triggers: vec![time_trigger(TriggerKind::Interval, None, Some(60_000))],
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T09:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(due_window(&set, None, now).as_deref(), Some("0"));
+        let recent = now - chrono::Duration::seconds(30);
+        assert_eq!(due_window(&set, Some(recent), now), None);
+        let stale = now - chrono::Duration::seconds(90);
+        assert!(due_window(&set, Some(stale), now).is_some());
+    }
+
+    #[test]
+    fn cron_is_due_after_its_scheduled_time() {
+        let set = TriggerSet {
+            match_mode: MatchMode::Any,
+            evaluation_window_ms: 0,
+            triggers: vec![time_trigger(TriggerKind::Cron, Some("0 9 * * *"), None)],
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-03T09:00:01Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(due_window(&set, None, now).as_deref(), Some("initial"));
+        let before = now - chrono::Duration::hours(2);
+        assert!(due_window(&set, Some(before), now).is_some());
+        assert_eq!(due_window(&set, Some(now), now), None);
     }
 }

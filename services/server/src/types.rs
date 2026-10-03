@@ -21,6 +21,8 @@ pub struct AppState {
     pub fallback_rate_limit: tokio::sync::Mutex<crate::rate_limit::InMemoryFallback>,
     /// Canonical org metadata cache (fetched from social-server; never derived).
     pub org_summaries: crate::org_summary::OrgSummaryCache,
+    /// Present when `MEMORY_BLOB_BACKEND=r2`. Recall of `r2:` blob ids uses this.
+    pub r2: Option<crate::blob_store::R2BlobStore>,
 }
 
 // ============================================================
@@ -70,6 +72,23 @@ impl KeyPool {
 // ============================================================
 // Config
 // ============================================================
+
+/// Where encrypted memory ciphertext is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobBackend {
+    FileStorage,
+    R2,
+}
+
+impl BlobBackend {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_lowercase().as_str() {
+            "r2" | "cloudflare" | "cf" => Self::R2,
+            "file_storage" | "filestorage" | "file-storage" | "" => Self::FileStorage,
+            other => panic!("MEMORY_BLOB_BACKEND must be file_storage or r2, got {other}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -121,6 +140,13 @@ pub struct Config {
     pub ai_credit_enabled: bool,
     /// Default LLM model id for analyze/ask when client omits model_id.
     pub default_llm_model: String,
+    /// Where encrypted memory ciphertext is stored. File Storage is the default.
+    pub blob_backend: BlobBackend,
+    pub r2_bucket: Option<String>,
+    pub r2_endpoint: Option<String>,
+    pub r2_access_key_id: Option<String>,
+    pub r2_secret_access_key: Option<String>,
+    pub r2_region: String,
     /// Push per-agent memory usage aggregates to social-server when true.
     pub memory_usage_sync_enabled: bool,
     /// Interval for the usage-stats push task (seconds).
@@ -217,6 +243,13 @@ impl SocialChainConfig {
     }
 }
 
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let network = std::env::var("MYSO_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
@@ -228,6 +261,23 @@ impl Config {
             .filter(|value| !value.trim().is_empty());
         if ai_credit_enabled && ai_credit_oracle_api_secret.is_none() {
             panic!("AI_CREDIT_ORACLE_API_SECRET must be set when AI_CREDIT_ENABLED=true");
+        }
+        let blob_backend = BlobBackend::parse(
+            &std::env::var("MEMORY_BLOB_BACKEND").unwrap_or_else(|_| "file_storage".to_string()),
+        );
+        let r2_bucket = non_empty_env("R2_BUCKET");
+        let r2_endpoint = non_empty_env("R2_ENDPOINT");
+        let r2_access_key_id = non_empty_env("R2_ACCESS_KEY_ID");
+        let r2_secret_access_key = non_empty_env("R2_SECRET_ACCESS_KEY");
+        if blob_backend == BlobBackend::R2
+            && (r2_bucket.is_none()
+                || r2_endpoint.is_none()
+                || r2_access_key_id.is_none()
+                || r2_secret_access_key.is_none())
+        {
+            panic!(
+                "R2_BUCKET, R2_ENDPOINT, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY are required when MEMORY_BLOB_BACKEND=r2"
+            );
         }
         let default_rpc = match network.as_str() {
             "testnet" => "https://fullnode.testnet.mysosocial.network:443",
@@ -305,6 +355,12 @@ impl Config {
             ai_credit_enabled,
             default_llm_model: std::env::var("DEFAULT_LLM_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-4o-mini".to_string()),
+            blob_backend,
+            r2_bucket,
+            r2_endpoint,
+            r2_access_key_id,
+            r2_secret_access_key,
+            r2_region: std::env::var("R2_REGION").unwrap_or_else(|_| "auto".to_string()),
             memory_usage_sync_enabled: std::env::var("MEMORY_USAGE_SYNC_ENABLED")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),

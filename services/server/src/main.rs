@@ -3,6 +3,7 @@ mod action_approvals;
 mod ai_spend;
 mod audit_push;
 mod auth;
+mod blob_store;
 mod chain_actions;
 mod chain_discovery;
 mod compatibility;
@@ -186,6 +187,19 @@ async fn main() {
 
     // Build key pool for parallel File Storage uploads
     let key_pool = KeyPool::new(config.myso_private_keys.clone());
+    let r2 = if config.blob_backend == types::BlobBackend::R2 {
+        tracing::info!(
+            "  blob backend: r2 bucket {}",
+            config.r2_bucket.as_deref().unwrap_or("")
+        );
+        Some(
+            blob_store::R2BlobStore::from_config(&config)
+                .expect("R2 blob store configuration is incomplete"),
+        )
+    } else {
+        tracing::info!("  blob backend: file_storage");
+        None
+    };
 
     // Initialize Redis for rate limiting
     let redis = rate_limit::create_redis_client(&config.rate_limit.redis_url)
@@ -202,6 +216,7 @@ async fn main() {
         redis,
         fallback_rate_limit: tokio::sync::Mutex::new(crate::rate_limit::InMemoryFallback::default()),
         org_summaries: crate::org_summary::OrgSummaryCache::new(),
+        r2,
     });
 
     // Spawn background task for cache eviction + lifecycle sync

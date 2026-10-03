@@ -36,16 +36,19 @@ pub async fn execute_remember_text(
 
     let owner = &auth.owner;
     let agent_object_id = &auth.agent_object_id;
+    let use_r2 = state.config.blob_backend == crate::types::BlobBackend::R2;
 
-    ensure_agent_vault(state, auth).await?;
+    if !use_r2 {
+        ensure_agent_vault(state, auth).await?;
 
-    if let Err(code) = crate::memory_contract::check_spend_limit(
-        auth.max_action_spend,
-        crate::auth::ESTIMATED_FILE_STORAGE_UPLOAD_MIST,
-    ) {
-        return Err(AppError::Forbidden(format!(
-            "max_action_spend exceeded (code={code})"
-        )));
+        if let Err(code) = crate::memory_contract::check_spend_limit(
+            auth.max_action_spend,
+            crate::auth::ESTIMATED_FILE_STORAGE_UPLOAD_MIST,
+        ) {
+            return Err(AppError::Forbidden(format!(
+                "max_action_spend exceeded (code={code})"
+            )));
+        }
     }
 
     crate::ai_spend::preflight_remember(state, auth, text).await?;
@@ -75,28 +78,37 @@ pub async fn execute_remember_text(
 
     rate_limit::check_storage_quota(state, owner, encrypted.len() as i64).await?;
 
-    let key_index = state.key_pool.next_index().ok_or_else(|| {
-        AppError::Internal(
-            "No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)"
-                .into(),
+    let blob_id = if use_r2 {
+        let store = state.r2.as_ref().ok_or_else(|| {
+            AppError::Internal("R2 blob store is not configured".into())
+        })?;
+        let object_id = Uuid::new_v4().to_string();
+        store.put(owner, &object_id, encrypted.clone()).await?;
+        crate::blob_store::blob_id_for(&object_id)
+    } else {
+        let key_index = state.key_pool.next_index().ok_or_else(|| {
+            AppError::Internal(
+                "No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)"
+                    .into(),
+            )
+        })?;
+        file_storage::upload_blob(
+            &state.http_client,
+            &state.config.sidecar_url,
+            state.config.sidecar_secret.as_deref(),
+            &encrypted,
+            50,
+            owner,
+            key_index,
+            agent_object_id,
+            &state.config.package_id,
+            Some(&auth.agent_object_id),
+            visibility,
+            organization_id,
         )
-    })?;
-    let upload_result = file_storage::upload_blob(
-        &state.http_client,
-        &state.config.sidecar_url,
-        state.config.sidecar_secret.as_deref(),
-        &encrypted,
-        50,
-        owner,
-        key_index,
-        agent_object_id,
-        &state.config.package_id,
-        Some(&auth.agent_object_id),
-        visibility,
-        organization_id,
-    )
-    .await?;
-    let blob_id = upload_result.blob_id;
+        .await?
+        .blob_id
+    };
 
     let blob_size = encrypted.len() as i64;
     let id = Uuid::new_v4().to_string();

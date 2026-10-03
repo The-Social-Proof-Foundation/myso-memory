@@ -123,6 +123,47 @@ impl WorkflowClient {
             .map_err(|e| e.to_string())?;
         Ok(())
     }
+
+    pub async fn ingest_due_task(
+        &self,
+        job: &crate::AutomationJob,
+        window: &str,
+    ) -> Result<(), String> {
+        let idempotency_key = format!("automation:due:{}:{window}", job.id);
+        let body = format!(
+            "Recurring task is due for {}",
+            job.target_agent_object_id
+        );
+        let payload = serde_json::json!({
+            "idempotency_key": idempotency_key,
+            "recipient_address": job.account_id,
+            "item_type": "task",
+            "title": job.name,
+            "body": body,
+            "payload": {
+                "job_id": job.id,
+                "organization_id": job.organization_id,
+                "agent_object_id": job.target_agent_object_id,
+                "action": job.action.config,
+                "memory_scope": job.memory_scope,
+            },
+            "organization_id": job.organization_id,
+            "source_service": "automation_engine",
+        });
+        let response = self
+            .http
+            .post(format!("{}/internal/workflow/items", self.base_url))
+            .header("x-internal-sync-secret", &self.secret)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(format!("workflow ingest failed ({status})"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

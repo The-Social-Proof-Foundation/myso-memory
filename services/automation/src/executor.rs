@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::clients::{AuditClient, OracleClient, WorkflowClient};
 use crate::store::AutomationStore;
-use crate::trigger_eval::{event_matches_trigger, trigger_set_should_fire};
+use crate::trigger_eval::{due_window, event_matches_trigger, trigger_set_should_fire};
 use crate::{
     AutomationJob, PlatformEvent, AUDIT_ACTION_JOB_RUN, AUDIT_ACTION_JOB_SKIP,
     AUDIT_ACTION_TRIGGER_FIRED, RUN_STATUS_FAILED, RUN_STATUS_SKIPPED, RUN_STATUS_SUCCEEDED,
@@ -146,7 +146,18 @@ impl RunContext {
             return Ok(());
         }
 
-        let exec_result = execute_action(job).await;
+        let exec_result = {
+            let now = chrono::Utc::now();
+            let last_success = self
+                .store
+                .latest_success_at(job.id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let window = due_window(&job.trigger_set, last_success, now).or_else(|| {
+                event.map(|item| format!("event:{}", item.source_event_id))
+            });
+            execute_action(job, self.workflow.as_ref(), window.as_deref()).await
+        };
         match exec_result {
             Ok(cost) => {
                 self.store
@@ -191,15 +202,24 @@ impl RunContext {
     }
 }
 
-async fn execute_action(job: &AutomationJob) -> Result<u64, String> {
+async fn execute_action(
+    job: &AutomationJob,
+    workflow: Option<&WorkflowClient>,
+    due_window: Option<&str>,
+) -> Result<u64, String> {
     match job.action.kind {
         crate::JobActionKind::MemoryRelayerCall => {
+            let window = due_window.ok_or("scheduled job has no due window")?;
+            let workflow = workflow.ok_or(
+                "WORKFLOW_RELAYER_URL and WORKFLOW_SYNC_SECRET are required to nudge messaging",
+            )?;
+            workflow.ingest_due_task(job, window).await?;
             tracing::info!(
                 job_id = %job.id,
                 agent = %job.target_agent_object_id,
-                "delegating memory relayer action (auth enforced by relayer)"
+                "nudged messaging with due task"
             );
-            Ok(job.max_mist_per_run.min(1))
+            Ok(0)
         }
         crate::JobActionKind::SocialAction | crate::JobActionKind::Webhook => {
             tracing::info!(job_id = %job.id, "action stub — wire signed client in deployment");

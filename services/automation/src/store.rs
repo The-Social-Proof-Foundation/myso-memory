@@ -29,6 +29,10 @@ pub trait AutomationStore: Send + Sync {
         cost_mist: Option<u64>,
         error: Option<String>,
     ) -> Result<(), StoreError>;
+    async fn latest_success_at(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError>;
     async fn ingest_event_dedup(&self, event: &PlatformEvent) -> Result<bool, StoreError>;
 }
 
@@ -50,7 +54,9 @@ struct InMemoryStore {
 }
 
 struct RunRow {
+    job_id: Uuid,
     status: String,
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait]
@@ -86,7 +92,9 @@ impl AutomationStore for InMemoryStore {
         self.runs.write().await.insert(
             run_id,
             RunRow {
+                job_id,
                 status: "running".into(),
+                finished_at: None,
             },
         );
         Ok(run_id)
@@ -101,8 +109,21 @@ impl AutomationStore for InMemoryStore {
     ) -> Result<(), StoreError> {
         if let Some(row) = self.runs.write().await.get_mut(&run_id) {
             row.status = status.to_string();
+            row.finished_at = Some(chrono::Utc::now());
         }
         Ok(())
+    }
+
+    async fn latest_success_at(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError> {
+        let runs = self.runs.read().await;
+        Ok(runs
+            .values()
+            .filter(|row| row.job_id == job_id && row.status == crate::RUN_STATUS_SUCCEEDED)
+            .filter_map(|row| row.finished_at)
+            .max())
     }
 
     async fn ingest_event_dedup(&self, event: &PlatformEvent) -> Result<bool, StoreError> {
@@ -229,6 +250,20 @@ impl AutomationStore for PgStore {
         .await
         .map_err(|e| StoreError::Message(e.to_string()))?;
         Ok(())
+    }
+
+    async fn latest_success_at(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError> {
+        sqlx::query_scalar(
+            r#"SELECT MAX(finished_at) FROM automation_runs
+               WHERE job_id = $1 AND status = 'succeeded'"#,
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StoreError::Message(e.to_string()))
     }
 
     async fn ingest_event_dedup(&self, event: &PlatformEvent) -> Result<bool, StoreError> {
