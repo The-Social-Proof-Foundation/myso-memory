@@ -2002,9 +2002,23 @@ pub async fn ask(
         sub_label
     );
 
-    crate::ai_spend::preflight_ask(&state, &auth, &body.question).await?;
+    let saved_model = match body
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        Some(_) => None,
+        None => state.db.get_agent_llm_model(agent_object_id).await?,
+    };
+    let chosen = crate::llm_models::pick_ask_model(
+        body.model_id.as_deref(),
+        saved_model.as_deref(),
+        &state.config.default_llm_model,
+    );
+    let llm_model = resolve_llm_model(&state.config, Some(&chosen));
 
-    let llm_model = resolve_llm_model(&state.config, body.model_id.as_deref());
+    crate::ai_spend::preflight_ask(&state, &auth, &body.question, &llm_model).await?;
 
     let requested_scope = crate::types::parse_scope(&body.scope)?;
     let (search_scope, degraded_scope) =

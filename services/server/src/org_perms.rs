@@ -54,14 +54,16 @@ pub async fn resolve_org_memory_perms(
     }
 
     let url = format!(
-        "{}/organizations/{}/memory-permissions?member={}&active_only=true",
+        "{}/internal/organizations/{}/memory-permissions?member={}&active_only=true",
         state.config.social_server_url.trim_end_matches('/'),
         org_id,
         auth.derived_address,
     );
-    let resp = state
-        .http_client
-        .get(&url)
+    let mut request = state.http_client.get(&url);
+    if let Some(secret) = state.config.internal_sync_secret.as_deref() {
+        request = request.header("x-internal-sync-secret", secret);
+    }
+    let resp = request
         .send()
         .await
         .map_err(|e| AppError::Internal(format!("org perms fetch failed: {}", e)))?;

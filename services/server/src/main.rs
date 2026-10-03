@@ -11,6 +11,7 @@ mod db;
 mod file_storage;
 mod jobs;
 mod lifecycle;
+mod llm_models;
 mod memory_contract;
 mod mydata;
 mod myso;
@@ -226,6 +227,11 @@ async fn main() {
     // auth + rate-limit middleware even sees the request.
     let protected_routes = Router::new()
         .route("/api/agent/context", get(routes::agent_context))
+        .route("/api/models", get(llm_models::list_models))
+        .route(
+            "/api/agent/llm-model",
+            get(llm_models::get_llm_model).put(llm_models::set_llm_model),
+        )
         .route("/api/messaging/inbox", get(routes::messaging_inbox))
         .route("/api/messaging/wait", get(routes::messaging_wait))
         .route(

@@ -45,6 +45,7 @@ impl VectorDb {
                 "011",
                 include_str!("../migrations/011_chain_action_requests.sql"),
             ),
+            ("013", include_str!("../migrations/013_agent_llm_models.sql")),
         ] {
             sqlx::raw_sql(sql).execute(&pool).await.map_err(|e| {
                 AppError::Internal(format!("Failed to run migration {}: {}", name, e))
@@ -449,5 +450,38 @@ impl VectorDb {
             .map_err(|e| AppError::Internal(format!("Failed to commit tx: {}", e)))?;
 
         Ok(row.0)
+    }
+
+    pub async fn get_agent_llm_model(
+        &self,
+        agent_object_id: &str,
+    ) -> Result<Option<String>, AppError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT model_id FROM agent_llm_models WHERE agent_object_id = $1",
+        )
+        .bind(agent_object_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to load agent model: {}", e)))?;
+        Ok(row.map(|value| value.0))
+    }
+
+    pub async fn upsert_agent_llm_model(
+        &self,
+        agent_object_id: &str,
+        model_id: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO agent_llm_models (agent_object_id, model_id) \
+             VALUES ($1, $2) \
+             ON CONFLICT (agent_object_id) DO UPDATE \
+             SET model_id = EXCLUDED.model_id, updated_at = NOW()",
+        )
+        .bind(agent_object_id)
+        .bind(model_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to save agent model: {}", e)))?;
+        Ok(())
     }
 }

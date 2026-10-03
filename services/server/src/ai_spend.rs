@@ -334,6 +334,7 @@ pub async fn preflight_ask(
     state: &Arc<AppState>,
     auth: &AuthInfo,
     question: &str,
+    model_id: &str,
 ) -> Result<(), AppError> {
     if !ai_credit_enabled(&state.config) {
         return Ok(());
@@ -344,7 +345,7 @@ pub async fn preflight_ask(
         owner: auth.owner.clone(),
         agent_object_id: auth.agent_object_id.clone(),
         operation: "ask".into(),
-        model_id: Some(DEFAULT_ANALYZE_MODEL.to_string()),
+        model_id: Some(model_id.to_string()),
         estimated_tokens_in: tokens_in,
         estimated_tokens_out: 512,
         fact_count: None,
