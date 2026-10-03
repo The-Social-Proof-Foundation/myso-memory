@@ -6,9 +6,10 @@
 
 # ── Stage 1: Build Rust binary ──────────────────────────────
 # LOW-28: pinned by digest for reproducible, supply-chain-safe builds.
-# Tag: rust:1.85-bookworm  |  arch: linux/amd64  |  pinned: 2026-04-16
-# To refresh: docker inspect --format='{{index .RepoDigests 0}}' rust:1.85-bookworm
-FROM rust:1.85-bookworm@sha256:bf7d87666c4da6eace19e06d21bc4859c6e2a5c97a21ac273b0e082112753cf0 AS builder
+# Tag: rust:1.94.1-bookworm  |  manifest index (linux amd64 + arm64)  |  pinned: 2026-10-03
+# aws-sdk-s3 1.138 (and its smithy crates) require rustc 1.94.1.
+# To refresh: docker buildx imagetools inspect rust:1.94.1-bookworm
+FROM rust:1.94.1-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS builder
 
 WORKDIR /app
 
