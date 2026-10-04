@@ -49,7 +49,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/v1/automation/jobs", post(handlers::create_job))
-        .route("/v1/automation/jobs/:id", get(handlers::get_job))
+        .route("/v1/automation/jobs/{id}", get(handlers::get_job))
         .route("/internal/automation/events", post(handlers::ingest_event))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
