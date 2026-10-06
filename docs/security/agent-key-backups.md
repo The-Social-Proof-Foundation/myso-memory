@@ -31,7 +31,7 @@ Keep the normal database, Redis, chain, social-index, MYDATA, inference, and sid
 
 In production, use an immutable RP ID, exact HTTPS allowed origins, and an exact backup-service origin. Wildcards, nonlocal HTTP origins, and private-key forwarding are rejected. Test and production roots are chain/account/credential bound and are not interchangeable.
 
-The chat app's dependency points to the local Memory SDK at `file:../../myso-memory/packages/sdk`, version 0.0.6. Its package includes built `dist` files. After changing SDK source, rebuild the SDK and refresh the chat app's local file dependency before building the chat app. No package has been published.
+The chat app's dependency points to the local Memory SDK at `file:../../myso-memory/packages/sdk`, version 0.0.6. Vite, TypeScript, and Vitest resolve its entry points directly to the working SDK source through `chat-app/local-memory-sdk.ts` and matching TypeScript paths. The local SDK is excluded from dependency prebundling, so source changes do not require an SDK rebuild or package reinstall to appear in Chat App. Restart Vite after changing the resolver configuration. Other SDK consumers still use built `dist` files; no package has been published.
 
 ## Cryptographic contract
 
@@ -117,7 +117,7 @@ pnpm --filter @socialproof/memory build
 pnpm --filter @socialproof/memory test
 cargo test --manifest-path services/server/Cargo.toml
 
-# chat-app (refresh the local file dependency after the SDK build)
+# chat-app (Vite and TypeScript consume the local SDK source directly)
 corepack pnpm install --force
 corepack pnpm build
 corepack pnpm test
