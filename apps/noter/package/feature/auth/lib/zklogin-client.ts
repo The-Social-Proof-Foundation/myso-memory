@@ -6,7 +6,7 @@
  * removed the concrete MySoClient class.
  */
 
-import { genAddressSeed, getZkLoginSignature, jwtToAddress, getExtendedEphemeralPublicKey } from "@mysten/zklogin";
+import { genAddressSeed, getZkLoginSignature, jwtToAddress, getExtendedEphemeralPublicKey } from "@socialproof/myso/zklogin";
 import { Ed25519PublicKey } from "@socialproof/myso/keypairs/ed25519";
 import { ZKLOGIN_CONFIG, AUTH_ERRORS } from "../constant";
 import type { ZkProofData } from "@/shared/db/type";

@@ -2,7 +2,7 @@ import { initTRPC, TRPCError } from "@trpc/server";
 import { FetchCreateContextFnOptions } from "@trpc/server/adapters/fetch";
 import superjson from "superjson";
 import { db } from "@/shared/lib/db";
-import { zkLoginSessions, walletSessions, users } from "@/shared/db/schema";
+import { zkLoginSessions, walletSessions } from "@/shared/db/schema";
 import { eq } from "drizzle-orm";
 
 export type Context = {
@@ -18,20 +18,9 @@ function getSessionIdFromRequest(req: Request): string | null {
   return req.headers.get("x-session-id");
 }
 
-/** Load user's Memory delegate key from the users table. Falls back to env vars. */
-async function loadUsermemoryKey(userId: string) {
-  try {
-    const [user] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
-    return {
-      memoryKey: user?.delegatePrivateKey ?? process.env.MEMORY_KEY ?? null,
-      memoryAccountId: user?.delegateAccountId ?? process.env.MEMORY_ACCOUNT_ID ?? null,
-    };
-  } catch {
-    return {
-      memoryKey: process.env.MEMORY_KEY ?? null,
-      memoryAccountId: process.env.MEMORY_ACCOUNT_ID ?? null,
-    };
-  }
+/** Server-held user signing is disabled; client-signed memory integration is required. */
+async function loadUsermemoryKey(_userId: string) {
+  return { memoryKey: null, memoryAccountId: null };
 }
 
 export const createContext = async (

@@ -128,6 +128,9 @@ export class Memory {
     private relayerVersionMetadata: RelayerVersionMetadata | null = null;
     private compatibilityPromise: Promise<RelayerVersionMetadata> | null = null;
 
+    private abortController = new AbortController();
+    private detachAbort?: () => void;
+
     private constructor(config: MemoryConfig) {
         this.privateKey = typeof config.key === "string" ? hexToBytes(config.key) : config.key;
         this.accountId = config.accountId;
@@ -146,6 +149,13 @@ export class Memory {
                 : config.ownerCoSignKey)
             : null;
         this.accountId = config.accountId;
+        if (config.signal) {
+            const signal = config.signal;
+            const stop = () => this.destroy();
+            signal.addEventListener('abort', stop, {once: true});
+            this.detachAbort = () => signal.removeEventListener('abort', stop);
+            if (signal.aborted) this.destroy();
+        }
     }
 
     /**
@@ -163,6 +173,9 @@ export class Memory {
      * Prevents key extraction from V8 heap dumps.
      */
     destroy(): void {
+        this.abortController.abort();
+        this.detachAbort?.();
+        this.detachAbort = undefined;
         if (this.privateKey) {
             this.privateKey.fill(0);
         }
@@ -176,6 +189,9 @@ export class Memory {
         // instance must not leak authorization tokens either.
         this.sessionCache = null;
         this.serverConfig = null;
+        this.sessionBuildPromise = null;
+        this.compatibilityPromise = null;
+        this.relayerVersionMetadata = null;
     }
 
     // ============================================================
@@ -462,7 +478,7 @@ export class Memory {
             return await this.signedRequest<HealthResult>("GET", "/health", {});
         } catch (err) {
             // Fall back to a plain GET for servers that reject bodies on GET /health.
-            const res = await fetch(`${this.serverUrl}/health`);
+            const res = await fetch(`${this.serverUrl}/health`, {signal: this.abortController.signal});
             if (!res.ok) {
                 throw err instanceof Error
                     ? err
@@ -483,6 +499,17 @@ export class Memory {
     // ============================================================
     // Internal: Signed HTTP Requests
     // ============================================================
+
+    /** Public signed endpoint API for extensions; never forwards a signing seed. */
+    request<T>(method: string, path: string, body: object = {}): Promise<T> {
+        return this.signedRequest<T>(method, path, body);
+    }
+    ask(params: { question: string; namespace?: string; scope?: string; limit?: number }) {
+        return this.signedRequest<{answer: string; memories_used: number; memories: RecallMemory[]; amount_mist?: number}>('POST', '/api/ask', {namespace: this.namespace, ...params});
+    }
+    listModels() { return this.signedRequest<{models: {id: string; display_name: string; input_mist_per_1m: number; output_mist_per_1m: number}[]}>('GET', '/api/models', {}); }
+    getAgentModel() { return this.signedRequest<{model_id: string; source: string}>('GET', '/api/agent/llm-model', {}); }
+    setAgentModel(modelId: string) { return this.signedRequest<{model_id: string; source: string}>('PUT', '/api/agent/llm-model', {model_id: modelId}); }
 
     private scopeFields(subLabel?: string): { namespace?: string } {
         const label = subLabel ?? this.subLabel;
@@ -536,7 +563,7 @@ export class Memory {
 
     private async fetchServerConfig(): Promise<ServerConfig> {
         if (this.serverConfig) return this.serverConfig;
-        const res = await fetch(`${this.serverUrl}/config`, { method: "GET" });
+        const res = await fetch(`${this.serverUrl}/config`, { method: "GET", signal: this.abortController.signal });
         if (!res.ok) {
             throw new Error(`GET /config returned ${res.status}`);
         }
@@ -585,8 +612,9 @@ export class Memory {
             );
         }
 
+        this.abortController.signal.throwIfAborted();
         const keypair = Ed25519Keypair.fromSecretKey(this.privateKey);
-        const mysoClient = new MySoClient({ url: cfg.mysoRpcUrl });
+        const mysoClient = new MySoClient({ url: cfg.mysoRpcUrl, network: cfg.network === "mainnet" ? "mainnet" : "testnet" });
 
         const session = await SessionKey.create({
             address: keypair.getPublicKey().toMySoAddress(),
@@ -628,6 +656,7 @@ export class Memory {
                 ? btoa(jsonStr)
                 : Buffer.from(jsonStr, "utf8").toString("base64");
 
+        this.abortController.signal.throwIfAborted();
         this.sessionCache = {
             bytes,
             expiresAt:
@@ -663,13 +692,13 @@ export class Memory {
     }
 
     private async fetchCompatibilityMetadata(): Promise<RelayerVersionMetadata> {
-        const versionRes = await fetch(`${this.serverUrl}/version`, { method: "GET" });
+        const versionRes = await fetch(`${this.serverUrl}/version`, { method: "GET", signal: this.abortController.signal });
         let body: Partial<RelayerVersionMetadata>;
 
         if (versionRes.ok) {
             body = (await versionRes.json()) as Partial<RelayerVersionMetadata>;
         } else {
-            const healthRes = await fetch(`${this.serverUrl}/health`, { method: "GET" });
+            const healthRes = await fetch(`${this.serverUrl}/health`, { method: "GET", signal: this.abortController.signal });
             if (!healthRes.ok) {
                 throw new Error(
                     `Memory compatibility check failed: GET /version returned ${versionRes.status}`,
@@ -719,7 +748,9 @@ export class Memory {
             acceptedStatuses?: number[];
         } = {},
     ): Promise<T> {
+        this.abortController.signal.throwIfAborted();
         await this.ensureCompatibleRelayer();
+        this.abortController.signal.throwIfAborted();
         const ed = await getEd();
 
         const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -750,6 +781,7 @@ export class Memory {
         };
         if (this.platformId) {
             headers["x-platform-id"] = this.platformId;
+            headers["x-platform-signature"] = bytesToHex(await ed.signAsync(new TextEncoder().encode(`mysocial-request-platform-v1|${this.platformId}|${message}`), this.privateKey));
         }
         if (this.ownerCoSignKey && this.isWriteRoute(method, path)) {
             const ownerSig = await ed.signAsync(msgBytes, this.ownerCoSignKey);
@@ -764,11 +796,12 @@ export class Memory {
         if (options.includeDelegateKey !== false) {
             headers["x-mydata-session"] = await this.buildMyDataSession();
         }
+        this.abortController.signal.throwIfAborted();
         const res = await fetch(url, {
             method,
             headers,
             body: method === "GET" ? undefined : bodyStr,
-            signal: options.signal,
+            signal: options.signal ? AbortSignal.any([options.signal, this.abortController.signal]) : this.abortController.signal,
         });
 
         const accepted = options.acceptedStatuses ?? [200];

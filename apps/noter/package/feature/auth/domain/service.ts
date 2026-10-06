@@ -8,7 +8,7 @@
 
 import type { db as dbClient } from "@/shared/lib/db";
 import { users, zkLoginSessions, walletSessions } from "@/shared/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import type { ZkProofData } from "@/shared/db/type";
 
 type DbClient = typeof dbClient;
@@ -207,84 +207,6 @@ export async function getActiveSession(db: DbClient, sessionId: string) {
 // ══════════════════════════════════════════════════════════════
 // ENOKI USER MANAGEMENT
 // ══════════════════════════════════════════════════════════════
-
-/** Create or update user from Enoki zkLogin. Stores delegate key for returning-user fast path. */
-export async function upsertEnokiUser(
-  db: DbClient,
-  input: {
-    mysoAddress: string;
-    delegatePrivateKey: string;
-    delegateAccountId: string;
-  }
-) {
-  const [existingUser] = await db
-    .select()
-    .from(users)
-    .where(eq(users.mysoAddress, input.mysoAddress))
-    .limit(1);
-
-  if (existingUser) {
-    const [user] = await db
-      .update(users)
-      .set({
-        authMethod: "enoki",
-        delegatePrivateKey: input.delegatePrivateKey,
-        delegateAccountId: input.delegateAccountId,
-        lastSeenAt: new Date(),
-      })
-      .where(eq(users.id, existingUser.id))
-      .returning();
-    return user;
-  }
-
-  const [user] = await db
-    .insert(users)
-    .values({
-      mysoAddress: input.mysoAddress,
-      authMethod: "enoki",
-      delegatePrivateKey: input.delegatePrivateKey,
-      delegateAccountId: input.delegateAccountId,
-      name: "Enoki User",
-      lastSeenAt: new Date(),
-    })
-    .returning();
-  return user;
-}
-
-/** Look up Enoki user with stored credentials for returning-user fast path. */
-export async function getEnokiUserByMySoAddress(db: DbClient, mysoAddress: string) {
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(
-      and(eq(users.mysoAddress, mysoAddress), eq(users.authMethod, "enoki"))
-    )
-    .limit(1);
-
-  if (user?.delegatePrivateKey && user?.delegateAccountId) {
-    return user;
-  }
-  return null;
-}
-
-/** Create an Enoki session. Reuses walletSessions table with walletType "enoki". */
-export async function createEnokiSession(
-  db: DbClient,
-  input: { sessionId: string; userId: string; mysoAddress: string }
-) {
-  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
-  await db.insert(walletSessions).values({
-    id: input.sessionId,
-    userId: input.userId,
-    walletAddress: input.mysoAddress,
-    walletType: "enoki",
-    signedMessage: "enoki-zklogin",
-    signature: "",
-    signedAt: new Date(),
-    expiresAt,
-  });
-  return { sessionId: input.sessionId, expiresAt };
-}
 
 // ══════════════════════════════════════════════════════════════
 // SESSION CLEANUP

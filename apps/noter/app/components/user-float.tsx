@@ -8,7 +8,7 @@ import {
   TooltipTrigger,
 } from "@/shared/components/ui/tooltip";
 import { cn } from "@/shared/lib/utils";
-import { Copy, LogOut, Minus, Check, Shield, KeyRound, Eye, EyeOff, ExternalLink } from "lucide-react";
+import { Copy, LogOut, Minus, Check, Shield, ExternalLink } from "lucide-react";
 import Image from "next/image";
 import { useState } from "react";
 
@@ -45,7 +45,6 @@ function truncateAddress(addr: string): string {
 
 export function UserFloatPanel({ className, onClose }: UserFloatPanelProps) {
   const { user, mysoAddress, logout } = useAuth();
-  const [showKey, setShowKey] = useState(false);
 
   const handleLogout = async () => {
     await logout();
@@ -148,40 +147,6 @@ export function UserFloatPanel({ className, onClose }: UserFloatPanelProps) {
                 </div>
               )}
             </div>
-
-            {/* Delegate Key Export */}
-            {user.delegatePrivateKey && (
-              <div className="space-y-1">
-                <div className="flex items-center gap-1 px-1 py-0.5">
-                  <KeyRound className="size-3 text-muted-foreground" />
-                  <span className="text-xs font-medium">Delegate Key</span>
-                </div>
-
-                {showKey && (
-                  <div className="bg-secondary p-2">
-                    <code className="text-[10px] break-all leading-relaxed block font-mono">
-                      {user.delegatePrivateKey}
-                    </code>
-                    <div className="flex justify-end mt-1">
-                      <CopyButton value={user.delegatePrivateKey} label="key" />
-                    </div>
-                  </div>
-                )}
-
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="w-full"
-                  onClick={() => setShowKey(!showKey)}
-                >
-                  {showKey ? (
-                    <><EyeOff className="size-3 mr-1.5" /> Hide Key</>
-                  ) : (
-                    <><Eye className="size-3 mr-1.5" /> Reveal Key</>
-                  )}
-                </Button>
-              </div>
-            )}
 
             {/* Logout */}
             <Button

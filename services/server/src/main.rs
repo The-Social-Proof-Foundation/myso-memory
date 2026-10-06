@@ -1,4 +1,7 @@
 mod access_request_client;
+mod owner_auth;
+mod agent_key_backups;
+mod agent_key_setup;
 mod action_approvals;
 mod ai_spend;
 mod audit_push;
@@ -59,6 +62,12 @@ async fn main() {
 
     // Load config
     let mut config = Config::from_env();
+    let backups_enabled = std::env::var("ENABLE_AGENT_KEY_BACKUPS").as_deref() == Ok("true");
+    if backups_enabled {
+        owner_auth::validate_config().expect("Invalid agent backup configuration");
+        assert!(!config.allow_legacy_delegate_key_forwarding && !config.allow_legacy_social_key_forwarding,
+            "Non-custodial agent backups require legacy private-key forwarding to be disabled");
+    }
     tracing::info!("starting memory server on port {}", config.port);
     tracing::info!("  MySo RPC: {}", config.myso_rpc_url);
     tracing::info!("  package id: {}", config.package_id);
@@ -363,6 +372,11 @@ async fn main() {
             rate_limit::sponsor_rate_limit_middleware,
         ));
     public_routes = public_routes.merge(owner_approval_routes);
+    if backups_enabled {
+        public_routes = public_routes.merge(agent_key_backups::router()
+            .layer(DefaultBodyLimit::max(32 * 1024))
+            .layer(middleware::from_fn_with_state(state.clone(), rate_limit::sponsor_rate_limit_middleware)));
+    }
     if config.allow_public_generic_sponsor {
         tracing::warn!(
             target: "memory::security",
@@ -396,6 +410,9 @@ async fn main() {
             let mut allowed_headers = vec![
                 header::CONTENT_TYPE,
                 header::AUTHORIZATION,
+                header::IF_MATCH,
+                "x-vault-token".parse::<header::HeaderName>().unwrap(),
+                "x-sdk-compatibility".parse::<header::HeaderName>().unwrap(),
                 // SDK auth headers (required for Ed25519 signed requests)
                 "x-public-key".parse::<header::HeaderName>().unwrap(),
                 "x-signature".parse::<header::HeaderName>().unwrap(),
@@ -403,6 +420,7 @@ async fn main() {
                 "x-nonce".parse::<header::HeaderName>().unwrap(),
                 "x-account-id".parse::<header::HeaderName>().unwrap(),
                 "x-platform-id".parse::<header::HeaderName>().unwrap(),
+                "x-platform-signature".parse::<header::HeaderName>().unwrap(),
                 "x-owner-public-key".parse::<header::HeaderName>().unwrap(),
                 "x-owner-signature".parse::<header::HeaderName>().unwrap(),
                 // SessionKey envelope used instead of forwarding a private key.
@@ -420,7 +438,7 @@ async fn main() {
             }
             CorsLayer::new()
                 .allow_origin(AllowOrigin::list(origins))
-                .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
                 .allow_headers(allowed_headers)
         }
     };

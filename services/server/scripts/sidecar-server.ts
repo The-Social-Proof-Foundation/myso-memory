@@ -433,6 +433,14 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     next();
 });
 
+// Public verification only; no browser PRF outputs.
+app.post('/key-backup/:operation', async (req, res) => {
+    try {
+        const {keyBackupOperation} = await import('./key-backup.js');
+        res.json(await keyBackupOperation(String(req.params.operation), req.body));
+    } catch { res.status(400).json({code: 'verification_rejected'}); }
+});
+
 // ============================================================
 // POST /mydata/encrypt
 // ============================================================

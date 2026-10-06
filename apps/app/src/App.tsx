@@ -12,9 +12,7 @@ import {
   WalletProvider,
   useCurrentAccount,
   useDisconnectWallet,
-  useMySoClientContext,
 } from '@socialproof/dapp-kit'
-import { isEnokiNetwork, registerEnokiWallets } from '@mysten/enoki'
 import { getJsonRpcFullnodeUrl } from '@socialproof/myso/jsonRpc'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
@@ -74,16 +72,12 @@ export function useDelegateKey() {
 
 function DelegateKeyProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<DelegateKeyState>(() => {
-    const saved = sessionStorage.getItem('memory_delegate')
-    if (saved) {
-      try { return JSON.parse(saved) } catch { /* ignore */ }
-    }
+    sessionStorage.removeItem('memory_delegate')
     return { delegateKey: null, delegatePublicKey: null, accountObjectId: null }
   })
 
   const setDelegateKeys = useCallback((privateKey: string, publicKey: string, accountId: string) => {
     const next = { delegateKey: privateKey, delegatePublicKey: publicKey, accountObjectId: accountId }
-    sessionStorage.setItem('memory_delegate', JSON.stringify(next))
     setState(next)
   }, [])
 
@@ -165,30 +159,8 @@ function DelegateKeyProvider({ children }: { children: React.ReactNode }) {
 // Enoki wallet registration
 // ============================================================
 
-function RegisterEnokiWallets() {
-  const { client, network } = useMySoClientContext()
-
-  useEffect(() => {
-    if (!isEnokiNetwork(network)) return
-    if (!config.enokiApiKey || !config.googleClientId) {
-      console.warn('Enoki API key or Google Client ID not set. Skipping Enoki wallet registration.')
-      return
-    }
-
-    const { unregister } = registerEnokiWallets({
-      apiKey: config.enokiApiKey,
-      providers: {
-        google: { clientId: config.googleClientId },
-      },
-      client,
-      network,
-    })
-
-    return unregister
-  }, [client, network])
-
-  return null
-}
+// Legacy Enoki agent setup is disabled; passkey-backed setup lives in the chat app.
+function RegisterEnokiWallets() { return null }
 
 // ============================================================
 // App content — route based on auth + key state

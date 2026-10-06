@@ -108,35 +108,6 @@ async fn get_json(
         .map_err(|e| SocialApiError::Parse(e.to_string()))
 }
 
-/// Walk parent chain up to root, mirroring `assert_ancestor_chain_active_from_table`.
-/// Returns ancestors ordered from immediate parent to root (excludes `agent` itself).
-pub async fn fetch_ancestor_chain(
-    http_client: &reqwest::Client,
-    base_url: &str,
-    agent: &SocialSubAgent,
-) -> Result<Vec<SocialSubAgent>, SocialApiError> {
-    use crate::memory_contract::MAX_AGENT_DEPTH;
-
-    let mut ancestors = Vec::new();
-    let mut current_parent = agent.parent_object_id.clone();
-    let mut hops = 0u8;
-
-    while let Some(parent_id) = current_parent {
-        hops += 1;
-        if hops > MAX_AGENT_DEPTH {
-            return Err(SocialApiError::Parse(
-                "ancestor chain exceeds max depth".into(),
-            ));
-        }
-
-        let parent = fetch_sub_agent_by_object_id(http_client, base_url, &parent_id).await?;
-        current_parent = parent.parent_object_id.clone();
-        ancestors.push(parent);
-    }
-
-    Ok(ancestors)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

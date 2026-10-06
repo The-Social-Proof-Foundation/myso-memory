@@ -1680,6 +1680,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigRespon
             clock_id: "0x6",
         });
     Json(ConfigResponse {
+        agent_key_backups: std::env::var("ENABLE_AGENT_KEY_BACKUPS").as_deref() == Ok("true"),
         package_id,
         network: state.config.myso_network.clone(),
         myso_rpc_url: state.config.myso_rpc_url.clone(),

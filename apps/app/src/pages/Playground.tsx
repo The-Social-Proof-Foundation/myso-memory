@@ -281,7 +281,7 @@ export default function Playground() {
         setRestoreResult(null)
         setRestoreError(null)
         try {
-            const data = await memory.restore(namespace || 'default')
+            const data = await memory.restore()
             setRestoreResult(JSON.stringify(data, null, 2))
         } catch (err: unknown) {
             setRestoreError(err instanceof Error ? err.message : String(err))

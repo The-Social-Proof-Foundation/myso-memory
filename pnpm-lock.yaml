@@ -1023,7 +1023,7 @@ importers:
         version: 5.9.3
 
   packages/openclaw-memory:
-    dependencies:
+    devDependencies:
       '@sinclair/typebox':
         specifier: 0.34.48
         version: 0.34.48
@@ -1033,10 +1033,6 @@ importers:
       '@socialproof/sub-agents':
         specifier: 0.0.2
         version: 0.0.2(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)
-      zod:
-        specifier: ^3.25.76
-        version: 3.25.76
-    devDependencies:
       '@types/node':
         specifier: ^22.19.17
         version: 22.19.17
@@ -1046,6 +1042,9 @@ importers:
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
+      zod:
+        specifier: ^3.25.76
+        version: 3.25.76
 
   packages/sdk:
     dependencies:
@@ -1055,6 +1054,9 @@ importers:
       '@noble/hashes':
         specifier: ^2.0.0
         version: 2.2.0
+      '@socialproof/bcs':
+        specifier: ^0.0.2
+        version: 0.0.2
       '@socialproof/file-storage':
         specifier: '>=0.0.4'
         version: 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))

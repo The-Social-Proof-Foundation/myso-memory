@@ -62,67 +62,14 @@ export function useAuth() {
   }, [session, sessionQuery.data, sessionQuery.isError, sessionQuery.isLoading, auth.isAuthenticated, setAuthenticated, setLoading, setSession]);
 
   /** Connect with Enoki zkLogin (two-phase: check returning user, then register). */
-  const connectEnoki = useCallback(
-    async (params: { mysoAddress: string; privateKey?: string; accountId?: string }) => {
-      try {
-        setLoading(true);
-        const result = await connectEnokiMutation.mutateAsync(params);
+  const connectEnoki = useCallback(async (_params: {mysoAddress: string; accountId?: string}) => {
+    throw new Error("Use passkey-backed agent setup in the chat app.");
+  }, []);
 
-        if ("needsSetup" in result && result.needsSetup) {
-          setLoading(false);
-          return result;
-        }
+  const connectDelegateKey = useCallback(async (_params: {accountId: string}) => {
+    throw new Error("Private-key login is disabled.");
+  }, []);
 
-        if (result.sessionData) {
-          setSession(result.sessionData);
-        }
-
-        if (result.user) {
-          setAuthenticated({
-            isAuthenticated: true,
-            user: result.user,
-            mysoAddress: result.user.mysoAddress,
-            provider: null,
-          });
-        }
-
-        return result;
-      } catch (error) {
-        setLoading(false);
-        console.error("Enoki connection failed:", error);
-        throw error;
-      }
-    },
-    [connectEnokiMutation, setSession, setAuthenticated, setLoading]
-  );
-
-  /** Connect with delegate key (manual key + account ID). */
-  const connectDelegateKey = useCallback(
-    async (params: { privateKey: string; accountId: string }) => {
-      try {
-        setLoading(true);
-        const result = await connectDelegateKeyMutation.mutateAsync(params);
-
-        setSession(result.sessionData);
-
-        setAuthenticated({
-          isAuthenticated: true,
-          user: result.user,
-          mysoAddress: result.user.mysoAddress,
-          provider: null,
-        });
-
-        return result;
-      } catch (error) {
-        setLoading(false);
-        console.error("Delegate key connection failed:", error);
-        throw error;
-      }
-    },
-    [connectDelegateKeyMutation, setSession, setAuthenticated, setLoading]
-  );
-
-  /** Logout — clear session, auth state, and disconnect wallet (prevents autoConnect). */
   const logout = useCallback(async () => {
     try {
       if (session?.sessionId) {

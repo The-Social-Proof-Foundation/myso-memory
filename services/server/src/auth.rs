@@ -17,7 +17,7 @@ use crate::memory_contract::{
 use crate::myso::{derived_address_from_public_key, verify_sub_agent_onchain};
 use crate::policy::{validate_agent_policy, PolicyError, RequestPolicyInput};
 use crate::social::{
-    fetch_ancestor_chain, fetch_sub_agent_by_derived_address, fetch_sub_agent_by_object_id,
+    fetch_sub_agent_by_derived_address, fetch_sub_agent_by_object_id,
     SocialApiError, SocialSubAgent,
 };
 use crate::types::{AppState, AuthInfo};
@@ -117,6 +117,9 @@ pub async fn verify_signature(
         })
         .flatten();
 
+    let signed_platform = headers.get("x-platform-id").and_then(|v|v.to_str().ok()).map(String::from);
+    let platform_signature = headers.get("x-platform-signature").and_then(|v|v.to_str().ok()).map(String::from);
+
     let mydata_session = headers
         .get("x-mydata-session")
         .and_then(|v| v.to_str().ok())
@@ -215,6 +218,14 @@ pub async fn verify_signature(
     {
         return Err(constant_time_reject().await);
     }
+
+    if let Some(platform) = signed_platform.as_deref() {
+        crate::owner_auth::address(platform).map_err(|_|StatusCode::BAD_REQUEST)?;
+        let encoded = platform_signature.as_deref().ok_or_else(unsupported_legacy_sdk)?;
+        let bytes: [u8;64] = hex::decode(encoded).map_err(|_|StatusCode::UNAUTHORIZED)?.try_into().map_err(|_|StatusCode::UNAUTHORIZED)?;
+        let bound = format!("mysocial-request-platform-v1|{}|{}",platform,message);
+        if verifying_key.verify(bound.as_bytes(),&Signature::from_bytes(&bytes)).is_err() {return Err(constant_time_reject().await);}
+    } else if platform_signature.is_some() {return Err(StatusCode::BAD_REQUEST);}
 
     {
         let nonce_key = format!("nonce:{}", nonce);
@@ -427,6 +438,7 @@ async fn resolve_sub_agent(
 ) -> Result<ResolvedSubAgent, ResolveError> {
     let derived_address = derived_address_from_public_key(pk_bytes);
 
+    let account_id_hint = account_id_hint.map(|a| crate::memory_contract::normalize_object_id(&a));
     let mut agent: Option<SocialSubAgent> = None;
     let mut owner = String::new();
 
@@ -483,7 +495,7 @@ async fn resolve_sub_agent(
         {
             Ok(indexed) => {
                 if let Some(ref hint) = account_id_hint {
-                    if hint != &indexed.account_id {
+                    if !memory_contract::addresses_equal(hint, &indexed.account_id) {
                         return Err(ResolveError::Other(
                             "x-account-id does not match indexed sub-agent account".into(),
                         ));
@@ -521,11 +533,25 @@ async fn resolve_sub_agent(
         }
     }
 
-    let agent = agent.expect("agent resolved");
-    let ancestors =
-        fetch_ancestor_chain(&state.http_client, &state.config.social_server_url, &agent)
-            .await
-            .map_err(|e| ResolveError::Other(e.to_string()))?;
+    let agent = crate::myso::authoritative_agent(&state.http_client, &state.config.myso_rpc_url, &state.config.package_id, agent.expect("agent resolved"))
+        .await.map_err(|e| ResolveError::Other(e.to_string()))?;
+    if account_id_hint.as_deref().is_some_and(|hint| !memory_contract::addresses_equal(hint, &agent.account_id)) {
+        return Err(ResolveError::Other("x-account-id mismatch".into()));
+    }
+    let mut ancestors = Vec::new();
+    let mut parent = agent.parent_object_id.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = parent {
+        if !seen.insert(id.clone()) || ancestors.len() >= memory_contract::MAX_AGENT_DEPTH as usize {
+            return Err(ResolveError::Other("invalid ancestor chain".into()));
+        }
+        let indexed = fetch_sub_agent_by_object_id(&state.http_client, &state.config.social_server_url, &id).await.map_err(|e|ResolveError::Other(e.to_string()))?;
+        let canonical = crate::myso::authoritative_agent(&state.http_client, &state.config.myso_rpc_url, &state.config.package_id, indexed).await.map_err(|e|ResolveError::Other(e.to_string()))?;
+        if !memory_contract::addresses_equal(&canonical.account_id,&agent.account_id) || canonical.organization_id != agent.organization_id {
+            return Err(ResolveError::Other("ancestor identity mismatch".into()));
+        }
+        parent=canonical.parent_object_id.clone();ancestors.push(canonical);
+    }
 
     let owner_co_signed = match (owner_pk, owner_sig) {
         (Some(pk), Some(sig)) if is_write => verify_owner_co_signature(pk, sig, message, &owner),

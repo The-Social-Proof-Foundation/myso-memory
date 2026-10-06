@@ -99,7 +99,6 @@ export const users = pgTable(
     avatar: text(),
 
     // Enoki delegate key credentials (nullable, only for Enoki auth)
-    delegatePrivateKey: text(),
     delegateAccountId: text(),
 
     // Last active

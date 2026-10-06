@@ -7,6 +7,7 @@
         "sidecar": "tsx sidecar-server.ts"
     },
     "dependencies": {
+        "@simplewebauthn/server": "13.2.2",
         "@socialproof/file-storage": "0.0.4",
         "@socialproof/mydata": "0.0.4",
         "@socialproof/myso": "0.0.4",

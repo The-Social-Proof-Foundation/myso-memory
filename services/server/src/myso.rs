@@ -161,7 +161,7 @@ fn verify_public_key_field(
     ))
 }
 
-async fn fetch_object_fields(
+pub(crate) async fn fetch_object_fields(
     http_client: &reqwest::Client,
     rpc_url: &str,
     object_id: &str,
@@ -209,8 +209,7 @@ fn parse_u64_json(value: &serde_json::Value) -> Option<u64> {
 }
 
 fn addresses_equal(a: &str, b: &str) -> bool {
-    a.trim_start_matches("0x")
-        .eq_ignore_ascii_case(b.trim_start_matches("0x"))
+    crate::memory_contract::addresses_equal(a, b)
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,4 +300,50 @@ mod tests {
         assert_eq!(verified.derived_address, "0xderived");
         assert!(has_cap(verified.capabilities, CAP_MYDATA_READ));
     }
+}
+
+/// Exact package/type verification for recovery ownership and registration bindings.
+pub(crate) async fn fetch_typed_object_fields(http: &reqwest::Client, rpc: &str, id: &str, package: &str, name: &str) -> Result<serde_json::Map<String, serde_json::Value>, OnchainVerifyError> {
+    let value: serde_json::Value = http.post(rpc).json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"myso_getObject","params":[id,{"showContent":true}]})).send().await.map_err(|e| OnchainVerifyError::RpcError(e.to_string()))?.json().await.map_err(|e| OnchainVerifyError::RpcError(e.to_string()))?;
+    let data = value.pointer("/result/data/content").ok_or_else(|| OnchainVerifyError::RpcError("Object missing".into()))?;
+    let actual = data.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+    let mut parts = actual.split("::");
+    if !addresses_equal(parts.next().unwrap_or_default(), package) || parts.next() != Some("memory") || parts.next() != Some(name) || parts.next().is_some() {
+        return Err(OnchainVerifyError::RpcError("Unexpected recovery object type".into()));
+    }
+    data.get("fields").and_then(|v| v.as_object()).cloned().ok_or_else(|| OnchainVerifyError::RpcError("Object fields missing".into()))
+}
+
+/// Resolve every policy field from chain; indexed rows provide discovery, never authority.
+pub(crate) async fn authoritative_agent(http: &reqwest::Client, rpc: &str, package: &str, mut row: crate::social::SocialSubAgent) -> Result<crate::social::SocialSubAgent, OnchainVerifyError> {
+    use serde_json::Value;
+    let f = fetch_typed_object_fields(http,rpc,&row.agent_object_id,package,"SubAgent").await?;
+    let fail = || OnchainVerifyError::RpcError("Incomplete canonical agent policy".into());
+    let number = |v: Option<&Value>| -> Result<u64, OnchainVerifyError> { v.and_then(|v|v.as_u64().or_else(||v.as_str()?.parse().ok())).ok_or_else(fail) };
+    let string = |key: &str| -> Result<String,OnchainVerifyError> {f.get(key).and_then(Value::as_str).map(String::from).ok_or_else(fail)};
+    let option = |v: Option<&Value>| -> Result<Option<Value>,OnchainVerifyError> {
+        let v=v.ok_or_else(fail)?;
+        if v.is_null(){return Ok(None);}
+        if v.is_string() || v.is_number(){return Ok(Some(v.clone()));}
+        let vec=v.get("vec").or_else(||v.pointer("/fields/vec")).and_then(Value::as_array).ok_or_else(fail)?;
+        if vec.len()>1{return Err(fail());} Ok(vec.first().cloned())
+    };
+    if !addresses_equal(&string("memory_account_id")?, &row.account_id) || !addresses_equal(&string("derived_address")?, &row.derived_address) {return Err(fail());}
+    row.account_id=string("memory_account_id")?;
+    row.derived_address=string("derived_address")?;
+    row.organization_id=Some(string("organization_id")?);
+    row.active=f.get("active").and_then(Value::as_bool).ok_or_else(fail)?;
+    row.capabilities=i64::try_from(number(f.get("capabilities"))?).map_err(|_|fail())?;
+    row.delegatable_caps=i64::try_from(number(f.get("delegatable_caps"))?).map_err(|_|fail())?;
+    row.identity_class=i16::try_from(number(f.get("identity_class"))?).map_err(|_|fail())?;
+    row.register_scope=i16::try_from(number(f.get("register_scope"))?).map_err(|_|fail())?;
+    row.depth=i16::try_from(number(f.get("depth"))?).map_err(|_|fail())?;
+    let constraints=f.get("constraints").and_then(|v|v.get("fields").or(Some(v))).ok_or_else(fail)?;
+    row.approval_required_caps=i64::try_from(number(constraints.get("approval_required_caps"))?).map_err(|_|fail())?;
+    row.max_action_spend=option(constraints.get("max_action_spend"))?.map(|v| number(Some(&v)).and_then(|n|i64::try_from(n).map_err(|_|fail()))).transpose()?;
+    row.expires_at_ms=option(f.get("expires_at"))?.map(|v| number(Some(&v)).and_then(|n|i64::try_from(n).map_err(|_|fail()))).transpose()?;
+    row.platform_scope=option(f.get("platform_scope"))?.map(|v|v.as_str().map(String::from).ok_or_else(fail)).transpose()?;
+    row.parent_object_id=option(f.get("parent_object_id"))?.map(|v|v.as_str().map(String::from).ok_or_else(fail)).transpose()?;
+    row.revoked_at_ms=None;row.deactivated_at_ms=None;
+    Ok(row)
 }

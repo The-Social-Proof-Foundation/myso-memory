@@ -32,7 +32,7 @@ export async function verifyWalletSignature(
 ): Promise<boolean> {
   try {
     const messageBytes = new TextEncoder().encode(message);
-    await verifyPersonalMessageSignature(messageBytes, signature);
+    await verifyPersonalMessageSignature(messageBytes, signature, {address});
     return true;
   } catch (error) {
     console.error("Signature verification failed:", error);

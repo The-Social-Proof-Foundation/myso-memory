@@ -837,6 +837,8 @@ pub struct HealthResponse {
 /// client-side. All fields are non-secret (on-chain / public RPC URL).
 #[derive(Debug, Serialize)]
 pub struct ConfigResponse {
+    #[serde(rename = "agentKeyBackups")]
+    pub agent_key_backups: bool,
     #[serde(rename = "packageId")]
     pub package_id: String,
     pub network: String,

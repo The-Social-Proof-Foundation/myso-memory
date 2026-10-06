@@ -13,11 +13,8 @@ import { Memory } from "@socialproof/memory";
  * Called per-request with credentials from tRPC context.
  */
 export function createMemoryClient(key: string, accountId: string): Memory {
-  return Memory.create({
-    key,
-    accountId,
-    serverUrl: process.env.MEMORY_SERVER_URL || "http://localhost:8000",
-  });
+  void key; void accountId;
+  throw new Error("Client signing required: Noter cannot hold user agent keys.");
 }
 
 /**
@@ -28,8 +25,8 @@ export function getMemoryClient(
   key?: string | null,
   accountId?: string | null,
 ): Memory {
-  const resolvedKey = key || process.env.MEMORY_KEY;
-  const resolvedAccountId = accountId || process.env.MEMORY_ACCOUNT_ID;
+  const resolvedKey = key;
+  const resolvedAccountId = accountId;
 
   if (!resolvedKey) {
     throw new Error("[Memory] No key configured — sign in with Enoki or set MEMORY_KEY in .env");

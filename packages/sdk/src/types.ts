@@ -10,6 +10,8 @@
 // ============================================================
 
 export interface MemoryConfig {
+    /** Lock/logout signal. Aborting it destroys the client and stops pending HTTP work. */
+    signal?: AbortSignal;
     /** Ed25519 private key (hex string or Uint8Array). Sub-agent key registered on-chain. */
     key: string | Uint8Array;
     /** MemoryAccount object ID on MySo */

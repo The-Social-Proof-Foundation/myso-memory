@@ -965,7 +965,10 @@ export class SponsoredSocialGateway implements SocialGateway {
             "x-sdk-compatibility": MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
         };
         if (bodyString) headers["content-type"] = "application/json";
-        if (this.platformId) headers["x-platform-id"] = this.platformId;
+        if (this.platformId) {
+            headers["x-platform-id"] = this.platformId;
+            headers["x-platform-signature"] = bytesToHex(await this.signer.sign(new TextEncoder().encode(`mysocial-request-platform-v1|${this.platformId}|${canonical}`)));
+        }
         return this.requestJson(method, requestPath, headers, bodyString || undefined);
     }
 

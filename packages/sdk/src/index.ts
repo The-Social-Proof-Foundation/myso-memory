@@ -66,3 +66,6 @@ export type {
     HealthResult,
     RestoreResult,
 } from "./types.js";
+
+export * from "./agent-key-envelope.js";
+export * from "./agent-key-backup-client.js";
