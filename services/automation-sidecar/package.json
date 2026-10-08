@@ -1,0 +1,27 @@
+{
+  "name": "@socialproof/automation-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Memory bridge for the myso-automation engine: signs memory relayer calls with the agent's own Ed25519 key via @socialproof/memory. No runtime deps beyond the SDK (node:http only).",
+  "main": "./dist/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "gen:seal-key": "tsx src/gen-seal-key.ts"
+  },
+  "dependencies": {
+    "@socialproof/memory": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.8.6",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

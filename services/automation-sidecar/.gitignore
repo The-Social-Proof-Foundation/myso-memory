@@ -1,0 +1,8 @@
+# Plaintext agent key material. Never commit this — it holds Ed25519 seeds.
+agents.json
+
+# Local overrides
+.env
+.env.local
+
+node_modules/

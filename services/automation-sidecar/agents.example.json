@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "Agent identity file for the automation memory bridge.",
+    "Copy to agents.json and fill in real values: cp agents.example.json agents.json",
+    "",
+    "Each key is a `target_agent_key_ref` that a job references. The bridge",
+    "resolves it to the three fields a headless memory client needs — key,",
+    "accountId, serverUrl — and never returns the key to the caller.",
+    "",
+    "`key` is a 32-byte Ed25519 seed as 64 hex digits (a 0x prefix is accepted).",
+    "This is the agent's own sub-agent seed, never a human login key.",
+    "",
+    "Optional per entry:",
+    "  serverUrl  memory relayer origin, overriding MEMORY_SERVER_URL",
+    "  namespace  scope for recall/writes, overriding AUTOMATION_DEFAULT_NAMESPACE",
+    "  platformId Platform object id, for sub-agents with platform_scope",
+    "",
+    "agents.json holds plaintext key material. Gitignore it and chmod 600 it.",
+    "Replace this file with a custody vault before running multi-tenant."
+  ],
+  "version": 1,
+  "agents": {
+    "demo-agent": {
+      "key": "0000000000000000000000000000000000000000000000000000000000000000",
+      "accountId": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "serverUrl": "http://127.0.0.1:8000",
+      "namespace": "chat-app"
+    }
+  }
+}
