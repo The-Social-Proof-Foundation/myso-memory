@@ -335,11 +335,11 @@ fn ensure_target_is_caller(target: &str, caller: &str) -> Result<(), ProxyError>
 }
 
 // ---------------------------------------------------------------------------
-// Sealed automation delegates
+// Encrypted automation delegates
 // ---------------------------------------------------------------------------
 //
 // A delegate is a memory-only, expiring, spend-capped sub-agent the owner
-// registered on-chain for unattended jobs. Its seed is sealed in the browser to
+// registered on-chain for unattended jobs. Its seed is encrypted in the browser to
 // the memory bridge's public key, so this service only ever relays ciphertext.
 // It cannot open it, and none of these routes ever returns it.
 //
@@ -360,13 +360,13 @@ fn valid_delegate_ref(value: &str) -> bool {
 pub struct PutDelegateBody {
     /// The on-chain `SubAgent` object this key signs as.
     pub agent_object_id: String,
-    /// Which bridge seal key the envelope was sealed to.
-    pub seal_key_id: String,
-    /// The sealed envelope (base64url). Opaque to this service.
-    pub sealed: String,
+    /// Which bridge MyData key the envelope was encrypted to.
+    pub mydata_key_id: String,
+    /// The encrypted envelope (base64url). Opaque to this service.
+    pub encrypted_key: String,
 }
 
-/// `PUT /api/automation/delegates/:ref` — store a sealed delegate key.
+/// `PUT /api/automation/delegates/:ref` — store a encrypted delegate key.
 pub async fn put_delegate(
     Extension(auth): Extension<AuthInfo>,
     State(state): State<Arc<AppState>>,
@@ -384,8 +384,8 @@ pub async fn put_delegate(
         "account_id": auth.account_id,
         "delegate_ref": delegate_ref,
         "agent_object_id": body.agent_object_id,
-        "seal_key_id": body.seal_key_id,
-        "sealed": body.sealed,
+        "mydata_key_id": body.mydata_key_id,
+        "encrypted_key": body.encrypted_key,
     });
     engine
         .send_no_content(reqwest::Method::PUT, "/v1/automation/delegates", Some(&payload))

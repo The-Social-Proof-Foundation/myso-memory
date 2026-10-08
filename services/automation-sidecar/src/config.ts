@@ -71,13 +71,13 @@ export interface SidecarConfig {
     /**
      * True outside production. Static keys are plaintext seeds, which is exactly
      * the custody this bridge must not have in a real deployment, so production
-     * accepts only sealed, capability-scoped delegates.
+     * accepts only MyData-encrypted, capability-scoped delegates.
      */
     allowStaticKeys: boolean;
-    /** Automation engine origin, where sealed delegate keys are stored. */
+    /** Automation engine origin, where encrypted delegate keys are stored. */
     engineUrl?: string;
-    /** `id:base64url` seal private keys. Present means delegates are enabled. */
-    sealPrivateKeys?: string;
+    /** `id:base64url` MyData private key. Present means delegates are enabled. */
+    myDataPrivateKeys?: string;
 }
 
 /** Value shipped in `.env.example`; public, so never valid in production. */
@@ -175,7 +175,7 @@ export function loadConfig(
     }
 
     const production = env.NODE_ENV === "production";
-    const sealPrivateKeys = readString(env, "AUTOMATION_SEAL_PRIVATE_KEYS");
+    const myDataPrivateKeys = readString(env, "AUTOMATION_MYDATA_PRIVATE_KEYS");
     const eventsUrl = readString(env, "AUTOMATION_EVENTS_URL");
     const engineUrl = readString(env, "AUTOMATION_ENGINE_URL") ?? eventsUrl;
     const rawInlineKeys = readString(env, "AUTOMATION_AGENT_KEYS_JSON");
@@ -189,12 +189,12 @@ export function loadConfig(
             throw new Error(
                 "Refusing to start: AUTOMATION_AGENT_KEYS_JSON / AUTOMATION_AGENT_KEYS_FILE " +
                     "hold plaintext agent seeds and are not allowed in production. Remove them; " +
-                    "jobs use sealed delegate keys the account owner registers instead.",
+                    "jobs use encrypted delegate keys the account owner registers instead.",
             );
         }
-        if (!sealPrivateKeys || !engineUrl || !readString(env, "MEMORY_SERVER_URL")) {
+        if (!myDataPrivateKeys || !engineUrl || !readString(env, "MEMORY_SERVER_URL")) {
             throw new Error(
-                "Refusing to start: production needs AUTOMATION_SEAL_PRIVATE_KEYS, " +
+                "Refusing to start: production needs AUTOMATION_MYDATA_PRIVATE_KEYS, " +
                     "AUTOMATION_ENGINE_URL and MEMORY_SERVER_URL to resolve delegate keys.",
             );
         }
@@ -236,6 +236,6 @@ export function loadConfig(
         agentKeysJson,
         allowStaticKeys: !production,
         engineUrl,
-        sealPrivateKeys,
+        myDataPrivateKeys,
     };
 }

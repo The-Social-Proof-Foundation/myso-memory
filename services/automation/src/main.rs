@@ -92,8 +92,8 @@ async fn main() {
                 .delete(handlers::delete_delegate),
         )
         .route(
-            "/v1/automation/delegates/sealed",
-            get(handlers::get_sealed_delegate),
+            "/v1/automation/delegates/key",
+            get(handlers::get_delegate_key),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

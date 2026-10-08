@@ -18,7 +18,7 @@
     "start:bridge": "pnpm --filter @socialproof/automation-sidecar start",
     "test:bridge": "pnpm --filter @socialproof/automation-sidecar test",
     "typecheck:bridge": "pnpm --filter @socialproof/automation-sidecar typecheck",
-    "gen:seal-key": "pnpm --filter @socialproof/automation-sidecar gen:seal-key",
+    "gen:mydata-key": "pnpm --filter @socialproof/automation-sidecar gen:mydata-key",
     "docker:bridge": "docker build -f services/automation-sidecar/Dockerfile -t myso-automation-bridge .",
     "dev:automation": "cargo run --manifest-path services/automation/Cargo.toml",
     "build:automation": "cargo build --release --locked --manifest-path services/automation/Cargo.toml",

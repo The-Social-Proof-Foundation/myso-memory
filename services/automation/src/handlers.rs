@@ -192,14 +192,14 @@ pub async fn ingest_event(
 }
 
 // ---------------------------------------------------------------------------
-// Sealed delegate keys
+// Encrypted delegate keys
 // ---------------------------------------------------------------------------
 //
-// These routes move opaque ciphertext. The engine cannot open a sealed key (it
-// has no seal private key), never logs one, and never returns one except to the
-// bridge-facing `/sealed` route.
+// These routes move opaque ciphertext. The engine cannot open a encrypted key (it
+// has no MyData private key), never logs one, and never returns one except to the
+// bridge-facing `/encrypted` route.
 
-const MAX_SEALED_BYTES: usize = 4096;
+const MAX_ENCRYPTED_KEY_BYTES: usize = 4096;
 const MAX_ID_BYTES: usize = 200;
 
 /// `[A-Za-z0-9._-]{1,64}`: a name, not free text, so it is safe in a URL and a log.
@@ -222,8 +222,8 @@ pub struct PutDelegateRequest {
     pub account_id: String,
     pub delegate_ref: String,
     pub agent_object_id: String,
-    pub seal_key_id: String,
-    pub sealed: String,
+    pub mydata_key_id: String,
+    pub encrypted_key: String,
 }
 
 pub async fn put_delegate(
@@ -234,14 +234,14 @@ pub async fn put_delegate(
     verify_internal_secret(&headers, &state.internal_sync_secret)?;
     bounded_nonblank(&req.account_id, "account_id")?;
     bounded_nonblank(&req.agent_object_id, "agent_object_id")?;
-    bounded_nonblank(&req.seal_key_id, "seal_key_id")?;
+    bounded_nonblank(&req.mydata_key_id, "mydata_key_id")?;
     if !valid_delegate_ref(&req.delegate_ref) {
         return Err(AppError::BadRequest(
             "delegate_ref must be 1-64 characters of letters, digits, '.', '_' or '-'".into(),
         ));
     }
-    if req.sealed.trim().is_empty() || req.sealed.len() > MAX_SEALED_BYTES {
-        return Err(AppError::BadRequest("sealed is required and must be small".into()));
+    if req.encrypted_key.trim().is_empty() || req.encrypted_key.len() > MAX_ENCRYPTED_KEY_BYTES {
+        return Err(AppError::BadRequest("encrypted is required and must be small".into()));
     }
     state
         .store
@@ -249,8 +249,8 @@ pub async fn put_delegate(
             account_id: req.account_id,
             delegate_ref: req.delegate_ref,
             agent_object_id: req.agent_object_id,
-            seal_key_id: req.seal_key_id,
-            sealed: req.sealed,
+            mydata_key_id: req.mydata_key_id,
+            encrypted_key: req.encrypted_key,
             created_at: chrono::Utc::now(),
         })
         .await
@@ -278,7 +278,7 @@ fn require_ref(query: &DelegateScopeQuery) -> Result<&str, AppError> {
     }
 }
 
-/// Metadata only. The sealed key is never part of this response.
+/// Metadata only. The encrypted key is never part of this response.
 pub async fn list_delegates(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -292,18 +292,18 @@ pub async fn list_delegates(
 }
 
 #[derive(serde::Serialize)]
-pub struct SealedDelegateResponse {
+pub struct EncryptedDelegateResponse {
     pub agent_object_id: String,
-    pub seal_key_id: String,
-    pub sealed: String,
+    pub mydata_key_id: String,
+    pub encrypted_key: String,
 }
 
-/// The sealed envelope, for the bridge to open. Still ciphertext on the wire.
-pub async fn get_sealed_delegate(
+/// The encrypted envelope, for the bridge to open. Still ciphertext on the wire.
+pub async fn get_delegate_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<DelegateScopeQuery>,
-) -> Result<Json<SealedDelegateResponse>, AppError> {
+) -> Result<Json<EncryptedDelegateResponse>, AppError> {
     verify_internal_secret(&headers, &state.internal_sync_secret)?;
     let account = require_account(&query)?;
     let delegate_ref = require_ref(&query)?;
@@ -313,10 +313,10 @@ pub async fn get_sealed_delegate(
         .await
         .map_err(AppError::store)?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(SealedDelegateResponse {
+    Ok(Json(EncryptedDelegateResponse {
         agent_object_id: record.agent_object_id,
-        seal_key_id: record.seal_key_id,
-        sealed: record.sealed,
+        mydata_key_id: record.mydata_key_id,
+        encrypted_key: record.encrypted_key,
     }))
 }
 

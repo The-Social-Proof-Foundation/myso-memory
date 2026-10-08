@@ -57,11 +57,11 @@ pub trait AutomationStore: Send + Sync {
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError>;
     async fn ingest_event_dedup(&self, event: &PlatformEvent) -> Result<bool, StoreError>;
 
-    /// Insert or replace a sealed delegate key for `(account_id, delegate_ref)`.
+    /// Insert or replace a encrypted delegate key for `(account_id, delegate_ref)`.
     async fn put_delegate(&self, record: DelegateRecord) -> Result<(), StoreError>;
-    /// Metadata for an account's delegates. Never includes the sealed key.
+    /// Metadata for an account's delegates. Never includes the encrypted key.
     async fn list_delegates(&self, account_id: &str) -> Result<Vec<DelegateSummary>, StoreError>;
-    /// The sealed key itself, for the bridge.
+    /// The encrypted key itself, for the bridge.
     async fn get_delegate(
         &self,
         account_id: &str,
@@ -72,7 +72,7 @@ pub trait AutomationStore: Send + Sync {
         -> Result<bool, StoreError>;
 }
 
-/// A sealed delegate key. Deliberately not `Debug`: the `sealed` field is
+/// A encrypted delegate key. Deliberately not `Debug`: the `encrypted` field is
 /// ciphertext, but nothing should be one `{:?}` away from printing it.
 #[derive(Clone)]
 pub struct DelegateRecord {
@@ -80,18 +80,18 @@ pub struct DelegateRecord {
     pub delegate_ref: String,
     /// The on-chain `SubAgent` object this key signs as.
     pub agent_object_id: String,
-    /// Which bridge seal key the envelope was sealed to, so keys can rotate.
-    pub seal_key_id: String,
-    pub sealed: String,
+    /// Which bridge MyData key the envelope was encrypted to, so keys can rotate.
+    pub mydata_key_id: String,
+    pub encrypted_key: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// The listable face of a delegate: everything except the sealed key.
+/// The listable face of a delegate: everything except the encrypted key.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DelegateSummary {
     pub delegate_ref: String,
     pub agent_object_id: String,
-    pub seal_key_id: String,
+    pub mydata_key_id: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -100,7 +100,7 @@ impl From<&DelegateRecord> for DelegateSummary {
         Self {
             delegate_ref: r.delegate_ref.clone(),
             agent_object_id: r.agent_object_id.clone(),
-            seal_key_id: r.seal_key_id.clone(),
+            mydata_key_id: r.mydata_key_id.clone(),
             created_at: r.created_at,
         }
     }
@@ -398,7 +398,7 @@ pub async fn postgres_store(database_url: &str) -> Result<Arc<dyn AutomationStor
     for sql in [
         include_str!("../migrations/001_automation.sql"),
         include_str!("../migrations/002_job_owner_address.sql"),
-        include_str!("../migrations/003_automation_delegates.sql"),
+        include_str!("../migrations/003_automation_delegate_keys.sql"),
     ] {
         for stmt in sql.split(';').filter(|s| !s.trim().is_empty()) {
             sqlx::query(stmt.trim())
@@ -600,20 +600,20 @@ impl AutomationStore for PgStore {
 
     async fn put_delegate(&self, record: DelegateRecord) -> Result<(), StoreError> {
         sqlx::query(
-            r#"INSERT INTO automation_delegates
-               (account_id, delegate_ref, agent_object_id, seal_key_id, sealed)
+            r#"INSERT INTO automation_delegate_keys
+               (account_id, delegate_ref, agent_object_id, mydata_key_id, encrypted_key)
                VALUES ($1,$2,$3,$4,$5)
                ON CONFLICT (account_id, delegate_ref) DO UPDATE SET
                    agent_object_id = EXCLUDED.agent_object_id,
-                   seal_key_id = EXCLUDED.seal_key_id,
-                   sealed = EXCLUDED.sealed,
+                   mydata_key_id = EXCLUDED.mydata_key_id,
+                   encrypted_key = EXCLUDED.encrypted_key,
                    created_at = NOW()"#,
         )
         .bind(&record.account_id)
         .bind(&record.delegate_ref)
         .bind(&record.agent_object_id)
-        .bind(&record.seal_key_id)
-        .bind(&record.sealed)
+        .bind(&record.mydata_key_id)
+        .bind(&record.encrypted_key)
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Message(e.to_string()))?;
@@ -621,10 +621,10 @@ impl AutomationStore for PgStore {
     }
 
     async fn list_delegates(&self, account_id: &str) -> Result<Vec<DelegateSummary>, StoreError> {
-        // The sealed column is deliberately not selected.
+        // The encrypted column is deliberately not selected.
         let rows = sqlx::query_as::<_, PgDelegateSummary>(
-            r#"SELECT delegate_ref, agent_object_id, seal_key_id, created_at
-               FROM automation_delegates WHERE account_id = $1
+            r#"SELECT delegate_ref, agent_object_id, mydata_key_id, created_at
+               FROM automation_delegate_keys WHERE account_id = $1
                ORDER BY delegate_ref"#,
         )
         .bind(account_id)
@@ -636,7 +636,7 @@ impl AutomationStore for PgStore {
             .map(|r| DelegateSummary {
                 delegate_ref: r.delegate_ref,
                 agent_object_id: r.agent_object_id,
-                seal_key_id: r.seal_key_id,
+                mydata_key_id: r.mydata_key_id,
                 created_at: r.created_at,
             })
             .collect())
@@ -648,8 +648,8 @@ impl AutomationStore for PgStore {
         delegate_ref: &str,
     ) -> Result<Option<DelegateRecord>, StoreError> {
         let row = sqlx::query_as::<_, PgDelegateRecord>(
-            r#"SELECT account_id, delegate_ref, agent_object_id, seal_key_id, sealed, created_at
-               FROM automation_delegates WHERE account_id = $1 AND delegate_ref = $2"#,
+            r#"SELECT account_id, delegate_ref, agent_object_id, mydata_key_id, encrypted_key, created_at
+               FROM automation_delegate_keys WHERE account_id = $1 AND delegate_ref = $2"#,
         )
         .bind(account_id)
         .bind(delegate_ref)
@@ -660,8 +660,8 @@ impl AutomationStore for PgStore {
             account_id: r.account_id,
             delegate_ref: r.delegate_ref,
             agent_object_id: r.agent_object_id,
-            seal_key_id: r.seal_key_id,
-            sealed: r.sealed,
+            mydata_key_id: r.mydata_key_id,
+            encrypted_key: r.encrypted_key,
             created_at: r.created_at,
         }))
     }
@@ -672,7 +672,7 @@ impl AutomationStore for PgStore {
         delegate_ref: &str,
     ) -> Result<bool, StoreError> {
         let result = sqlx::query(
-            r#"DELETE FROM automation_delegates WHERE account_id = $1 AND delegate_ref = $2"#,
+            r#"DELETE FROM automation_delegate_keys WHERE account_id = $1 AND delegate_ref = $2"#,
         )
         .bind(account_id)
         .bind(delegate_ref)
@@ -687,7 +687,7 @@ impl AutomationStore for PgStore {
 struct PgDelegateSummary {
     delegate_ref: String,
     agent_object_id: String,
-    seal_key_id: String,
+    mydata_key_id: String,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -696,8 +696,8 @@ struct PgDelegateRecord {
     account_id: String,
     delegate_ref: String,
     agent_object_id: String,
-    seal_key_id: String,
-    sealed: String,
+    mydata_key_id: String,
+    encrypted_key: String,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -987,8 +987,8 @@ mod tests {
             account_id: account.into(),
             delegate_ref: name.into(),
             agent_object_id: "0xagent".into(),
-            seal_key_id: "k1".into(),
-            sealed: "ciphertext".into(),
+            mydata_key_id: "k1".into(),
+            encrypted_key: "ciphertext".into(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -1003,19 +1003,19 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].delegate_ref, "mine");
 
-        // Another account cannot read, or guess its way to, this sealed key.
+        // Another account cannot read, or guess its way to, this encrypted key.
         assert!(store.get_delegate("0xacct-b", "mine").await.unwrap().is_none());
         assert!(store.get_delegate("0xacct-a", "mine").await.unwrap().is_some());
     }
 
     #[tokio::test]
-    async fn the_delegate_listing_never_carries_the_sealed_key() {
+    async fn the_delegate_listing_never_carries_the_encrypted_key() {
         let store = memory_store();
         store.put_delegate(delegate("0xacct-a", "mine")).await.unwrap();
         let listing = store.list_delegates("0xacct-a").await.unwrap();
         let json = serde_json::to_string(&listing).unwrap();
         assert!(!json.contains("ciphertext"), "{json}");
-        assert!(!json.contains("sealed"), "{json}");
+        assert!(!json.contains("encrypted_key"), "{json}");
     }
 
     #[tokio::test]
@@ -1023,10 +1023,10 @@ mod tests {
         let store = memory_store();
         store.put_delegate(delegate("0xacct-a", "mine")).await.unwrap();
         let mut rotated = delegate("0xacct-a", "mine");
-        rotated.sealed = "rotated".into();
+        rotated.encrypted_key = "rotated".into();
         store.put_delegate(rotated).await.unwrap();
         let got = store.get_delegate("0xacct-a", "mine").await.unwrap().unwrap();
-        assert_eq!(got.sealed, "rotated");
+        assert_eq!(got.encrypted_key, "rotated");
         assert_eq!(store.list_delegates("0xacct-a").await.unwrap().len(), 1);
     }
 

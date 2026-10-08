@@ -3,8 +3,8 @@
  *
  * A delegate is a capability-scoped, expiring, revocable on-chain sub-agent the
  * account owner registered for unattended memory work. This module fetches its
- * sealed key from the automation engine's database and opens it with the
- * bridge's seal private key. The bridge never holds a user's root key or any of
+ * encrypted key from the automation engine's database and opens it with the
+ * bridge's MyData private key. The bridge never holds a user's root key or any of
  * their other agents' keys, only keys the owner chose to delegate.
  *
  * Nothing here caches a decrypted key: every request fetches and opens afresh,
@@ -15,7 +15,7 @@
 
 import { BridgeError } from "./bridge-error.js";
 import { normalizeObjectId } from "./ids.js";
-import { SealError, SealKeyRing, sealAad } from "./seal.js";
+import { DelegateCryptoError, MyDataKeyRing, delegateAad } from "./delegate-crypto.js";
 
 /** `delegate:<name>` in a job's `target_agent_key_ref` selects this path. */
 export const DELEGATE_REF_PREFIX = "delegate:";
@@ -31,16 +31,16 @@ export interface DelegateSource {
     open(accountId: string, delegateRef: string): Promise<OpenedDelegate>;
 }
 
-interface SealedRow {
+interface EncryptedRow {
     agent_object_id: string;
-    seal_key_id: string;
-    sealed: string;
+    mydata_key_id: string;
+    encrypted_key: string;
 }
 
 export interface EngineDelegateSourceOptions {
     engineUrl: string;
     secret: string;
-    keyring: SealKeyRing;
+    keyring: MyDataKeyRing;
     timeoutMs?: number;
     fetchImpl?: typeof fetch;
 }
@@ -53,17 +53,17 @@ export class EngineDelegateSource implements DelegateSource {
     }
 
     async open(accountId: string, delegateRef: string): Promise<OpenedDelegate> {
-        const row = await this.fetchSealed(accountId, delegateRef);
+        const row = await this.fetchEncryptedRow(accountId, delegateRef);
         let seed: Buffer;
         try {
             seed = this.opts.keyring.open(
-                row.seal_key_id,
-                row.sealed,
-                sealAad(accountId, delegateRef, row.agent_object_id),
+                row.mydata_key_id,
+                row.encrypted_key,
+                delegateAad(accountId, delegateRef, row.agent_object_id),
             );
         } catch (err) {
             // Deliberately generic: not which step failed, not any bytes.
-            if (err instanceof SealError) {
+            if (err instanceof DelegateCryptoError) {
                 throw new BridgeError(
                     "the stored delegate key cannot be opened; register the delegate again",
                     409,
@@ -75,9 +75,9 @@ export class EngineDelegateSource implements DelegateSource {
         return { seedHex: seed.toString("hex"), agentObjectId: normalizeObjectId(row.agent_object_id) };
     }
 
-    private async fetchSealed(accountId: string, delegateRef: string): Promise<SealedRow> {
+    private async fetchEncryptedRow(accountId: string, delegateRef: string): Promise<EncryptedRow> {
         const url =
-            `${this.opts.engineUrl.replace(/\/+$/, "")}/v1/automation/delegates/sealed` +
+            `${this.opts.engineUrl.replace(/\/+$/, "")}/v1/automation/delegates/key` +
             `?account_id=${encodeURIComponent(accountId)}&delegate_ref=${encodeURIComponent(delegateRef)}`;
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs ?? 5_000);
@@ -107,15 +107,15 @@ export class EngineDelegateSource implements DelegateSource {
                 "delegate_store_unavailable",
             );
         }
-        const body = (await res.json().catch(() => null)) as Partial<SealedRow> | null;
+        const body = (await res.json().catch(() => null)) as Partial<EncryptedRow> | null;
         if (
             !body ||
             typeof body.agent_object_id !== "string" ||
-            typeof body.seal_key_id !== "string" ||
-            typeof body.sealed !== "string"
+            typeof body.mydata_key_id !== "string" ||
+            typeof body.encrypted_key !== "string"
         ) {
             throw new BridgeError("delegate store returned a malformed row", 502, "delegate_store_unavailable");
         }
-        return body as SealedRow;
+        return body as EncryptedRow;
     }
 }

@@ -57,7 +57,7 @@ ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=8011
 
-# The bridge opens sealed delegate keys in memory at request time and writes
+# The bridge opens encrypted delegate keys in memory at request time and writes
 # nothing to disk, so it does not need to own any files. NODE_ENV=production
 # also makes it refuse any plaintext agent-key file or variable.
 USER node

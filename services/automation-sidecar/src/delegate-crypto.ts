@@ -1,20 +1,20 @@
 /**
- * Sealed delegate keys.
+ * Encrypted delegate keys.
  *
- * A delegate seed is sealed in the user's browser to the bridge's X25519 public
+ * A delegate seed is encrypted in the user's browser to the bridge's X25519 public
  * key and travels (memory relayer, automation engine, Postgres) only as
  * ciphertext. Nothing between the browser and the bridge can read it, and the
- * database holds nothing usable without the bridge's seal private key, which
+ * database holds nothing usable without the bridge's MyData private key, which
  * lives only in the bridge's environment.
  *
  * Envelope (base64url):  version(1) | ephemeralPublic(32) | iv(12) | ciphertext+tag
  *   shared = X25519(ephemeralPrivate, bridgePublic)
  *   key    = HKDF-SHA256(shared, salt = ephemeralPublic | bridgePublic, info)
- *   cipher = AES-256-GCM, additional data = {@link sealAad}
+ *   cipher = AES-256-GCM, additional data = {@link delegateAad}
  *
  * The additional data binds the ciphertext to its account, name and on-chain
- * agent, so a sealed key copied into another row fails to open instead of
- * quietly signing for the wrong account. The chat-app implements the sealing
+ * agent, so a encrypted key copied into another row fails to open instead of
+ * quietly signing for the wrong account. The chat-app implements the encrypting
  * half of this exact format with WebCrypto.
  */
 
@@ -37,15 +37,15 @@ const X25519_PKCS8_PREFIX = Buffer.from("302e020100300506032b656e04220420", "hex
 const X25519_SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex");
 const SEED_BYTES = 32;
 
-export class SealError extends Error {
+export class DelegateCryptoError extends Error {
     constructor(message: string) {
         super(message);
-        this.name = "SealError";
+        this.name = "DelegateCryptoError";
     }
 }
 
-/** Additional authenticated data. Mirror exactly in every sealer. */
-export function sealAad(accountId: string, delegateRef: string, agentObjectId: string): Buffer {
+/** Additional authenticated data. Mirror exactly in every encryptor. */
+export function delegateAad(accountId: string, delegateRef: string, agentObjectId: string): Buffer {
     return Buffer.from(
         `myso-delegate-v1|${normalizeObjectId(accountId)}|${delegateRef}|${normalizeObjectId(agentObjectId)}`,
         "utf8",
@@ -77,8 +77,8 @@ export function publicKeyFor(privateRaw: Buffer): Buffer {
     return Buffer.from(der.subarray(der.length - 32));
 }
 
-/** A fresh seal keypair, raw 32-byte halves. */
-export function generateSealKeyPair(): { privateKey: Buffer; publicKey: Buffer } {
+/** A fresh MyData keypair, raw 32-byte halves. */
+export function generateMyDataKeyPair(): { privateKey: Buffer; publicKey: Buffer } {
     const { privateKey } = generateKeyPairSync("x25519");
     const der = privateKey.export({ format: "der", type: "pkcs8" });
     const raw = Buffer.from(der.subarray(der.length - 32));
@@ -98,13 +98,13 @@ function deriveKey(shared: Buffer, ephemeralPublic: Buffer, recipientPublic: Buf
 }
 
 /**
- * Seal a 32-byte seed to a recipient. The bridge itself never seals; this exists
+ * MyData a 32-byte seed to a recipient. The bridge itself never encrypts; this exists
  * for tests and for operators scripting registration, and it is the reference
  * the browser implementation is checked against.
  */
-export function sealSeed(seed: Buffer, recipientPublic: Buffer, aad: Buffer): string {
-    if (seed.length !== SEED_BYTES) throw new SealError("seed must be 32 bytes");
-    const ephemeral = generateSealKeyPair();
+export function encryptSeed(seed: Buffer, recipientPublic: Buffer, aad: Buffer): string {
+    if (seed.length !== SEED_BYTES) throw new DelegateCryptoError("seed must be 32 bytes");
+    const ephemeral = generateMyDataKeyPair();
     const shared = diffieHellman({
         privateKey: privateKeyObject(ephemeral.privateKey),
         publicKey: publicKeyObject(recipientPublic),
@@ -123,8 +123,8 @@ export function sealSeed(seed: Buffer, recipientPublic: Buffer, aad: Buffer): st
  * Open an envelope. Every failure collapses to one generic message: a caller
  * (or a log) learns "could not open", never which step failed or any bytes.
  */
-export function openSealed(envelope: string, privateRaw: Buffer, aad: Buffer): Buffer {
-    const fail = () => new SealError("sealed delegate key could not be opened");
+export function decryptSeed(envelope: string, privateRaw: Buffer, aad: Buffer): Buffer {
+    const fail = () => new DelegateCryptoError("encrypted delegate key could not be opened");
     let raw: Buffer;
     try {
         raw = Buffer.from(envelope, "base64url");
@@ -160,30 +160,30 @@ export function openSealed(envelope: string, privateRaw: Buffer, aad: Buffer): B
 
 const KEY_ID = /^[A-Za-z0-9_-]{1,32}$/;
 
-/** The bridge's seal private keys, by id, so a key can be rotated without downtime. */
-export class SealKeyRing {
+/** The bridge's MyData private key, by id, so a key can be rotated without downtime. */
+export class MyDataKeyRing {
     private readonly keys = new Map<string, Buffer>();
 
     /** Parse `id:base64url,id2:base64url`. Throws without echoing any key text. */
-    static parse(raw: string): SealKeyRing {
-        const ring = new SealKeyRing();
+    static parse(raw: string): MyDataKeyRing {
+        const ring = new MyDataKeyRing();
         for (const part of raw.split(",").map((p) => p.trim()).filter(Boolean)) {
             const at = part.indexOf(":");
             const id = at > 0 ? part.slice(0, at) : "";
             const value = at > 0 ? part.slice(at + 1) : "";
             if (!KEY_ID.test(id)) {
-                throw new SealError(
-                    "AUTOMATION_SEAL_PRIVATE_KEYS entries must look like <id>:<base64url key>",
+                throw new DelegateCryptoError(
+                    "AUTOMATION_MYDATA_PRIVATE_KEYS entries must look like <id>:<base64url key>",
                 );
             }
             const privateRaw = Buffer.from(value, "base64url");
             if (privateRaw.length !== 32) {
-                throw new SealError(`AUTOMATION_SEAL_PRIVATE_KEYS key "${id}" must be 32 bytes`);
+                throw new DelegateCryptoError(`AUTOMATION_MYDATA_PRIVATE_KEYS key "${id}" must be 32 bytes`);
             }
             ring.keys.set(id, privateRaw);
         }
         if (ring.keys.size === 0) {
-            throw new SealError("AUTOMATION_SEAL_PRIVATE_KEYS contains no keys");
+            throw new DelegateCryptoError("AUTOMATION_MYDATA_PRIVATE_KEYS contains no keys");
         }
         return ring;
     }
@@ -198,7 +198,7 @@ export class SealKeyRing {
 
     open(keyId: string, envelope: string, aad: Buffer): Buffer {
         const priv = this.keys.get(keyId);
-        if (!priv) throw new SealError("sealed delegate key could not be opened");
-        return openSealed(envelope, priv, aad);
+        if (!priv) throw new DelegateCryptoError("encrypted delegate key could not be opened");
+        return decryptSeed(envelope, priv, aad);
     }
 }

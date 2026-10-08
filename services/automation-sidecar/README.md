@@ -18,13 +18,13 @@ chat-app ──► memory relayer ──► automation engine ──► bridge �
 1. The owner creates a delegate in the chat-app (Agents → Automation → Automation delegates).
    That registers a fresh sub-agent on-chain with capabilities `7` (memory read, memory write,
    MYDATA read), no ability to mint children, a spend cap and an expiry of at most 90 days.
-2. The delegate's seed is generated in the browser and sealed there to this bridge's public key
+2. The delegate's seed is generated in the browser and encrypted there to this bridge's public key
    (X25519 + AES-256-GCM, bound to the account, name and agent). Only ciphertext leaves the
    browser.
 3. The memory relayer and the engine relay and store that ciphertext. The engine's database
-   holds nothing usable without this bridge's seal private key.
+   holds nothing usable without this bridge's MyData private key.
 4. For each job, the engine sends `key_ref: "delegate:<name>"` and the job's `account_id`. The
-   bridge fetches the sealed row, opens it in memory, and **before every signing request** asks
+   bridge fetches the encrypted row, opens it in memory, and **before every signing request** asks
    the relayer, as the delegate, for its chain-verified state. It refuses unless the delegate is:
    - active and unexpired (the relayer enforces this on-chain on every call),
    - registered under the job's account, as the agent that was stored,
@@ -47,7 +47,7 @@ or lower the limit. See [§13 of the engine README](../automation/README.md#13-s
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /health` | none | Liveness. Reports a count only, never ref names. |
-| `GET /seal-keys` | none | Public seal keys (ids and public halves) for browsers to seal to. |
+| `GET /mydata-keys` | none | Public MyData keys (ids and public halves) for browsers to encrypt to. |
 | `POST /internal/memory/recall` | `x-internal-sync-secret` | Semantic recall as a delegate. |
 | `POST /internal/memory/remember` | `x-internal-sync-secret` | Store a memory as a delegate. |
 | `POST /internal/memory/probe` | `x-internal-sync-secret` | Check the relayer for a delegate. |
@@ -62,8 +62,8 @@ Production (`NODE_ENV=production`, which the Dockerfile sets) requires:
 | Variable | Notes |
 |---|---|
 | `INTERNAL_SYNC_SECRET` | Shared with the engine and relayer. The public placeholder is refused. |
-| `AUTOMATION_SEAL_PRIVATE_KEYS` | `id:base64url`, comma-separated to rotate. **The one secret that matters.** |
-| `AUTOMATION_ENGINE_URL` | Where sealed delegates are stored. Falls back to `AUTOMATION_EVENTS_URL`. |
+| `AUTOMATION_MYDATA_PRIVATE_KEYS` | `id:base64url`, comma-separated to rotate. **The one secret that matters.** |
+| `AUTOMATION_ENGINE_URL` | Where encrypted delegates are stored. Falls back to `AUTOMATION_EVENTS_URL`. |
 | `MEMORY_SERVER_URL` | Memory relayer origin used for delegates. |
 | `HOST` / `PORT` | `0.0.0.0` in a container (the Dockerfile sets it), `8011` by default. |
 
@@ -74,17 +74,17 @@ Optional: `AUTOMATION_DEFAULT_NAMESPACE` (default `chat-app`), `AUTOMATION_REQUE
 `AUTOMATION_MAX_BODY_BYTES`, `AUTOMATION_EVENTS_URL` and `AUTOMATION_EVENTS_SECRET` (publish
 `memory.created` back to the engine). See [`.env.example`](.env.example).
 
-### Generate the seal key
+### Generate the MyData key
 
 Run this on your own machine, never in a CI log:
 
 ```bash
-pnpm gen:seal-key        # from the myso-memory root
+pnpm gen:mydata-key        # from the myso-memory root
 ```
 
 ```
-AUTOMATION_SEAL_PRIVATE_KEYS=<id>:<key>   → this service's variables (secret)
-VITE_AUTOMATION_SEAL_KEY=<id>:<key>       → the chat-app build (public)
+AUTOMATION_MYDATA_PRIVATE_KEYS=<id>:<key>   → this service's variables (secret)
+VITE_AUTOMATION_MYDATA_KEY=<id>:<key>       → the chat-app build (public)
 ```
 
 To rotate, list both keys (`old:...,new:...`), point the chat-app at the new public key, and
@@ -130,12 +130,12 @@ pnpm smoke:automation   # engine + bridge end to end against a stub relayer
 |---|---|
 | `src/server.ts` | HTTP surface, secret check, startup wiring |
 | `src/bridge.ts` | Recall, remember, probe; client cache; ref resolution |
-| `src/delegates.ts` | Fetches and opens sealed delegates from the engine |
+| `src/delegates.ts` | Fetches and opens encrypted delegates from the engine |
 | `src/verify.ts` | Per-request on-chain delegate check |
-| `src/seal.ts` | Sealed-box crypto and the seal key ring |
+| `src/encrypt.ts` | Encrypted-envelope crypto and the MyData key ring |
 | `src/keys.ts` | Dev-only static key store |
 | `src/config.ts` | Environment and the production custody rules |
-| `src/gen-seal-key.ts` | Seal keypair generator |
+| `src/gen-mydata-key.ts` | MyData keypair generator |
 
-The browser half of the sealing format lives in the chat-app
+The browser half of the encrypting format lives in the chat-app
 (`src/lib/agents/automation-delegate.ts`) and is tested against this implementation.

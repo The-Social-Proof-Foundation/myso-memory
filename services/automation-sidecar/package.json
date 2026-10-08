@@ -14,7 +14,7 @@
     "start": "node dist/server.js",
     "test": "tsx --test src/*.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "gen:seal-key": "tsx src/gen-seal-key.ts"
+    "gen:mydata-key": "tsx src/gen-mydata-key.ts"
   },
   "dependencies": {
     "@socialproof/memory": "workspace:*"

@@ -5,7 +5,7 @@
 > This system is **ready for Railway integration testing and testnet use.** It is
 > **non-custodial**: the memory bridge holds no user agent key. An unattended job signs as a
 > *delegate* the owner registered on-chain: memory read/write only, a spend cap, an expiry,
-> revocable at any time. The delegate's key is sealed in the owner's browser to the bridge's
+> revocable at any time. The delegate's key is encrypted in the owner's browser to the bridge's
 > public key and stored only as ciphertext.
 >
 > What that does and does not guarantee is in [§13](#13-security-limitations). Read it before
@@ -38,7 +38,7 @@ Two facts shape everything below:
 | Concern | Location | Status |
 |---|---|---|
 | Trigger evaluation, job/run orchestration, retries, budgets | `services/automation` (this service) | ✅ tested, frozen pending integration |
-| Signing memory calls as a sealed, scoped delegate | `services/automation-sidecar` | ✅ tested; delegates only in production |
+| Signing memory calls as a encrypted_key, scoped delegate | `services/automation-sidecar` | ✅ tested; delegates only in production |
 | Owner-authenticated `/api/automation/*` proxy | `services/server/src/automation_proxy.rs` | ✅ tested |
 | Chat-app automation panel + client | `chat-app/src/**/automation*` | ✅ read-only by design |
 
@@ -138,7 +138,7 @@ cp agents.example.json agents.json
 
 > **Local development only.** This static key file holds a plaintext seed, which is exactly
 > what a deployment must not have: with `NODE_ENV=production` the bridge refuses to start if
-> it is present. Use a throwaway agent on a dev network. Deployments use sealed delegates
+> it is present. Use a throwaway agent on a dev network. Deployments use encrypted delegates
 > instead (§12, §13.1).
 
 Edit `agents.json` — each key is a `target_agent_key_ref` your jobs will reference:
@@ -450,7 +450,7 @@ Stated plainly so nothing here reads as more finished than it is:
 - **A create-job form in the chat-app.** The panel is read-only. Job creation needs a
   trigger builder, a key-ref picker, and a budget field; a half-built form that silently
   produced an inert job would be worse than none.
-- **Key custody.** Deployments use sealed delegates (§13.1). `agents.json` is a dev-only
+- **Key custody.** Deployments use encrypted delegates (§13.1). `agents.json` is a dev-only
   plaintext store that production refuses to load.
 - **Event producers.** `/internal/automation/events` is implemented and the 15-family
   registry in `docs/event_registry.json` defines the vocabulary, but few services publish
@@ -619,7 +619,7 @@ looks for a file literally named `Dockerfile` there, so point at ours explicitly
 RAILWAY_DOCKERFILE_PATH=services/automation-sidecar/Dockerfile
 PORT=8011
 INTERNAL_SYNC_SECRET=${{shared.INTERNAL_SYNC_SECRET}}
-AUTOMATION_SEAL_PRIVATE_KEYS=<id>:<key>        # from `pnpm gen:seal-key`; the ONE secret here
+AUTOMATION_MYDATA_PRIVATE_KEYS=<id>:<key>        # from `pnpm gen:mydata-key`; the ONE secret here
 AUTOMATION_ENGINE_URL=http://${{automation-engine.RAILWAY_PRIVATE_DOMAIN}}:8010
 MEMORY_SERVER_URL=http://${{memory-relayer.RAILWAY_PRIVATE_DOMAIN}}:8000
 ```
@@ -628,15 +628,15 @@ The bridge **refuses to start** in production if `AUTOMATION_AGENT_KEYS_JSON` or
 `AUTOMATION_AGENT_KEYS_FILE` is set, or if any of the three variables above is missing. There
 is no plaintext-seed mode on a deployment.
 
-Generate the seal key on your own machine:
+Generate the MyData key on your own machine:
 
 ```bash
-pnpm gen:seal-key            # prints two lines
-# AUTOMATION_SEAL_PRIVATE_KEYS=k202610:<private>   → bridge service variable (secret)
-# VITE_AUTOMATION_SEAL_KEY=k202610:<public>        → chat-app build variable (public)
+pnpm gen:mydata-key            # prints two lines
+# AUTOMATION_MYDATA_PRIVATE_KEYS=k202610:<private>   → bridge service variable (secret)
+# VITE_AUTOMATION_MYDATA_KEY=k202610:<public>        → chat-app build variable (public)
 ```
 
-The private line is the only thing that can open the sealed keys in the engine's database.
+The private line is the only thing that can open the encrypted keys in the engine's database.
 Keep it in the bridge's variables and nowhere else. To rotate, append a second key
 (`old:...,new:...`), point the chat-app at the new public key, and drop the old one once no
 stored delegate still names it.
@@ -648,7 +648,7 @@ history belongs to the engine.
 
 **Give it no public domain.** The engine reaches it over private networking and nothing else
 should. It signs as delegates, so public exposure plus a leaked `INTERNAL_SYNC_SECRET` would let
-a stranger spend delegates' limits until they expire. `/health` and `/seal-keys` are the only
+a stranger spend delegates' limits until they expire. `/health` and `/mydata-keys` are the only
 unauthenticated routes and reveal nothing secret.
 
 There is deliberately **no `railway.json` here**: Config as Code is [deprecated by
@@ -737,7 +737,7 @@ MYDATA decrypt capability, so weigh that before doing it.
 
 ### Custody on a hosted platform
 
-The dashboard holds **one** secret that matters: `AUTOMATION_SEAL_PRIVATE_KEYS`. Everything
+The dashboard holds **one** secret that matters: `AUTOMATION_MYDATA_PRIVATE_KEYS`. Everything
 else is ciphertext, public data, or a shared header secret. Someone with dashboard access can
 open the delegate keys stored in the database, which is why a delegate is limited to memory,
 a spend cap and an expiry, and why the owner can end it on-chain without anyone's help. They
@@ -749,10 +749,10 @@ The bridge logs which key source it loaded and which relayer it targets, which i
 way to tell a bad deploy from a bad job:
 
 ```
-[automation-memory-bridge] listening on http://0.0.0.0:8011 | keys=sealed delegates | agents=0 | namespace=chat-app | memory=http://memory-server.railway.internal:8000
+[automation-memory-bridge] listening on http://0.0.0.0:8011 | keys=encrypted delegates | agents=0 | namespace=chat-app | memory=http://memory-server.railway.internal:8000
 ```
 
-`keys=sealed delegates` is the only value a deployment should ever show. `static ... (dev)`
+`keys=encrypted delegates` is the only value a deployment should ever show. `static ... (dev)`
 means a plaintext key store is loaded, which production refuses to do.
 
 Then check the chain outward, in order. Each step isolates one hop. The bridge and the engine
@@ -810,7 +810,7 @@ registers a *delegate* sub-agent on-chain:
 | An expiry, 90 days at most from the UI | chain + bridge refuses a delegate without one |
 | Revocable at any time (`revoke_sub_agent`) | chain; takes effect on the next request |
 
-The delegate's seed is generated in the owner's browser, sealed there (X25519 + AES-256-GCM,
+The delegate's seed is generated in the owner's browser, encrypted there (X25519 + AES-256-GCM,
 bound to the account, name and agent) to the bridge's public key, and stored in the engine's
 Postgres as ciphertext. The memory relayer, the engine and the database only ever relay or
 hold that ciphertext. The bridge opens it in memory at request time, and before **every**
@@ -830,9 +830,9 @@ is the honest cost of unattended execution. If a delegate's authority is too muc
 
 **Residual items to close before mainnet:**
 
-- The seal private key is a single Railway secret. A KMS-backed seal key would remove it from
+- The MyData private key is a single Railway secret. A KMS-backed MyData key would remove it from
   the dashboard.
-- A stored sealed row can be replaced by any authenticated agent of the same account. This
+- A stored encrypted row can be replaced by any authenticated agent of the same account. This
   cannot grant authority (the delegate must still verify on-chain), but it can disable a job.
   Requiring an owner co-sign on `PUT /api/automation/delegates` closes it.
 - The spend cap bounds relayer-side spend; it does not bound what a delegate *reads*.

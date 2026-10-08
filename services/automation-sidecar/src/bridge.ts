@@ -90,7 +90,7 @@ export interface MemoryBridgeOptions {
      * `delegate:<name>` refs instead.
      */
     store?: AgentKeyStore;
-    /** Sealed, capability-scoped delegate keys (the production path). */
+    /** Encrypted, capability-scoped delegate keys (the production path). */
     delegates?: DelegateSource;
     /** Checks the delegate against the chain, via the relayer, on every request. */
     verifier?: Pick<DelegateVerifier, "verify">;
@@ -176,7 +176,7 @@ export class MemoryBridge {
      * Resolve a key ref **for a specific account**, ready to sign with.
      *
      * Two kinds of ref:
-     *   - `delegate:<name>`: a sealed delegate registered by the account owner.
+     *   - `delegate:<name>`: a encrypted delegate registered by the account owner.
      *     It is opened, then verified against the chain through the relayer on
      *     *this* request, so revocation and expiry apply immediately.
      *   - anything else: a static development key.

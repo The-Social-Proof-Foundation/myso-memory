@@ -77,13 +77,13 @@ describe("placeholder secret", () => {
 const PRODUCTION_ENV = {
     INTERNAL_SYNC_SECRET: "a-long-random-value",
     NODE_ENV: "production",
-    AUTOMATION_SEAL_PRIVATE_KEYS: "k1:" + "A".repeat(43),
+    AUTOMATION_MYDATA_PRIVATE_KEYS: "k1:" + "A".repeat(43),
     AUTOMATION_ENGINE_URL: "http://engine.internal:8010",
     MEMORY_SERVER_URL: "http://memory.internal:8000",
 };
 
 describe("production custody rules", () => {
-    it("accepts sealed delegates and disables static keys", () => {
+    it("accepts encrypted delegates and disables static keys", () => {
         const config = loadConfig(PRODUCTION_ENV);
         assert.equal(config.allowStaticKeys, false);
         assert.equal(config.agentKeysFile, null);
@@ -107,7 +107,7 @@ describe("production custody rules", () => {
 
     it("requires the pieces delegates need", () => {
         for (const missing of [
-            "AUTOMATION_SEAL_PRIVATE_KEYS",
+            "AUTOMATION_MYDATA_PRIVATE_KEYS",
             "AUTOMATION_ENGINE_URL",
             "MEMORY_SERVER_URL",
         ] as const) {

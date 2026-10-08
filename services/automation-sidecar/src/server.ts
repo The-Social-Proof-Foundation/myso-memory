@@ -7,7 +7,7 @@
  *
  * Routes:
  *   GET  /health                    → liveness + registered agent count (public, no ref names)
- *   GET  /seal-keys                 → public halves of the delegate seal keys (public)
+ *   GET  /mydata-keys                 → public halves of the delegate MyData keys (public)
  *   POST /internal/memory/recall    → semantic recall as a resolved agent
  *   POST /internal/memory/remember  → store a memory as a resolved agent
  *   POST /internal/memory/probe     → memory relayer reachability for an agent
@@ -23,7 +23,7 @@ import { BridgeError, MemoryBridge, type MemoryBridgeOptions } from "./bridge.js
 import { loadConfig, type SidecarConfig } from "./config.js";
 import { EngineDelegateSource } from "./delegates.js";
 import { AgentKeyStore, KeyStoreError } from "./keys.js";
-import { SealKeyRing } from "./seal.js";
+import { MyDataKeyRing } from "./delegate-crypto.js";
 import { DelegateVerifier } from "./verify.js";
 
 const SERVICE_NAME = "automation-memory-bridge";
@@ -112,12 +112,12 @@ export interface BridgeServerDeps {
     bridge: Pick<MemoryBridge, "recall" | "remember" | "probe">;
     /** Static dev keys, absent in production. Used by /health for a count. */
     store?: Pick<AgentKeyStore, "size">;
-    /** Public seal keys for browsers to seal delegate seeds to. Never private halves. */
-    sealPublicKeys?: () => Array<{ id: string; publicKey: string }>;
+    /** Public MyData keys for browsers to encrypt delegate seeds to. Never private halves. */
+    myDataPublicKeys?: () => Array<{ id: string; publicKey: string }>;
 }
 
 export function createBridgeServer(deps: BridgeServerDeps): Server {
-    const { config, bridge, store, sealPublicKeys } = deps;
+    const { config, bridge, store, myDataPublicKeys } = deps;
 
     return createServer((req, res) => {
         void handle(req, res).catch((err: unknown) => {
@@ -143,15 +143,15 @@ export function createBridgeServer(deps: BridgeServerDeps): Server {
                 status: "ok",
                 service: SERVICE_NAME,
                 agents: store?.size() ?? 0,
-                delegates: sealPublicKeys !== undefined,
+                delegates: myDataPublicKeys !== undefined,
             });
             return;
         }
 
-        if (path === "/seal-keys" && method === "GET") {
-            // Public by design: these are the keys a browser seals a delegate seed
+        if (path === "/mydata-keys" && method === "GET") {
+            // Public by design: these are the keys a browser encrypts a delegate seed
             // *to*. They cannot open anything.
-            sendJson(res, 200, { keys: sealPublicKeys?.() ?? [] });
+            sendJson(res, 200, { keys: myDataPublicKeys?.() ?? [] });
             return;
         }
 
@@ -253,8 +253,8 @@ async function main(): Promise<void> {
         store.reload();
     }
 
-    // Sealed delegate keys: ciphertext in the engine's database, opened here.
-    const keyring = config.sealPrivateKeys ? SealKeyRing.parse(config.sealPrivateKeys) : undefined;
+    // Encrypted delegate keys: ciphertext in the engine's database, opened here.
+    const keyring = config.myDataPrivateKeys ? MyDataKeyRing.parse(config.myDataPrivateKeys) : undefined;
     const delegates =
         keyring && config.engineUrl
             ? new EngineDelegateSource({
@@ -279,14 +279,14 @@ async function main(): Promise<void> {
         config,
         bridge,
         store,
-        sealPublicKeys: keyring ? () => keyring.publicKeys() : undefined,
+        myDataPublicKeys: keyring ? () => keyring.publicKeys() : undefined,
     });
 
     await new Promise<void>((resolve) => {
         server.listen(config.port, config.host, () => {
             console.log(
                 `[${SERVICE_NAME}] listening on http://${config.host}:${config.port} ` +
-                    `| keys=${store ? (store.isInline ? "static inline (dev)" : "static file (dev)") : "sealed delegates"} ` +
+                    `| keys=${store ? (store.isInline ? "static inline (dev)" : "static file (dev)") : "encrypted delegates"} ` +
                     `| agents=${store?.size() ?? 0} ` +
                     `| namespace=${config.defaultNamespace} ` +
                     `| memory=${config.defaultServerUrl ?? "(per-key)"}`,
