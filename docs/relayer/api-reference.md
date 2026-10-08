@@ -238,11 +238,25 @@ Recall memories, inject them into an LLM prompt, and return an AI-generated answ
 {
   "question": "What do you know about my preferences?",
   "limit": 5,
-  "namespace": "demo"
+  "namespace": "demo",
+  "recall": true,
+  "idempotency_key": "chat-turn-9f2c…"
 }
 ```
 
 `limit` defaults to `5`. `namespace` defaults to `"default"`.
+
+| Field | Meaning |
+|---|---|
+| `recall` | Recall-on-demand. `false` answers from the model alone and skips the query embedding, the vector search and every MYDATA download/decrypt; the response still carries a normal `answer` with `memories_used: 0`. Absent means `true`, so existing callers keep the always-recall behaviour. |
+| `idempotency_key` | Stable key for gateway reserve/provider/capture idempotency. Send the same value when retrying one logical turn so the retry reconciles the existing reservation instead of billing twice. |
+| `model_id` | LLM model id for billing; must match the oracle pricing catalog. |
+| `scope` | Optional org search scope. |
+
+When `AI_CREDIT_ENABLED=true`, generation is served by the AI-credit gateway
+(`AI_CREDIT_ORACLE_URL`, authenticated with `AI_CREDIT_ORACLE_API_SECRET`), which owns the
+reservation and proxies OpenRouter. With it disabled, local development calls OpenRouter or
+OpenAI directly — a fallback, not a supported production path.
 
 **Response:**
 

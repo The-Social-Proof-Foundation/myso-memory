@@ -1,0 +1,30 @@
+# Local Postgres for the automation engine.
+#
+# The automation engine gets its OWN database. Sharing the memory relayer's
+# database would put `automation_jobs` / `automation_runs` in the same schema as
+# the memory tables, and the engine applies its migration on every boot.
+#
+#   pnpm db:automation:up      # start
+#   pnpm db:automation:down    # stop
+#
+# Port 5433 on the host so it cannot collide with the memory relayer's 5432.
+services:
+  automation-db:
+    image: postgres:16-alpine
+    container_name: myso-automation-db
+    environment:
+      POSTGRES_USER: automation
+      POSTGRES_PASSWORD: automation
+      POSTGRES_DB: automation
+    ports:
+      - "5433:5432"
+    volumes:
+      - automation-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U automation -d automation"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  automation-db-data:

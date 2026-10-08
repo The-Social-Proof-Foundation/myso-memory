@@ -32,7 +32,6 @@ import type {
     RememberJobPollOptions,
     RememberBulkAcceptedResponse,
     RememberBulkStatusItem,
-    RememberResult,
     RecallResult,
     RecallMemory,
     RecallOptions,
@@ -504,10 +503,34 @@ export class Memory {
     request<T>(method: string, path: string, body: object = {}): Promise<T> {
         return this.signedRequest<T>(method, path, body);
     }
-    ask(params: { question: string; namespace?: string; scope?: string; limit?: number }) {
-        return this.signedRequest<{answer: string; memories_used: number; memories: RecallMemory[]; amount_mist?: number}>('POST', '/api/ask', {namespace: this.namespace, ...params});
+    ask(params: {
+        question: string;
+        namespace?: string;
+        scope?: string;
+        limit?: number;
+        /**
+         * Recall-on-demand. `false` answers from the model alone and skips the
+         * query embedding, vector search and MYDATA decrypts. Omit to keep the
+         * original always-recall behaviour.
+         */
+        recall?: boolean;
+        /**
+         * Stable key for gateway reserve/provider/capture idempotency. Send the
+         * same value when retrying one logical turn so a retry cannot bill or
+         * store twice.
+         */
+        idempotencyKey?: string;
+        modelId?: string;
+    }) {
+        const { idempotencyKey, modelId, ...rest } = params;
+        return this.signedRequest<{answer: string; memories_used: number; memories: RecallMemory[]; amount_mist?: number}>('POST', '/api/ask', {
+            namespace: this.namespace,
+            ...rest,
+            ...(idempotencyKey ? {idempotency_key: idempotencyKey} : {}),
+            ...(modelId ? {model_id: modelId} : {}),
+        });
     }
-    listModels() { return this.signedRequest<{models: {id: string; display_name: string; input_mist_per_1m: number; output_mist_per_1m: number}[]}>('GET', '/api/models', {}); }
+    listModels() { return this.signedRequest<{models: {id: string; display_name: string; context_length: number | null; input_usd_per_1m: number | null; output_usd_per_1m: number | null}[]}>('GET', '/api/models', {}); }
     getAgentModel() { return this.signedRequest<{model_id: string; source: string}>('GET', '/api/agent/llm-model', {}); }
     setAgentModel(modelId: string) { return this.signedRequest<{model_id: string; source: string}>('PUT', '/api/agent/llm-model', {model_id: modelId}); }
 

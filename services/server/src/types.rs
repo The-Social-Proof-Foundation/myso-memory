@@ -102,6 +102,10 @@ pub struct Config {
     pub memory_account_id: Option<String>,
     pub openai_api_key: Option<String>,
     pub openai_api_base: String,
+    /// OpenRouter is used for model discovery and, when configured, chat inference.
+    /// Embeddings continue to use the independently configured OpenAI-compatible API.
+    pub openrouter_api_key: Option<String>,
+    pub openrouter_api_base: String,
     pub file_storage_publisher_url: String,
     pub file_storage_aggregator_url: String,
     /// Primary key (used for MYDATA decrypt / recall). Unchanged.
@@ -120,6 +124,9 @@ pub struct Config {
     pub rate_limit: RateLimitConfig,
     /// Sponsor-specific rate limiting and concurrency config
     pub sponsor_rate_limit: SponsorRateLimitConfig,
+    /// Per-IP limit for the agent key backup routes (`/api/owner/auth/*`, `/api/accounts/*`).
+    /// Separate from the sponsor budget: unlocking and syncing keys must not spend gas-sponsorship quota.
+    pub key_backup_rate_limit: SponsorRateLimitConfig,
     /// Allowed CORS origins (comma-separated, e.g. "http://localhost:3000,https://mysocial.network")
     pub allowed_origins: String,
     /// Bootstrap shared objects for social_contracts::post PTBs
@@ -160,6 +167,13 @@ pub struct Config {
     /// Shared secret for internal social-server endpoints (`/internal/*`),
     /// including the org summary lookup used by MYDATA org decrypt.
     pub internal_sync_secret: Option<String>,
+    /// Automation engine origin, for the owner-authenticated `/api/automation/*`
+    /// proxy. When unset those routes report the engine as not configured rather
+    /// than exposing an unauthenticated path to it.
+    pub automation_engine_url: Option<String>,
+    /// Secret presented to the automation engine as `x-internal-sync-secret`.
+    /// Falls back to [`Self::internal_sync_secret`] so one value covers the stack.
+    pub automation_engine_secret: Option<String>,
     /// GraphQL endpoint used to discover local shared-object IDs after regenesis.
     pub social_chain_graphql_url: Option<String>,
     /// Enables type-based discovery for missing social/messaging object IDs.
@@ -168,6 +182,12 @@ pub struct Config {
     /// Memory access request producer (`POST /internal/memory/access-requests`).
     pub memory_access_sync_enabled: bool,
     pub memory_access_sync_secret: Option<String>,
+    /// Custody methods accepted for agent-key root wraps (AGENT_KEY_CUSTODY_TIERS).
+    pub agent_key_custody_tiers: Vec<String>,
+    /// Optional minimum custody tier required to unlock (AGENT_KEY_REQUIRE_TIER).
+    pub agent_key_require_tier: Option<String>,
+    /// Per-account challenge/unlock limit per minute (AGENT_KEY_UNLOCK_PER_MINUTE).
+    pub agent_key_unlock_per_minute: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +324,9 @@ impl Config {
                 }),
             openai_api_base: std::env::var("OPENAI_API_BASE")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+            openrouter_api_key: non_empty_env("OPENROUTER_API_KEY"),
+            openrouter_api_base: std::env::var("OPENROUTER_API_BASE")
+                .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string()),
             file_storage_publisher_url: std::env::var("FILE_STORAGE_PUBLISHER_URL")
                 .unwrap_or_else(|_| "https://publisher.file-storage-mainnet.mysocial.network".to_string()),
             file_storage_aggregator_url: std::env::var("FILE_STORAGE_AGGREGATOR_URL")
@@ -333,6 +356,7 @@ impl Config {
             sidecar_secret: std::env::var("SIDECAR_AUTH_TOKEN").ok(),
             rate_limit: RateLimitConfig::from_env(),
             sponsor_rate_limit: SponsorRateLimitConfig::from_env(),
+            key_backup_rate_limit: SponsorRateLimitConfig::key_backup_from_env(),
             allowed_origins: std::env::var("ALLOWED_ORIGINS")
                 .unwrap_or_default(),
             social_chain: SocialChainConfig::from_env(),
@@ -374,6 +398,13 @@ impl Config {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             internal_sync_secret: std::env::var("INTERNAL_SYNC_SECRET").ok(),
+            automation_engine_url: std::env::var("AUTOMATION_ENGINE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            automation_engine_secret: std::env::var("AUTOMATION_ENGINE_SECRET")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| std::env::var("INTERNAL_SYNC_SECRET").ok()),
             social_chain_graphql_url: std::env::var("SOCIAL_CHAIN_GRAPHQL_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -388,8 +419,57 @@ impl Config {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
             memory_access_sync_secret: std::env::var("MEMORY_ACCESS_SYNC_SECRET").ok(),
+            agent_key_custody_tiers: std::env::var("AGENT_KEY_CUSTODY_TIERS")
+                .unwrap_or_else(|_| DEFAULT_AGENT_KEY_CUSTODY_TIERS.to_string())
+                .split(',')
+                .map(|method| method.trim().to_string())
+                .filter(|method| !method.is_empty())
+                .collect(),
+            agent_key_require_tier: non_empty_env("AGENT_KEY_REQUIRE_TIER"),
+            agent_key_unlock_per_minute: std::env::var("AGENT_KEY_UNLOCK_PER_MINUTE")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(10),
         }
     }
+
+    /// A custody method is usable only when it is both known and configured as an enabled tier.
+    pub fn custody_method_enabled(&self, method: &str) -> bool {
+        CUSTODY_METHODS.contains(&method)
+            && self
+                .agent_key_custody_tiers
+                .iter()
+                .any(|tier| tier == method)
+    }
+}
+
+/// Custody methods recognized by the root-wrap v2 contract. Order is strongest-first for
+/// `AGENT_KEY_REQUIRE_TIER` (a required tier admits itself and anything stronger).
+pub const CUSTODY_METHODS: [&str; 4] = [
+    "passkey-prf-v1",
+    "recovery-code-v1",
+    "device-key-v1",
+    "zklogin-root-v1",
+];
+
+/// Default custody tiers: the pre-existing passkey tier plus the login-root tier.
+pub const DEFAULT_AGENT_KEY_CUSTODY_TIERS: &str =
+    "passkey-prf-v1,zklogin-root-v1,recovery-code-v1";
+
+/// Rank used only to decide whether a method satisfies AGENT_KEY_REQUIRE_TIER. A passkey is
+/// independent of the login/salt service, a recovery code additionally needs the printed code,
+/// a device key is a random per-device secret, and the login root is exactly as strong as the
+/// wallet login it is derived from.
+pub fn custody_method_rank(method: &str) -> u8 {
+    CUSTODY_METHODS
+        .iter()
+        .position(|known| *known == method)
+        .map_or(0, |index| (CUSTODY_METHODS.len() - index) as u8)
+}
+
+/// `AGENT_KEY_REQUIRE_TIER` is a minimum: weaker methods are refused.
+pub fn custody_tier_satisfied(required: &str, method: &str) -> bool {
+    custody_method_rank(method) >= custody_method_rank(required)
 }
 
 // ============================================================
@@ -476,6 +556,18 @@ impl Default for SponsorRateLimitConfig {
 }
 
 impl SponsorRateLimitConfig {
+    /// Key backup routes: 120/min and 1500/hr per IP unless `KEY_BACKUP_RATE_LIMIT_PER_MINUTE` /
+    /// `KEY_BACKUP_RATE_LIMIT_PER_HOUR` say otherwise. Per-account custody limits still apply.
+    pub fn key_backup_from_env() -> Self {
+        let read = |name: &str, default: i64| {
+            std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+        };
+        Self {
+            per_minute: read("KEY_BACKUP_RATE_LIMIT_PER_MINUTE", 120),
+            per_hour: read("KEY_BACKUP_RATE_LIMIT_PER_HOUR", 1500),
+        }
+    }
+
     pub fn from_env() -> Self {
         let mut c = Self::default();
         if let Ok(v) = std::env::var("SPONSOR_RATE_LIMIT_PER_MINUTE") {
@@ -784,6 +876,12 @@ pub struct AskRequest {
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub scope: Option<String>,
+    /// Recall-on-demand: `Some(false)` answers from the model alone, skipping the
+    /// query embedding, vector search and MYDATA decrypts entirely. Absent (or
+    /// `Some(true)`) keeps the original always-recall behaviour, so existing
+    /// callers are unaffected.
+    #[serde(default)]
+    pub recall: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -839,6 +937,12 @@ pub struct HealthResponse {
 pub struct ConfigResponse {
     #[serde(rename = "agentKeyBackups")]
     pub agent_key_backups: bool,
+    /// Custody tiers this deployment accepts for agent-key root wraps.
+    #[serde(rename = "agentKeyCustodyTiers")]
+    pub agent_key_custody_tiers: Vec<String>,
+    /// Minimum custody tier required to unlock, when the operator pinned one.
+    #[serde(rename = "agentKeyRequiredTier")]
+    pub agent_key_required_tier: Option<String>,
     #[serde(rename = "packageId")]
     pub package_id: String,
     pub network: String,
@@ -1019,6 +1123,10 @@ pub struct AuthInfo {
     pub capabilities: u64,
     pub approval_required_caps: u64,
     pub max_action_spend: Option<u64>,
+    /// Absolute expiry of the sub-agent (ms since epoch), if it has one. Lets a
+    /// credential holder, such as the automation bridge, refuse a delegate that
+    /// can never lapse.
+    pub expires_at_ms: Option<i64>,
     pub platform_scope: Option<String>,
     /// Agentic organization this sub-agent belongs to (from the social index).
     pub organization_id: Option<String>,
@@ -1216,6 +1324,7 @@ mod tests {
             capabilities: 3,
             approval_required_caps: 0,
             max_action_spend: None,
+            expires_at_ms: None,
             platform_scope: None,
             organization_id: None,
             platform_id: None,

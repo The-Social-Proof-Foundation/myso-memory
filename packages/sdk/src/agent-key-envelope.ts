@@ -133,6 +133,160 @@ export async function unwrapRecoveryRoot(prf: Uint8Array, wrap: RecoveryRootWrap
     return crypt(prf, wrap.salt, rootWrapAAD(wrap), wrap.nonce, fromBase64url(wrap.ciphertext, 48), true);
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * Custody tiers (root wrap v2)
+ *
+ * One random recovery root per account encrypts every agent envelope. The root is stored only as
+ * one or more independently encrypted wraps, each bound to a custody method. Any wrap of the same
+ * rootId unlocks the same agents, so adding or removing a method never re-encrypts an envelope and
+ * never changes an agent identity. Agent seeds and the root are always random: no tier derives key
+ * material from a credential.
+ * ---------------------------------------------------------------------------------------------- */
+
+export const ROOT_WRAP_VERSION = 2 as const;
+export const CUSTODY_METHODS = ['passkey-prf-v1', 'zklogin-root-v1', 'recovery-code-v1', 'device-key-v1'] as const;
+export type CustodyMethod = (typeof CUSTODY_METHODS)[number];
+
+/** Canonical empty for a method-irrelevant 32-byte field. */
+export const ZERO_32_BASE64URL = base64url(new Uint8Array(32));
+
+export const RECOVERY_CODE_KDF = 'pbkdf2-sha256' as const;
+export const RECOVERY_CODE_ITERATIONS = 600000;
+const LOGIN_ROOT_DOMAIN = 'mysocial:agent-custody-secret:zklogin-root:v1';
+const RECOVERY_CODE_DOMAIN = 'mysocial:agent-custody-secret:recovery-code:v1';
+
+export type CustodyBinding = {
+    chain: string; packageId: string; owner: string; accountId: string;
+    rootId: string; subject: string; revision: number;
+    credentialId: string; rpId: string; prfInput: string;
+    codeKdf: string; codeSalt: string;
+};
+export type RecoveryRootWrapV2 = CustodyBinding & {
+    version: 2; algorithm: 'AES-256-GCM'; kdf: 'HKDF-SHA256'; method: CustodyMethod;
+    salt: string; nonce: string; ciphertext: string;
+};
+export type AnyRecoveryRootWrap = RecoveryRootWrapV1 | RecoveryRootWrapV2;
+
+export function isCustodyMethod(value: unknown): value is CustodyMethod {
+    return typeof value === 'string' && (CUSTODY_METHODS as readonly string[]).includes(value);
+}
+
+/** Canonical empty field rules; a wrap cannot be replayed under a different method. */
+export function normalizeCustodyBinding(method: CustodyMethod, binding: CustodyBinding): CustodyBinding {
+    if (!isCustodyMethod(method)) throw new Error('Unsupported custody method');
+    if (!binding.subject) throw new Error('Custody subject is required');
+    const address = (value: string) => normalizeKeyAddress(value);
+    const base: CustodyBinding = {
+        chain: binding.chain, packageId: address(binding.packageId), owner: address(binding.owner), accountId: address(binding.accountId),
+        rootId: binding.rootId, subject: binding.subject, revision: binding.revision,
+        credentialId: '', rpId: '', prfInput: ZERO_32_BASE64URL, codeKdf: '', codeSalt: ZERO_32_BASE64URL,
+    };
+    if (!Number.isInteger(base.revision) || base.revision < 1 || base.revision > 0xffffffff) throw new Error('Invalid revision');
+    if (method === 'passkey-prf-v1') {
+        if (!binding.credentialId || !binding.rpId) throw new Error('Passkey custody requires a credential id and rp id');
+        const prfInput = fromBase64url(binding.prfInput, 32);
+        if (prfInput.every(b => b === 0)) throw new Error('Passkey custody requires a PRF input');
+        base.credentialId = binding.credentialId; base.rpId = binding.rpId; base.prfInput = base64url(prfInput);
+    } else if (method === 'recovery-code-v1') {
+        const {kdf, iterations} = parseRecoveryCodeParams(binding.codeKdf);
+        const codeSalt = fromBase64url(binding.codeSalt, 32);
+        if (codeSalt.every(b => b === 0)) throw new Error('Recovery-code custody requires a code salt');
+        if (base.subject !== address(binding.owner)) throw new Error('Recovery-code subject must be the account owner');
+        base.codeKdf = formatRecoveryCodeParams(kdf, iterations); base.codeSalt = base64url(codeSalt);
+    } else if (method === 'zklogin-root-v1') {
+        if (base.subject !== address(binding.owner)) throw new Error('Login-root subject must be the account owner');
+    } else if (method === 'device-key-v1') {
+        if (base.subject !== address(binding.owner)) throw new Error('Device-key subject must be the account owner');
+    }
+    if (binding.credentialId !== base.credentialId || binding.prfInput !== base.prfInput
+        || binding.codeKdf !== base.codeKdf || binding.codeSalt !== base.codeSalt) {
+        throw new Error('Custody binding carries fields that do not belong to its method');
+    }
+    return base;
+}
+
+const RootAAD2 = bcs.struct('RecoveryRootWrapV2', {
+    domain: bcs.string(), version: bcs.u8(), algorithm: bcs.string(), kdf: bcs.string(),
+    method: bcs.string(),
+    chain: bcs.string(), packageId: Address, owner: Address, accountId: Address,
+    rootId: bcs.string(), subject: bcs.string(),
+    credentialId: bcs.string(), rpId: bcs.string(), prfInput: Address,
+    codeKdf: bcs.string(), codeSalt: Address,
+    revision: bcs.u32(), salt: Address,
+});
+export function rootWrapV2AAD(e: RecoveryRootWrapV2): Uint8Array {
+    if (e.version !== ROOT_WRAP_VERSION) throw new Error('Unsupported root wrap version');
+    if (e.algorithm !== 'AES-256-GCM' || e.kdf !== 'HKDF-SHA256') throw new Error('Unsupported envelope version');
+    if (!Number.isInteger(e.revision) || e.revision < 1 || e.revision > 0xffffffff) throw new Error('Invalid revision');
+    const binding = normalizeCustodyBinding(e.method, e);
+    return RootAAD2.serialize({
+        ...binding, domain: 'mysocial:agent-root-wrap:v2', version: ROOT_WRAP_VERSION, algorithm: e.algorithm, kdf: e.kdf, method: e.method,
+        packageId: address(binding.packageId), owner: address(binding.owner), accountId: address(binding.accountId),
+        prfInput: Array.from(fromBase64url(binding.prfInput, 32)), codeSalt: Array.from(fromBase64url(binding.codeSalt, 32)),
+        salt: Array.from(fromBase64url(e.salt, 32)),
+    }).toBytes();
+}
+export async function wrapRecoveryRootV2(secret: Uint8Array, root: Uint8Array, method: CustodyMethod, binding: CustodyBinding): Promise<RecoveryRootWrapV2> {
+    if (root.length !== 32) throw new Error('Invalid recovery root');
+    const b = normalizeCustodyBinding(method, binding);
+    const wrap: RecoveryRootWrapV2 = {
+        ...b, version: ROOT_WRAP_VERSION, algorithm: 'AES-256-GCM', kdf: 'HKDF-SHA256', method,
+        salt: base64url(randomKey()), nonce: base64url(crypto.getRandomValues(new Uint8Array(12))), ciphertext: '',
+    };
+    wrap.ciphertext = base64url(await crypt(secret, wrap.salt, rootWrapV2AAD(wrap), wrap.nonce, root, false));
+    return wrap;
+}
+export async function unwrapRecoveryRootV2(secret: Uint8Array, wrap: RecoveryRootWrapV2): Promise<Uint8Array> {
+    return crypt(secret, wrap.salt, rootWrapV2AAD(wrap), wrap.nonce, fromBase64url(wrap.ciphertext, 48), true);
+}
+export function isRecoveryRootWrapV2(value: unknown): value is RecoveryRootWrapV2 {
+    const v = value as RecoveryRootWrapV2 | null;
+    return !!v && typeof v === 'object' && v.version === ROOT_WRAP_VERSION && isCustodyMethod((v as {method?: unknown}).method);
+}
+/** Dual-read: v1 wraps (passkey PRF) and v2 wraps both unlock the same root. */
+export async function unwrapAnyRecoveryRoot(secret: Uint8Array, wrap: AnyRecoveryRootWrap): Promise<Uint8Array> {
+    return isRecoveryRootWrapV2(wrap) ? unwrapRecoveryRootV2(secret, wrap) : unwrapRecoveryRoot(secret, wrap);
+}
+
+export function formatRecoveryCodeParams(kdf: string = RECOVERY_CODE_KDF, iterations: number = RECOVERY_CODE_ITERATIONS): string {
+    if (kdf !== RECOVERY_CODE_KDF) throw new Error('Unsupported recovery-code KDF');
+    if (!Number.isInteger(iterations) || iterations < 100000 || iterations > 10000000) throw new Error('Invalid recovery-code iterations');
+    return `${kdf}:${iterations}`;
+}
+export function parseRecoveryCodeParams(params: string): {kdf: string; iterations: number} {
+    const [kdf, raw] = (params ?? '').split(':');
+    const iterations = Number(raw);
+    if (kdf !== RECOVERY_CODE_KDF || !Number.isInteger(iterations) || iterations < 100000 || iterations > 10000000) throw new Error('Invalid recovery-code parameters');
+    return {kdf, iterations};
+}
+
+/** `zklogin-root-v1` wrap secret: the deterministic login key, domain-separated. */
+export async function deriveZkLoginRootSecret(loginSeed: Uint8Array): Promise<Uint8Array> {
+    if (loginSeed.length !== 32) throw new Error('Expected a 32-byte login seed');
+    const info = new TextEncoder().encode(LOGIN_ROOT_DOMAIN);
+    return hkdf(sha256, loginSeed, new Uint8Array(32), info, 32);
+}
+/**
+ * `recovery-code-v1` wrap secret: requires both the login key and the user code, so neither the
+ * salt service nor the user's code alone can unwrap. Parameter order is fixed by the KDF params
+ * stored in the wrap, so changing the iteration count requires a new wrap.
+ */
+export async function deriveRecoveryCodeSecret(loginSeed: Uint8Array, code: string, codeSalt: Uint8Array, codeKdf: string = formatRecoveryCodeParams()): Promise<Uint8Array> {
+    if (loginSeed.length !== 32) throw new Error('Expected a 32-byte login seed');
+    if (codeSalt.length !== 32) throw new Error('Expected a 32-byte code salt');
+    if (!code) throw new Error('Recovery code is required');
+    const {iterations} = parseRecoveryCodeParams(codeKdf);
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(code) as BufferSource, 'PBKDF2', false, ['deriveBits']);
+    const stretched = new Uint8Array(await crypto.subtle.deriveBits({name: 'PBKDF2', salt: codeSalt as BufferSource, iterations, hash: 'SHA-256'}, base, 256));
+    const ikm = new Uint8Array(64);
+    try {
+        ikm.set(loginSeed, 0); ikm.set(stretched, 32);
+        return hkdf(sha256, ikm, codeSalt, new TextEncoder().encode(RECOVERY_CODE_DOMAIN), 32);
+    } finally { stretched.fill(0); ikm.fill(0); }
+}
+/** `device-key-v1`: random wrap secret held only on the device; never sent to a server. */
+export function generateDeviceWrapSecret(): Uint8Array { return randomKey(); }
+
 const IntentBudget = bcs.struct('AgentIntentBudget', {balanceId: Address, budgetMist: bcs.option(bcs.u64()), dailyCapMist: bcs.option(bcs.u64()), monthlyCapMist: bcs.option(bcs.u64()), requireApprovalAboveMist: bcs.option(bcs.u64())});
 const Intent = bcs.struct('AgentRegistrationIntentV1', {domain: bcs.string(), label: bcs.string(), capabilities: bcs.u64(), delegatableCaps: bcs.u64(), expiresAtMs: bcs.option(bcs.u64()), parentAgentId: bcs.option(Address), budget: bcs.option(IntentBudget)});
 /** Bind resumable public registration/budget choices to the encrypted signing seed. */

@@ -709,6 +709,7 @@ export async function buildApproveKeyPolicyTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
@@ -726,6 +727,7 @@ export async function buildApproveKeyWritePolicyTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_write_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
@@ -743,6 +745,7 @@ export async function approveKeyPolicy(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
@@ -762,6 +765,7 @@ export async function approveKeyWritePolicy(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_write_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),

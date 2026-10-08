@@ -29,10 +29,10 @@ import { Ed25519Keypair } from "@socialproof/myso/keypairs/ed25519";
 import { decodeMySoPrivateKey } from "@socialproof/myso/cryptography";
 import { Transaction } from "@socialproof/myso/transactions";
 import { MyDataClient, SessionKey, EncryptedObject } from "@socialproof/mydata";
+import { addApproveKeyPolicyCall } from "./mydata-policy.js";
 
 // Network config from env vars
 const MYSO_NETWORK = (process.env.MYSO_NETWORK || "mainnet") as "mainnet" | "testnet";
-const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
 const MYDATA_KEY_SERVERS = [
     ...new Set(
         (process.env.MYDATA_KEY_SERVERS || "")
@@ -148,16 +148,8 @@ async function main() {
         mysoClient: mysoClient as any,
     });
 
-    // approve_key_policy(id: vector<u8>, account: &MemoryAccount, clock: &Clock, ctx: &TxContext)
     const tx = new Transaction();
-    tx.moveCall({
-        target: `${packageId}::memory::approve_key_policy`,
-        arguments: [
-            tx.pure("vector<u8>", idBytes),
-            tx.object(accountId),
-            tx.object(MYSO_CLOCK),
-        ],
-    });
+    addApproveKeyPolicyCall(tx, packageId, process.env.MEMORY_CONFIG_ID || "", idBytes, accountId, null);
     const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
 
     // Step 4: Fetch keys from key servers (policy check happens here)

@@ -13,6 +13,7 @@ For setup steps and deployment context, see [Self-Hosting](/relayer/self-hosting
 | `MEMORY_PACKAGE_ID` | MySo package ID. See [Contract Overview](/contract/overview) |
 | `MEMORY_REGISTRY_ID` | Onchain registry object ID. See [Contract Overview](/contract/overview) |
 | `MYDATA_KEY_SERVERS` | Comma-separated MYDATA key server object IDs used by the sidecar for encrypt and decrypt |
+| `MEMORY_CONFIG_ID` | Shared `memory::MemoryConfig` object required by MYDATA key-policy approval; auto-discovered on localnet |
 
 ## Usually Required
 
@@ -30,6 +31,8 @@ These are not all enforced at boot, but most real deployments need them.
 | `PORT` | `8000` | Relayer port |
 | `SIDECAR_URL` | `http://localhost:9000` | Sidecar HTTP endpoint |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
+| `OPENROUTER_API_BASE` | `https://openrouter.ai/api/v1` | Public model discovery; local chat endpoint when `OPENROUTER_API_KEY` is set |
+| `OPENROUTER_API_KEY` | unset | Routes local `/api/ask` chat to OpenRouter; embeddings retain the OpenAI configuration. Production AI-credit enforcement still uses the billing gateway |
 | `MYSO_NETWORK` | `mainnet` | Picks the fallback RPC URL and network-driven service defaults |
 | `MYSO_RPC_URL` | network default | Override the MySo fullnode URL |
 | `SOCIAL_CHAIN_AUTO_DISCOVERY` | `true` on localnet | Discover missing IDs and replace fullnode-proven stale localnet IDs after regenesis; remote explicit pins are never replaced |
@@ -67,6 +70,14 @@ These are not all enforced at boot, but most real deployments need them.
 | `FILE_STORAGE_UPLOAD_RELAY_URL` | network default | Override the File Storage upload relay used by the sidecar |
 | `ENOKI_API_KEY` | none | Optional Enoki key for sponsored sidecar transactions |
 | `ENOKI_NETWORK` | `mainnet` | Network used for Enoki-sponsored flows |
+| `ENABLE_AGENT_KEY_BACKUPS` | `false` | Enable client-side encrypted agent-key backups and their routes. Must be exactly `true` to enable |
+| `AGENT_KEY_CUSTODY_TIERS` | `passkey-prf-v1,zklogin-root-v1,recovery-code-v1` | Custody methods the server accepts for root wraps. `AGENT_KEY_CUSTODY_TIERS=passkey-prf-v1` reproduces the passkey-only posture |
+| `AGENT_KEY_REQUIRE_TIER` | none | Optional minimum custody tier; a weaker unlock is refused with `custody_tier_required` |
+| `AGENT_KEY_UNLOCK_PER_MINUTE` | `10` | Per-account custody attempts per minute, enforced in Redis (`custody_rate_limited`). The counter increments once per challenge and once more per custody-purpose verify, so 10 is roughly three or four unlocks per minute |
+| `PASSKEY_RP_ID` | none | WebAuthn RP ID; required only when the `passkey-prf-v1` tier is enabled |
+| `PASSKEY_ALLOWED_ORIGINS` | none | Exact HTTPS origins for passkey ceremonies; required only when the `passkey-prf-v1` tier is enabled |
+| `KEY_BACKUP_SERVICE_ORIGIN` | none | Exact origin bound into owner challenges; required when backups are enabled |
+| `SIDECAR_AUTH_TOKEN` | none | Shared secret authenticating private verification calls to the sidecar |
 
 ## Notes
 

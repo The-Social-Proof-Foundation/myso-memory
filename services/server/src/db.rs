@@ -48,6 +48,10 @@ impl VectorDb {
             ("012", include_str!("../migrations/012_action_approvals.sql")),
             ("013", include_str!("../migrations/013_agent_llm_models.sql")),
             ("014", include_str!("../migrations/014_agent_key_backups.sql")),
+            (
+                "015",
+                include_str!("../migrations/015_agent_custody_tiers.sql"),
+            ),
         ] {
             sqlx::raw_sql(sql).execute(&pool).await.map_err(|e| {
                 AppError::Internal(format!("Failed to run migration {}: {}", name, e))

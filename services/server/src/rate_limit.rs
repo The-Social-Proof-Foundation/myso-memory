@@ -828,6 +828,28 @@ pub async fn sponsor_rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    let config = state.config.sponsor_rate_limit.clone();
+    ip_rate_limit(&state, request, next, "sponsor", &config).await
+}
+
+/// Per-IP limiter for the agent key backup routes, on its own counters and limits so unlocking
+/// and syncing keys never spends the (much smaller) sponsor budget.
+pub async fn key_backup_rate_limit_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let config = state.config.key_backup_rate_limit.clone();
+    ip_rate_limit(&state, request, next, "keybackup", &config).await
+}
+
+async fn ip_rate_limit(
+    state: &Arc<AppState>,
+    request: Request,
+    next: Next,
+    scope: &str,
+    config: &crate::types::SponsorRateLimitConfig,
+) -> Response {
     // Extract client IP from X-Forwarded-For (set by reverse proxy) or
     // fall back to the direct connection address stored by axum.
     let ip: Option<String> = request
@@ -852,12 +874,11 @@ pub async fn sponsor_rate_limit_middleware(
         }
     };
 
-    let config = &state.config.sponsor_rate_limit;
     let mut redis = state.redis.clone();
     let now = chrono::Utc::now().timestamp_millis() as f64;
 
-    let min_key = format!("rate:sponsor:ip:min:{}", ip);
-    let hr_key = format!("rate:sponsor:ip:hr:{}", ip);
+    let min_key = format!("rate:{}:ip:min:{}", scope, ip);
+    let hr_key = format!("rate:{}:ip:hr:{}", scope, ip);
     let min_window_start = now - 60_000.0;
     let hr_window_start = now - 3_600_000.0;
 

@@ -6,6 +6,7 @@ mod action_approvals;
 mod ai_spend;
 mod audit_push;
 mod auth;
+mod automation_proxy;
 mod blob_store;
 mod chain_actions;
 mod chain_discovery;
@@ -64,7 +65,7 @@ async fn main() {
     let mut config = Config::from_env();
     let backups_enabled = std::env::var("ENABLE_AGENT_KEY_BACKUPS").as_deref() == Ok("true");
     if backups_enabled {
-        owner_auth::validate_config().expect("Invalid agent backup configuration");
+        owner_auth::validate_config(&config).expect("Invalid agent backup configuration");
         assert!(!config.allow_legacy_delegate_key_forwarding && !config.allow_legacy_social_key_forwarding,
             "Non-custodial agent backups require legacy private-key forwarding to be disabled");
     }
@@ -85,6 +86,11 @@ async fn main() {
         config.rate_limit.max_requests_per_hour,
         config.rate_limit.max_requests_per_delegate_key,
         config.rate_limit.max_storage_bytes / 1_048_576
+    );
+    tracing::info!(
+        "  key backup rate limit: {}/min, {}/hr per IP",
+        config.key_backup_rate_limit.per_minute,
+        config.key_backup_rate_limit.per_hour,
     );
     tracing::info!(
         "  sponsor rate limit: {}/min, {}/hr per IP+sender",
@@ -299,6 +305,31 @@ async fn main() {
             post(routes::record_inference_usage_route),
         )
         .route("/api/restore", post(routes::restore))
+        // Automation jobs. The chat-app cannot hold the engine's shared secret,
+        // so these are owner-authenticated here and forwarded with the secret
+        // attached; ownership is re-checked per job before anything is returned.
+        .route(
+            "/api/automation/jobs",
+            get(automation_proxy::list_jobs).post(automation_proxy::create_job),
+        )
+        .route(
+            "/api/automation/jobs/{id}",
+            get(automation_proxy::get_job),
+        )
+        .route(
+            "/api/automation/jobs/{id}/runs",
+            get(automation_proxy::list_runs),
+        )
+        .route(
+            "/api/automation/delegates",
+            get(automation_proxy::list_delegates),
+        )
+        .route(
+            "/api/automation/delegates/{name}",
+            axum::routing::put(automation_proxy::put_delegate)
+                .delete(automation_proxy::delete_delegate),
+        )
+        .route("/api/automation/health", get(automation_proxy::health))
         .route("/api/social/post", post(social_routes::create_post))
         .route("/api/social/comment", post(social_routes::create_comment))
         .route("/api/social/react/post", post(social_routes::react_to_post))
@@ -375,7 +406,7 @@ async fn main() {
     if backups_enabled {
         public_routes = public_routes.merge(agent_key_backups::router()
             .layer(DefaultBodyLimit::max(32 * 1024))
-            .layer(middleware::from_fn_with_state(state.clone(), rate_limit::sponsor_rate_limit_middleware)));
+            .layer(middleware::from_fn_with_state(state.clone(), rate_limit::key_backup_rate_limit_middleware)));
     }
     if config.allow_public_generic_sponsor {
         tracing::warn!(

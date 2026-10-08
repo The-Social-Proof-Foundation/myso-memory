@@ -18,7 +18,9 @@ import { Ed25519Keypair } from "@socialproof/myso/keypairs/ed25519";
 import { decodeMySoPrivateKey } from "@socialproof/myso/cryptography";
 import { Transaction } from "@socialproof/myso/transactions";
 import { MyDataClient, SessionKey, EncryptedObject } from "@socialproof/mydata";
+import { resolveKeyServers } from "./mydata-key-servers.js";
 import { FileStorageClient } from "@socialproof/file-storage";
+import { addApproveKeyPolicyCall, type OrgDecryptContext } from "./mydata-policy.js";
 
 // ============================================================
 // Shared clients (initialized once at boot — the whole point!)
@@ -91,14 +93,60 @@ const FILE_STORAGE_UPLOAD_RELAY_URL = process.env.FILE_STORAGE_UPLOAD_RELAY_URL 
 
 const DEFAULT_FILE_STORAGE_EPOCHS = FILE_STORAGE_NETWORK === "testnet" ? 50 : 3;
 
-const mydataClient = new MyDataClient({
-    mysoClient: mysoClient as any,
-    serverConfigs: MYDATA_KEY_SERVERS.map((id) => ({
-        objectId: id,
-        weight: 1,
-    })),
-    verifyKeyServers: true,
-});
+/**
+ * MYDATA client, built lazily so a stale `MYDATA_KEY_SERVERS` pin (a regenesised localnet)
+ * can be re-resolved from GraphQL first. Only a successful build is memoized, so a chain that
+ * is still coming up is retried on the next request rather than poisoned for the process.
+ */
+let mydataClientPromise: Promise<MyDataClient> | null = null;
+
+function getMydataClient(): Promise<MyDataClient> {
+    if (mydataClientPromise) return mydataClientPromise;
+    const built = (async () => {
+        const resolved = await resolveKeyServers(
+            {
+                configured: MYDATA_KEY_SERVERS,
+                network: MYSO_NETWORK_RAW,
+                graphqlUrl: process.env.SOCIAL_CHAIN_GRAPHQL_URL,
+                packageId: process.env.MYDATA_PACKAGE_ID,
+            },
+            {
+                getObjectType: async (id) => {
+                    const res = await mysoClient.getObject({ id, options: { showType: true } } as any);
+                    return (res as any)?.data?.type ?? null;
+                },
+                queryGraphql: async (url, query) => {
+                    const res = await fetch(url, {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ query }),
+                    });
+                    if (!res.ok) throw new Error(`GraphQL ${res.status}`);
+                    return ((await res.json()) as { data?: unknown }).data ?? null;
+                },
+            },
+        );
+        if (resolved.stale.length > 0) {
+            console.warn(
+                `[sidecar] MYDATA_KEY_SERVERS pin(s) not found on chain: ${resolved.stale.join(", ")}` +
+                    (resolved.source === "discovered"
+                        ? ` — using discovered key server(s) ${resolved.ids.join(", ")}; update the env to silence this`
+                        : ""),
+            );
+        }
+        return new MyDataClient({
+            mysoClient: mysoClient as any,
+            serverConfigs: resolved.ids.map((id) => ({ objectId: id, weight: 1 })),
+            verifyKeyServers: true,
+        });
+    })();
+    mydataClientPromise = built;
+    built.catch(() => {
+        if (mydataClientPromise === built) mydataClientPromise = null;
+    });
+    return built;
+}
+
 
 const fileStorageClient = new FileStorageClient({
     network: FILE_STORAGE_NETWORK,
@@ -452,7 +500,7 @@ app.post("/mydata/encrypt", async (req, res) => {
         }
 
         const plaintext = Buffer.from(data, "base64");
-        const result = await mydataClient.encrypt({
+        const result = await (await getMydataClient()).encrypt({
             threshold: MYDATA_THRESHOLD,
             packageId,
             id: owner,
@@ -533,11 +581,6 @@ function normalizeMySoAddress(addr: string): string {
     return addr.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
 }
 
-interface OrgDecryptContext {
-    organizationId: string;
-    orgMemoryGroupId: string;
-}
-
 /**
  * Decide whether a decrypt request targets an org-identity blob.
  *
@@ -563,37 +606,6 @@ function resolveOrgDecryptContext(body: {
         return null;
     }
     return { organizationId, orgMemoryGroupId };
-}
-
-/** Append the correct key-policy approval moveCall for one MYDATA id. */
-function addApproveKeyPolicyCall(
-    tx: Transaction,
-    packageId: string,
-    idBytes: number[],
-    accountId: string,
-    orgCtx: OrgDecryptContext | null,
-): void {
-    if (orgCtx) {
-        tx.moveCall({
-            target: `${packageId}::memory::approve_org_key_policy`,
-            arguments: [
-                tx.pure("vector<u8>", idBytes),
-                tx.object(accountId),
-                tx.object(orgCtx.organizationId),
-                tx.object(orgCtx.orgMemoryGroupId),
-                tx.object(MYSO_CLOCK),
-            ],
-        });
-    } else {
-        tx.moveCall({
-            target: `${packageId}::memory::approve_key_policy`,
-            arguments: [
-                tx.pure("vector<u8>", idBytes),
-                tx.object(accountId),
-                tx.object(MYSO_CLOCK),
-            ],
-        });
-    }
 }
 
 // ============================================================
@@ -647,11 +659,11 @@ app.post("/mydata/decrypt", async (req, res) => {
         // approve_org_key_policy (OrgMemoryReader gate); everything else keeps
         // the owner-suffix approve_key_policy path.
         const tx = new Transaction();
-        addApproveKeyPolicyCall(tx, packageId, idBytes, accountId, orgCtx);
+        addApproveKeyPolicyCall(tx, packageId, process.env.MEMORY_CONFIG_ID || "", idBytes, accountId, orgCtx);
         const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
 
         // Fetch keys from key servers
-        await mydataClient.fetchKeys({
+        await (await getMydataClient()).fetchKeys({
             ids: [fullId],
             txBytes,
             sessionKey,
@@ -659,7 +671,7 @@ app.post("/mydata/decrypt", async (req, res) => {
         });
 
         // Decrypt locally
-        const decrypted = await mydataClient.decrypt({
+        const decrypted = await (await getMydataClient()).decrypt({
             data: encryptedData,
             sessionKey,
             txBytes,
@@ -744,12 +756,12 @@ app.post("/mydata/decrypt-batch", express.json({ limit: "8mb" }), async (req, re
             const idBytes = Array.from(
                 Uint8Array.from(id.match(/.{1,2}/g)!.map((b: string) => parseInt(b, 16)))
             );
-            addApproveKeyPolicyCall(tx, packageId, idBytes, accountId, orgCtx);
+            addApproveKeyPolicyCall(tx, packageId, process.env.MEMORY_CONFIG_ID || "", idBytes, accountId, orgCtx);
         }
         const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
 
         // ONE fetchKeys call for ALL IDs
-        await mydataClient.fetchKeys({
+        await (await getMydataClient()).fetchKeys({
             ids: allIds,
             txBytes,
             sessionKey,
@@ -761,7 +773,7 @@ app.post("/mydata/decrypt-batch", express.json({ limit: "8mb" }), async (req, re
 
         for (const item of parsedItems) {
             try {
-                const decrypted = await mydataClient.decrypt({
+                const decrypted = await (await getMydataClient()).decrypt({
                     data: item.encryptedData,
                     sessionKey,
                     txBytes,

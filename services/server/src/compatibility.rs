@@ -79,10 +79,20 @@ pub fn is_compatible_sdk_version(sdk_version: &str) -> bool {
 }
 
 fn feature_flags() -> BTreeMap<String, bool> {
+    let backups = std::env::var("ENABLE_AGENT_KEY_BACKUPS").as_deref() == Ok("true");
+    let tiers: Vec<String> = std::env::var("AGENT_KEY_CUSTODY_TIERS")
+        .unwrap_or_else(|_| crate::types::DEFAULT_AGENT_KEY_CUSTODY_TIERS.to_string())
+        .split(',')
+        .map(|tier| tier.trim().to_string())
+        .collect();
+    let tier = |method: &str| backups && tiers.iter().any(|tier| tier == method);
     BTreeMap::from([
         ("auth.accountBoundNonce".to_string(), true),
         ("auth.platformBoundSignature".to_string(), true),
-        ("agentKeys.passkeyPrfV1".to_string(), std::env::var("ENABLE_AGENT_KEY_BACKUPS").as_deref() == Ok("true")),
+        ("agentKeys.passkeyPrfV1".to_string(), tier("passkey-prf-v1")),
+        ("agentKeys.zkloginRootV1".to_string(), tier("zklogin-root-v1")),
+        ("agentKeys.recoveryCodeV1".to_string(), tier("recovery-code-v1")),
+        ("agentKeys.deviceKeyV1".to_string(), tier("device-key-v1")),
         ("auth.mydataSessionHeader".to_string(), true),
         ("config.publicDeploymentMetadata".to_string(), true),
         ("remember.asyncJobs".to_string(), true),

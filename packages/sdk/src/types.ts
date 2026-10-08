@@ -458,7 +458,7 @@ export interface EnsureAgentMemoryVaultResult {
 }
 
 /** Options for approveKeyPolicy / approveKeyWritePolicy PTB builders */
-export interface ApproveKeyPolicyOpts extends MemoryTxOpts {
+export interface ApproveKeyPolicyOpts extends MemoryConfigTxOpts {
     accountId: string;
     /** MYDATA encryption id (hex string) */
     id: string;

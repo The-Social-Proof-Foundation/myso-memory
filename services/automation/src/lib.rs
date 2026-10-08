@@ -5,11 +5,13 @@ pub mod config;
 pub mod event_bus;
 pub mod executor;
 pub mod handlers;
+pub mod memory_bridge;
 pub mod store;
 pub mod trigger_eval;
 
 pub use config::Config;
 pub use event_bus::EventBus;
+pub use memory_bridge::{MemoryActionConfig, MemoryBridgeClient, MemoryOperation};
 pub use store::AutomationStore;
 
 /// Normalized platform event envelope (transport-agnostic).
@@ -117,6 +119,12 @@ pub struct AutomationJob {
     pub id: uuid::Uuid,
     pub organization_id: String,
     pub account_id: String,
+    /// Wallet address of the MemoryAccount's owner. The AI credit oracle bills
+    /// and applies spend policy by this address, so it is distinct from
+    /// `account_id` (the MemoryAccount object id). Empty on rows created before
+    /// the field existed; such jobs cannot preflight and fail with a clear error.
+    #[serde(default)]
+    pub owner_address: String,
     pub name: String,
     pub enabled: bool,
     pub trigger_set: TriggerSet,

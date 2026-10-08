@@ -394,6 +394,7 @@ mod tests {
             capabilities: 0,
             approval_required_caps: 0,
             max_action_spend: None,
+            expires_at_ms: None,
             platform_scope: None,
             organization_id: None,
             platform_id: None,

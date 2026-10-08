@@ -3,9 +3,13 @@ import {generateRegistrationOptions, verifyRegistrationResponse, generateAuthent
 import {verifyPersonalMessageSignature} from '@socialproof/myso/verify';
 import {MySoJsonRpcClient} from '@socialproof/myso/jsonRpc';
 import {parseZkLoginSignature} from '@socialproof/myso/zklogin';
+/** Purposes a signed owner intent may carry; anything else is rejected before verification. */
+const OWNER_PURPOSES = new Set(['unlock-agent-backups', 'custody-unlock-zklogin-root-v1', 'custody-unlock-recovery-code-v1', 'custody-unlock-device-key-v1']);
 export async function keyBackupOperation(operation: string, input: any) {
     if (operation === 'owner') {
-        if (typeof input.message !== 'string' || !input.message.startsWith('mysocial-key-backup-owner-v1|') || input.message.length > 4096) throw new Error('Invalid owner intent');
+        if (typeof input.message !== 'string' || !/^mysocial-key-backup-owner-v[12]\|/.test(input.message) || input.message.length > 4096) throw new Error('Invalid owner intent');
+        // Ownership intents bind the purpose; custody unlocks must name one of the pinned purposes.
+        if (input.message.startsWith('mysocial-key-backup-owner-v2|') && !OWNER_PURPOSES.has(input.message.split('|')[5])) throw new Error('Invalid owner intent');
         const client = new MySoJsonRpcClient({url: process.env.MYSO_RPC_URL!, network: process.env.MYSO_NETWORK === 'mainnet' ? 'mainnet' : 'testnet'});
         if (Buffer.from(input.signature, 'base64')[0] === 5) {
             const parsed = parseZkLoginSignature(new Uint8Array(Buffer.from(input.signature, 'base64').subarray(1)));

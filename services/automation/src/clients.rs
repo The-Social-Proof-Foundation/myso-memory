@@ -6,7 +6,19 @@ use crate::Config;
 pub struct OracleClient {
     http: reqwest::Client,
     base_url: String,
+    /// Sent as `x-ai-credit-oracle-secret`. The oracle only enforces it when its
+    /// own `AI_CREDIT_ORACLE_API_SECRET` is set, so omitting it is valid only
+    /// against an unauthenticated (dev) oracle.
+    api_secret: Option<String>,
 }
+
+/// Oracle operation every memory action is priced as. Recall embeds the query
+/// and remember embeds the text, which is exactly how the memory relayer
+/// preflights the same calls (`ai_spend::preflight_remember`), so a scheduled
+/// run and an interactive one are charged by the same rule.
+pub const MEMORY_PREFLIGHT_OPERATION: &str = "remember";
+/// Embedding model the relayer prices memory work against.
+pub const MEMORY_PREFLIGHT_MODEL: &str = "text-embedding-3-small";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct PreflightResponse {
@@ -22,9 +34,13 @@ impl OracleClient {
         Self {
             http: reqwest::Client::new(),
             base_url: config.oracle_url.trim_end_matches('/').to_string(),
+            api_secret: config.oracle_api_secret.clone(),
         }
     }
 
+    /// `owner` must be the principal's wallet address (the MemoryAccount's
+    /// owner), not the MemoryAccount object id: the oracle resolves the AI
+    /// credit balance from it.
     pub async fn preflight(
         &self,
         owner: &str,
@@ -35,16 +51,25 @@ impl OracleClient {
         let body = serde_json::json!({
             "owner": owner,
             "agent_object_id": agent_object_id,
+            "operation": MEMORY_PREFLIGHT_OPERATION,
+            "model_id": MEMORY_PREFLIGHT_MODEL,
             "estimated_tokens_in": estimated_tokens_in,
             "estimated_tokens_out": estimated_tokens_out,
         });
-        let resp = self
+        let mut request = self
             .http
             .post(format!("{}/v1/ai-credit/preflight", self.base_url))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+            .json(&body);
+        if let Some(secret) = self.api_secret.as_deref() {
+            request = request.header("x-ai-credit-oracle-secret", secret);
+        }
+        let resp = request.send().await.map_err(|e| e.to_string())?;
+        // The oracle answers 401/422 with a bodyless status, which previously
+        // surfaced as an opaque JSON decode error.
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("oracle preflight returned {status}"));
+        }
         resp.json().await.map_err(|e| e.to_string())
     }
 }
@@ -136,7 +161,7 @@ impl WorkflowClient {
         );
         let payload = serde_json::json!({
             "idempotency_key": idempotency_key,
-            "recipient_address": job.account_id,
+            "recipient_address": if job.owner_address.trim().is_empty() { &job.account_id } else { &job.owner_address },
             "item_type": "task",
             "title": job.name,
             "body": body,
