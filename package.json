@@ -26,6 +26,7 @@
     "db:automation:up": "docker compose -f services/automation/docker-compose.yml up -d",
     "db:automation:down": "docker compose -f services/automation/docker-compose.yml down",
     "test:automation-stack": "pnpm test:bridge && pnpm test:automation",
+    "smoke:live": "tsx services/automation/scripts/live-check.ts",
     "smoke:automation": "tsx services/automation/scripts/smoke.ts",
     "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules services/*/node_modules packages/*/dist services/*/dist",
     "changeset": "changeset",

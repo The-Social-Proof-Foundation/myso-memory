@@ -882,6 +882,22 @@ pub struct AskRequest {
     /// callers are unaffected.
     #[serde(default)]
     pub recall: Option<bool>,
+    /// Recent turns of the conversation, oldest first. Without this each ask is a
+    /// single stateless question and the agent has no idea what was just said.
+    #[serde(default)]
+    pub history: Vec<AskHistoryTurn>,
+    /// Who the agent is: its name, organization, and where it sits in the agent
+    /// hierarchy (who it reports to, who reports to it). Supplied by the caller
+    /// because that structure lives on-chain, not in memory.
+    #[serde(default)]
+    pub agent_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AskHistoryTurn {
+    /// `user` or `assistant`; anything else is treated as `user`.
+    pub role: String,
+    pub content: String,
 }
 
 #[derive(Debug, Serialize)]
