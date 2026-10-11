@@ -83,6 +83,11 @@ pub struct DelegateRecord {
     /// Which bridge MyData key the envelope was encrypted to, so keys can rotate.
     pub mydata_key_id: String,
     pub encrypted_key: String,
+    /// `memory` (read/write memory only) or `task_worker` (memory plus the task market).
+    pub delegate_class: String,
+    /// Registered actions this delegate may run. Empty for `memory`; task actions only for
+    /// `task_worker`. The on-chain capability bits remain the real limit.
+    pub allowed_action_ids: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -92,6 +97,8 @@ pub struct DelegateSummary {
     pub delegate_ref: String,
     pub agent_object_id: String,
     pub mydata_key_id: String,
+    pub delegate_class: String,
+    pub allowed_action_ids: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -101,6 +108,8 @@ impl From<&DelegateRecord> for DelegateSummary {
             delegate_ref: r.delegate_ref.clone(),
             agent_object_id: r.agent_object_id.clone(),
             mydata_key_id: r.mydata_key_id.clone(),
+            delegate_class: r.delegate_class.clone(),
+            allowed_action_ids: r.allowed_action_ids.clone(),
             created_at: r.created_at,
         }
     }
@@ -399,6 +408,7 @@ pub async fn postgres_store(database_url: &str) -> Result<Arc<dyn AutomationStor
         include_str!("../migrations/001_automation.sql"),
         include_str!("../migrations/002_job_owner_address.sql"),
         include_str!("../migrations/003_automation_delegate_keys.sql"),
+        include_str!("../migrations/004_delegate_class.sql"),
     ] {
         for stmt in sql.split(';').filter(|s| !s.trim().is_empty()) {
             sqlx::query(stmt.trim())
@@ -601,12 +611,15 @@ impl AutomationStore for PgStore {
     async fn put_delegate(&self, record: DelegateRecord) -> Result<(), StoreError> {
         sqlx::query(
             r#"INSERT INTO automation_delegate_keys
-               (account_id, delegate_ref, agent_object_id, mydata_key_id, encrypted_key)
-               VALUES ($1,$2,$3,$4,$5)
+               (account_id, delegate_ref, agent_object_id, mydata_key_id, encrypted_key,
+                delegate_class, allowed_action_ids)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
                ON CONFLICT (account_id, delegate_ref) DO UPDATE SET
                    agent_object_id = EXCLUDED.agent_object_id,
                    mydata_key_id = EXCLUDED.mydata_key_id,
                    encrypted_key = EXCLUDED.encrypted_key,
+                   delegate_class = EXCLUDED.delegate_class,
+                   allowed_action_ids = EXCLUDED.allowed_action_ids,
                    created_at = NOW()"#,
         )
         .bind(&record.account_id)
@@ -614,6 +627,8 @@ impl AutomationStore for PgStore {
         .bind(&record.agent_object_id)
         .bind(&record.mydata_key_id)
         .bind(&record.encrypted_key)
+        .bind(&record.delegate_class)
+        .bind(sqlx::types::Json(&record.allowed_action_ids))
         .execute(&self.pool)
         .await
         .map_err(|e| StoreError::Message(e.to_string()))?;
@@ -623,7 +638,8 @@ impl AutomationStore for PgStore {
     async fn list_delegates(&self, account_id: &str) -> Result<Vec<DelegateSummary>, StoreError> {
         // The encrypted column is deliberately not selected.
         let rows = sqlx::query_as::<_, PgDelegateSummary>(
-            r#"SELECT delegate_ref, agent_object_id, mydata_key_id, created_at
+            r#"SELECT delegate_ref, agent_object_id, mydata_key_id, delegate_class,
+                      allowed_action_ids, created_at
                FROM automation_delegate_keys WHERE account_id = $1
                ORDER BY delegate_ref"#,
         )
@@ -637,6 +653,8 @@ impl AutomationStore for PgStore {
                 delegate_ref: r.delegate_ref,
                 agent_object_id: r.agent_object_id,
                 mydata_key_id: r.mydata_key_id,
+                delegate_class: r.delegate_class,
+                allowed_action_ids: r.allowed_action_ids.0,
                 created_at: r.created_at,
             })
             .collect())
@@ -648,7 +666,8 @@ impl AutomationStore for PgStore {
         delegate_ref: &str,
     ) -> Result<Option<DelegateRecord>, StoreError> {
         let row = sqlx::query_as::<_, PgDelegateRecord>(
-            r#"SELECT account_id, delegate_ref, agent_object_id, mydata_key_id, encrypted_key, created_at
+            r#"SELECT account_id, delegate_ref, agent_object_id, mydata_key_id, encrypted_key,
+                      delegate_class, allowed_action_ids, created_at
                FROM automation_delegate_keys WHERE account_id = $1 AND delegate_ref = $2"#,
         )
         .bind(account_id)
@@ -662,6 +681,8 @@ impl AutomationStore for PgStore {
             agent_object_id: r.agent_object_id,
             mydata_key_id: r.mydata_key_id,
             encrypted_key: r.encrypted_key,
+            delegate_class: r.delegate_class,
+            allowed_action_ids: r.allowed_action_ids.0,
             created_at: r.created_at,
         }))
     }
@@ -688,6 +709,8 @@ struct PgDelegateSummary {
     delegate_ref: String,
     agent_object_id: String,
     mydata_key_id: String,
+    delegate_class: String,
+    allowed_action_ids: sqlx::types::Json<Vec<String>>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -698,6 +721,8 @@ struct PgDelegateRecord {
     agent_object_id: String,
     mydata_key_id: String,
     encrypted_key: String,
+    delegate_class: String,
+    allowed_action_ids: sqlx::types::Json<Vec<String>>,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -989,8 +1014,26 @@ mod tests {
             agent_object_id: "0xagent".into(),
             mydata_key_id: "k1".into(),
             encrypted_key: "ciphertext".into(),
+            delegate_class: "memory".into(),
+            allowed_action_ids: Vec::new(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_delegates_class_and_action_allowlist_round_trip() {
+        let store = memory_store();
+        let mut worker = delegate("0xacct-a", "worker");
+        worker.delegate_class = "task_worker".into();
+        worker.allowed_action_ids = vec!["task.accept.v1".into(), "task.deliver.v1".into()];
+        store.put_delegate(worker).await.unwrap();
+
+        let got = store.get_delegate("0xacct-a", "worker").await.unwrap().unwrap();
+        assert_eq!(got.delegate_class, "task_worker");
+        assert_eq!(got.allowed_action_ids, ["task.accept.v1", "task.deliver.v1"]);
+        let listed = store.list_delegates("0xacct-a").await.unwrap();
+        assert_eq!(listed[0].delegate_class, "task_worker");
+        assert_eq!(listed[0].allowed_action_ids.len(), 2);
     }
 
     #[tokio::test]

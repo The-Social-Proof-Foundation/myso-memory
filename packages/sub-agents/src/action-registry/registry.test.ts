@@ -10,6 +10,7 @@ import {
     CAP_POST_PUBLISH,
     CAP_REACT,
     CAP_SOCIAL_GRAPH,
+    CAP_TASK_TRADE,
 } from "../contract.js";
 import { deriveAgentAddress } from "../ptb/organization.js";
 import type { SocialChainConfig } from "../types.js";
@@ -42,6 +43,7 @@ const CHAIN: SocialChainConfig = {
     messagingNamespaceId: "0xb",
     messagingGroupManagerId: "0xc",
     messagingGroupLeaverId: "0xd",
+    taskConfigId: "0xf",
 };
 
 class MockTx {
@@ -126,6 +128,20 @@ test("registry assigns capability and risk policy to every current action", () =
             ["agent.revoke_child.v1", CAP_AGENT_REVOKE, "1B"],
             ["social.delete_post.v1", CAP_POST_PUBLISH, "3"],
             ["social.delete_comment.v1", CAP_COMMENT, "3"],
+            ["task.create.v1", CAP_TASK_TRADE, "1B"],
+            ["task.accept.v1", CAP_TASK_TRADE, "1B"],
+            ["task.decline.v1", CAP_TASK_TRADE, "1B"],
+            ["task.cancel_offer.v1", CAP_TASK_TRADE, "1B"],
+            ["task.deliver.v1", CAP_TASK_TRADE, "1B"],
+            ["task.settle.v1", CAP_TASK_TRADE, "1B"],
+            ["task.refund.v1", CAP_TASK_TRADE, "1B"],
+            ["task.release.v1", CAP_TASK_TRADE, "1B"],
+            ["task.expire_offer.v1", CAP_TASK_TRADE, "1B"],
+            ["task.propose_refund.v1", CAP_TASK_TRADE, "1B"],
+            ["task.accept_refund.v1", CAP_TASK_TRADE, "1B"],
+            ["task.reject_refund.v1", CAP_TASK_TRADE, "1B"],
+            ["task.withdraw_refund.v1", CAP_TASK_TRADE, "1B"],
+            ["task.review.v1", CAP_TASK_TRADE, "1B"],
         ],
     );
 });
@@ -196,9 +212,23 @@ test("registered builders preserve exact Move targets and important arguments", 
             },
             target: "0xe110::messaging::create_agent_and_share_group",
             check(args: unknown[]) {
-                assert.equal(args.length, 14);
+                // 12 inputs + roomKind + roomTaskId + clock.
+                assert.equal(args.length, 16);
                 assertObjectArgument(args[1], "0xb");
             },
+        },
+        {
+            id: "messaging.create_group.v1",
+            input: {
+                name: "task room",
+                uuid: "room-0001",
+                encryptedDekHex: "ab".repeat(32),
+                initialMembers: ["0x123"],
+                roomKind: 1,
+                roomTaskId: "0x7a5c",
+            },
+            target: "0xe110::messaging::create_agent_and_share_group",
+            check(args: unknown[]) { assert.equal(args.length, 16); },
         },
         {
             id: "organization.create.v1",
@@ -385,7 +415,7 @@ test("request and preparation metadata pin idempotency, registry, package, and b
         { postId: "0xpost", reaction: "like" },
         "request-123",
     );
-    assert.equal(request.registryVersion, "1.3.0");
+    assert.equal(request.registryVersion, "1.4.0");
     assert.equal(request.idempotency.scope, "account-agent-action");
     assert.match(request.parameterHash, /^sha256:[a-f0-9]{64}$/);
 
@@ -400,4 +430,191 @@ test("request and preparation metadata pin idempotency, registry, package, and b
     });
     assert.equal(prepared.registryAction, "social.react_to_post.v1");
     assert.equal(prepared.transactionBytesHash.slice(0, 7), "sha256:");
+});
+
+test("messaging room parameters reject an unmapped kind and an unbound task id", () => {
+    const base = {
+        name: "task room",
+        uuid: "room-0002",
+        encryptedDekHex: "ab".repeat(32),
+        initialMembers: ["0x123"],
+    };
+    assert.throws(
+        () => buildRegisteredSocialAction("messaging.create_group.v1", CONTEXT, { ...base, roomKind: 2 }),
+        /roomKind must be 1/,
+    );
+    assert.throws(
+        () =>
+            buildRegisteredSocialAction("messaging.create_group.v1", CONTEXT, {
+                ...base,
+                roomTaskId: "0x7a5c",
+            }),
+        /roomTaskId requires roomKind/,
+    );
+});
+
+const DIGEST_HEX = "ab".repeat(32);
+const DIGEST_BYTES = Array.from({ length: 32 }, () => 0xab);
+
+function buildTask(id: string, input: unknown): { target: string; arguments: unknown[] } {
+    const tx = buildRegisteredSocialAction(id, CONTEXT, input) as MockTx;
+    assert.equal(tx.calls.length, 1);
+    return tx.calls[0]!;
+}
+
+test("task builders mirror the Move entrypoint argument order", () => {
+    const create = buildTask("task.create.v1", {
+        sellerAccountId: "0xsa",
+        sellerAgentId: "0xsag",
+        amountMist: "5000000000",
+        scopeDigestHex: DIGEST_HEX,
+        title: "Translate",
+        acceptWindowMs: "3600000",
+        deliveryWindowMs: "86400000",
+        settleWindowMs: "86400000",
+        paymentCoinId: "0xcoin",
+        roomGroupId: "0xroom",
+    });
+    assert.equal(create.target, "0x50c1::agent_task::create_task");
+    assert.equal(create.arguments.length, 15);
+    assertObjectArgument(create.arguments[0], "0xf");
+    assertObjectArgument(create.arguments[1], "0x7");
+    assertObjectArgument(create.arguments[2], "0xmemory");
+    assertObjectArgument(create.arguments[3], "0xsa");
+    assertObjectArgument(create.arguments[4], "0xsag");
+    assertObjectArgument(create.arguments[5], "0xcoin");
+    assert.deepEqual(create.arguments[6], { kind: "pure", type: "u64", value: "5000000000" });
+    assert.deepEqual(create.arguments[7], { kind: "pure", type: "vector<u8>", value: DIGEST_BYTES });
+    assert.deepEqual(create.arguments[12], { kind: "pure", type: "option<address>", value: "0xroom" });
+    assert.deepEqual(create.arguments[13], { kind: "pure", type: "option<address>", value: null });
+
+    const accept = buildTask("task.accept.v1", {
+        taskId: "0xtask",
+        sellerAgentId: "0xsag",
+        termsDigestHex: DIGEST_HEX,
+    });
+    assert.equal(accept.target, "0x50c1::agent_task::accept_task");
+    assert.equal(accept.arguments.length, 7);
+    assertObjectArgument(accept.arguments[1], "0xtask");
+    assertObjectArgument(accept.arguments[3], "0xmemory");
+    assertObjectArgument(accept.arguments[4], "0xsag");
+
+    const decline = buildTask("task.decline.v1", { taskId: "0xtask", sellerAgentId: "0xsag" });
+    assert.equal(decline.target, "0x50c1::agent_task::decline_task");
+    assert.equal(decline.arguments.length, 5);
+
+    const cancel = buildTask("task.cancel_offer.v1", { taskId: "0xtask" });
+    assert.equal(cancel.target, "0x50c1::agent_task::cancel_offer");
+    assert.equal(cancel.arguments.length, 4);
+    assertObjectArgument(cancel.arguments[2], "0xmemory");
+
+    const deliver = buildTask("task.deliver.v1", {
+        taskId: "0xtask",
+        sellerAgentId: "0xsag",
+        digestHex: DIGEST_HEX,
+        uri: "wal://deliverable",
+    });
+    assert.equal(deliver.target, "0x50c1::agent_task::mark_delivered");
+    assert.equal(deliver.arguments.length, 6);
+    assertPureArgument(deliver.arguments[4], "wal://deliverable");
+
+    const settle = buildTask("task.settle.v1", { taskId: "0xtask", sellerAccountId: "0xsa" });
+    assert.equal(settle.target, "0x50c1::agent_task::settle_task");
+    assert.equal(settle.arguments.length, 7);
+    assertObjectArgument(settle.arguments[3], "0xmemory");
+    assertObjectArgument(settle.arguments[4], "0xsa");
+    assertObjectArgument(settle.arguments[5], "0x3");
+
+    const release = buildTask("task.release.v1", {
+        taskId: "0xtask",
+        buyerAccountId: "0xba",
+        sellerAccountId: "0xsa",
+        platformObjectId: "0xplat",
+    });
+    assert.equal(release.target, "0x50c1::agent_task::release_task");
+    assert.equal(release.arguments.length, 6);
+    assertObjectArgument(release.arguments[4], "0xplat");
+
+    for (const [id, fn] of [
+        ["task.refund.v1", "refund_task"],
+        ["task.expire_offer.v1", "expire_offer"],
+    ] as const) {
+        const call = buildTask(id, { taskId: "0xtask" });
+        assert.equal(call.target, `0x50c1::agent_task::${fn}`);
+        assert.equal(call.arguments.length, 2);
+    }
+
+    for (const [id, fn] of [
+        ["task.propose_refund.v1", "propose_refund"],
+        ["task.accept_refund.v1", "accept_refund"],
+        ["task.reject_refund.v1", "reject_refund"],
+        ["task.withdraw_refund.v1", "withdraw_refund"],
+    ] as const) {
+        const call = buildTask(id, { taskId: "0xtask", buyerAccountId: "0xba", sellerAgentId: "0xsag" });
+        assert.equal(call.target, `0x50c1::agent_task::${fn}`);
+        assert.equal(call.arguments.length, 5);
+        assertObjectArgument(call.arguments[2], "0xba");
+        assertObjectArgument(call.arguments[3], "0xsag");
+    }
+});
+
+test("task.review picks the Move entrypoint from the rater role and buyer shape", () => {
+    const base = { taskId: "0xtask", stars: 5, buyerAccountId: "0xba", sellerAgentId: "0xsag" };
+
+    const seller = buildTask("task.review.v1", { ...base, raterRole: "buyer", sellerAccountId: "0xsa" });
+    assert.equal(seller.target, "0x50c1::agent_task::review_seller");
+    assert.equal(seller.arguments.length, 8);
+    assertObjectArgument(seller.arguments[4], "0xsa");
+    assert.deepEqual(seller.arguments[6], { kind: "pure", type: "u8", value: 5 });
+
+    const agent = buildTask("task.review.v1", { ...base, raterRole: "seller", buyerAgentId: "0xbag" });
+    assert.equal(agent.target, "0x50c1::agent_task::review_buyer_agent");
+    assert.equal(agent.arguments.length, 7);
+    assertObjectArgument(agent.arguments[3], "0xbag");
+
+    const principal = buildTask("task.review.v1", { ...base, raterRole: "seller" });
+    assert.equal(principal.target, "0x50c1::agent_task::review_buyer_principal");
+    assert.equal(principal.arguments.length, 6);
+});
+
+test("task action validation rejects bad digests, stars, roles and a missing task config", () => {
+    const create = getSocialActionDescriptor("task.create.v1");
+    const valid = {
+        sellerAccountId: "0xsa",
+        sellerAgentId: "0xsag",
+        amountMist: "1",
+        scopeDigestHex: DIGEST_HEX,
+        title: "t",
+        acceptWindowMs: "1",
+        deliveryWindowMs: "1",
+        settleWindowMs: "1",
+        paymentCoinId: "0xcoin",
+    };
+    assert.equal(create.validate(valid).success, true);
+    assert.equal(create.validate({ ...valid, moveTarget: "0x1::x::y" }).success, false);
+    assert.throws(() => buildTask("task.create.v1", { ...valid, scopeDigestHex: "zz" }), /scopeDigestHex/);
+    assert.throws(() => buildTask("task.create.v1", { ...valid, amountMist: "0" }), /greater than zero/);
+    assert.throws(() => buildTask("task.create.v1", { ...valid, amountMist: "-1" }), /u64/);
+    assert.throws(
+        () => buildTask("task.create.v1", { ...valid, amountMist: "18446744073709551616" }),
+        /u64/,
+    );
+
+    const review = getSocialActionDescriptor("task.review.v1");
+    const base = { taskId: "0xt", buyerAccountId: "0xba", sellerAgentId: "0xsag" };
+    assert.equal(review.validate({ ...base, raterRole: "buyer", stars: 0, sellerAccountId: "0xsa" }).success, false);
+    assert.equal(review.validate({ ...base, raterRole: "buyer", stars: 6, sellerAccountId: "0xsa" }).success, false);
+    assert.equal(review.validate({ ...base, raterRole: "admin", stars: 3 }).success, false);
+    assert.equal(review.validate({ ...base, raterRole: "buyer", stars: 3 }).success, false);
+    assert.equal(review.validate({ ...base, raterRole: "seller", stars: 3 }).success, true);
+
+    const noConfig = { ...CONTEXT, chain: { ...CHAIN, taskConfigId: undefined } };
+    assert.throws(
+        () => buildRegisteredSocialAction("task.accept.v1", noConfig, {
+            taskId: "0xtask",
+            sellerAgentId: "0xsag",
+            termsDigestHex: DIGEST_HEX,
+        }),
+        /taskConfigId/,
+    );
 });

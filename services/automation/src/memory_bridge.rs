@@ -106,6 +106,17 @@ struct RememberRequest<'a> {
     namespace: Option<&'a str>,
 }
 
+#[derive(Debug, Serialize)]
+struct ChainActRequest<'a> {
+    key_ref: &'a str,
+    /// The job's account; the bridge refuses a delegate that is not registered under it.
+    account_id: &'a str,
+    action_id: &'a str,
+    params: &'a serde_json::Value,
+    /// Stable per (job, event, action) so a retry or a re-delivered event cannot act twice.
+    idempotency_key: &'a str,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecalledMemory {
     pub text: String,
@@ -235,6 +246,30 @@ impl MemoryBridgeClient {
                 text,
                 wait,
                 namespace,
+            },
+        )
+        .await
+    }
+
+    /// Run one registered chain action as the job's delegate. The bridge checks the delegate's
+    /// capabilities, spend cap, expiry and `allowed_action_ids` on every call; a 409 means the
+    /// chain state no longer allows the action.
+    pub async fn chain_act(
+        &self,
+        key_ref: &str,
+        account_id: &str,
+        action_id: &str,
+        params: &serde_json::Value,
+        idempotency_key: &str,
+    ) -> Result<serde_json::Value, BridgeError> {
+        self.post(
+            "/internal/chain/act",
+            &ChainActRequest {
+                key_ref,
+                account_id,
+                action_id,
+                params,
+                idempotency_key,
             },
         )
         .await

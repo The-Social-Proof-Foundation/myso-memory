@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use crate::clients::{AuditClient, OracleClient, WorkflowClient};
 use crate::memory_bridge::{execute_memory_action, BridgeError, MemoryBridgeClient};
+use crate::registered_action::{self, ChainActionResult, PolicyVerdict};
 use crate::store::AutomationStore;
 use crate::trigger_eval::{due_window, event_matches_trigger, trigger_set_should_fire};
+use crate::webhook::{self, Directive, WebhookClient};
 use crate::{
     AutomationJob, PlatformEvent, AUDIT_ACTION_JOB_RUN, AUDIT_ACTION_JOB_SKIP,
     AUDIT_ACTION_TRIGGER_FIRED, RUN_STATUS_FAILED, RUN_STATUS_SKIPPED, RUN_STATUS_SUCCEEDED,
@@ -27,6 +29,7 @@ pub struct RunContext {
     pub store: Arc<dyn AutomationStore>,
     pub oracle: OracleClient,
     pub memory: MemoryBridgeClient,
+    pub webhook: WebhookClient,
     pub workflow: Option<WorkflowClient>,
     pub audit: Option<AuditClient>,
 }
@@ -38,6 +41,43 @@ struct ActionOutcome {
     cost_mist: u64,
     summary: serde_json::Value,
     attempts: u32,
+    /// Set when the action was deliberately not performed (policy, stale event, chain state moved
+    /// on). Recorded as a skipped run rather than a success or a failure.
+    skipped: Option<String>,
+}
+
+impl ActionOutcome {
+    fn skipped(reason: String, attempts: u32) -> Self {
+        Self {
+            cost_mist: 0,
+            summary: serde_json::json!({ "skipped": reason }),
+            attempts,
+            skipped: Some(reason),
+        }
+    }
+
+    fn chain(result: ChainActionResult, attempts: u32, extra: serde_json::Value) -> Self {
+        match result {
+            ChainActionResult::Skipped(reason) => Self::skipped(reason, attempts),
+            ChainActionResult::Executed(mut summary) => {
+                if let (Some(target), Some(extra)) = (summary.as_object_mut(), extra.as_object()) {
+                    target.extend(extra.clone());
+                }
+                Self {
+                    cost_mist: 0,
+                    summary,
+                    attempts,
+                    skipped: None,
+                }
+            }
+        }
+    }
+}
+
+/// Only memory work is priced by the AI-credit oracle. Chain actions are bounded on chain by the
+/// delegate's spend cap, so they skip the preflight and the per-run credit budget.
+fn consumes_ai_credit(job: &AutomationJob) -> bool {
+    matches!(job.action.kind, crate::JobActionKind::MemoryRelayerCall)
 }
 
 impl RunContext {
@@ -148,74 +188,79 @@ impl RunContext {
                 .await;
         }
 
-        let preflight_result = if job.owner_address.trim().is_empty() {
-            Err("job has no owner_address, so the AI credit oracle cannot resolve \
-                 whose balance to charge; recreate the job"
-                .to_string())
-        } else {
-            self.oracle
-                .preflight(&job.owner_address, &job.target_agent_object_id, 1000, 0)
-                .await
-        };
-        let preflight = match preflight_result {
-            Ok(preflight) => preflight,
-            Err(err) => {
-                // An unreachable oracle used to return early via `?`, leaving the
-                // run row stuck in `running` forever with no explanation. Fail it
-                // explicitly instead: a stuck row is indistinguishable from a job
-                // that is still executing.
-                let message = format!("oracle preflight failed: {err}");
-                self.store
-                    .record_run_finish(run_id, RUN_STATUS_FAILED, None, Some(message.clone()), 1)
+        let mut reserved_cost = 0;
+        if consumes_ai_credit(job) {
+            let preflight_result = if job.owner_address.trim().is_empty() {
+                Err("job has no owner_address, so the AI credit oracle cannot resolve \
+                     whose balance to charge; recreate the job"
+                    .to_string())
+            } else {
+                self.oracle
+                    .preflight(&job.owner_address, &job.target_agent_object_id, 1000, 0)
                     .await
-                    .map_err(|e| e.to_string())?;
-                if let Some(audit) = &self.audit {
-                    let _ = audit
-                        .push_entry(
-                            AUDIT_ACTION_JOB_RUN,
-                            &job.target_agent_object_id,
-                            Some(&job.organization_id),
-                            &job.id.to_string(),
-                            serde_json::json!({ "run_id": run_id, "error": message }),
-                        )
-                        .await;
+            };
+            let preflight = match preflight_result {
+                Ok(preflight) => preflight,
+                Err(err) => {
+                    // An unreachable oracle used to return early via `?`, leaving the
+                    // run row stuck in `running` forever with no explanation. Fail it
+                    // explicitly instead: a stuck row is indistinguishable from a job
+                    // that is still executing.
+                    let message = format!("oracle preflight failed: {err}");
+                    self.store
+                        .record_run_finish(run_id, RUN_STATUS_FAILED, None, Some(message.clone()), 1)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if let Some(audit) = &self.audit {
+                        let _ = audit
+                            .push_entry(
+                                AUDIT_ACTION_JOB_RUN,
+                                &job.target_agent_object_id,
+                                Some(&job.organization_id),
+                                &job.id.to_string(),
+                                serde_json::json!({ "run_id": run_id, "error": message }),
+                            )
+                            .await;
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+            };
+
+            if preflight.approval_required || !preflight.allowed {
+                return self
+                    .skip_run(
+                        job,
+                        run_id,
+                        preflight.estimated_mist,
+                        preflight
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "approval_required or insufficient credits".into()),
+                    )
+                    .await;
             }
-        };
 
-        if preflight.approval_required || !preflight.allowed {
-            return self
-                .skip_run(
-                    job,
-                    run_id,
-                    preflight.estimated_mist,
-                    preflight
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| "approval_required or insufficient credits".into()),
-                )
-                .await;
-        }
-
-        // Per-run budget cap. `max_mist_per_run` was previously stored and never
-        // read, which meant a job documented a spending limit it did not honour.
-        if job.max_mist_per_run > 0 {
-            if let Some(estimated) = preflight.estimated_mist {
-                if estimated > job.max_mist_per_run {
-                    return self
-                        .skip_run(
-                            job,
-                            run_id,
-                            Some(estimated),
-                            format!(
-                                "estimated {estimated} mist exceeds the job's max_mist_per_run of {}",
-                                job.max_mist_per_run
-                            ),
-                        )
-                        .await;
+            // Per-run budget cap. `max_mist_per_run` was previously stored and never
+            // read, which meant a job documented a spending limit it did not honour.
+            if job.max_mist_per_run > 0 {
+                if let Some(estimated) = preflight.estimated_mist {
+                    if estimated > job.max_mist_per_run {
+                        return self
+                            .skip_run(
+                                job,
+                                run_id,
+                                Some(estimated),
+                                format!(
+                                    "estimated {estimated} mist exceeds the job's max_mist_per_run of {}",
+                                    job.max_mist_per_run
+                                ),
+                            )
+                            .await;
+                    }
                 }
             }
+
+            reserved_cost = preflight.estimated_mist.unwrap_or(0);
         }
 
         let now = chrono::Utc::now();
@@ -226,14 +271,12 @@ impl RunContext {
             .map_err(|e| e.to_string())?;
         let window = due_window(&job.trigger_set, last_success, now)
             .or_else(|| event.map(|item| format!("event:{}", item.source_event_id)));
-        let reserved_cost = preflight.estimated_mist.unwrap_or(0);
-
         let max_attempts = job.retry_policy.max_attempts.max(1);
         let mut attempts: u32 = 0;
         let outcome = loop {
             attempts += 1;
             match self
-                .execute_action(job, window.as_deref(), reserved_cost, attempts)
+                .execute_action(job, real_event, window.as_deref(), reserved_cost, attempts)
                 .await
             {
                 Ok(outcome) => break Ok(outcome),
@@ -255,6 +298,13 @@ impl RunContext {
         };
 
         match outcome {
+            Ok(outcome) if outcome.skipped.is_some() => {
+                let reason = outcome.skipped.unwrap_or_default();
+                // Policy and staleness skips are the job working as configured, so they are
+                // recorded but not pushed to the owner's inbox: a busy auto-accept job would
+                // otherwise alert on every offer it declined to take.
+                return self.record_skip(job, run_id, None, reason, false).await;
+            }
             Ok(outcome) => {
                 self.store
                     .record_run_finish(
@@ -324,12 +374,23 @@ impl RunContext {
         cost_mist: Option<u64>,
         reason: String,
     ) -> Result<(), String> {
+        self.record_skip(job, run_id, cost_mist, reason, true).await
+    }
+
+    async fn record_skip(
+        &self,
+        job: &AutomationJob,
+        run_id: uuid::Uuid,
+        cost_mist: Option<u64>,
+        reason: String,
+        notify: bool,
+    ) -> Result<(), String> {
         self.store
             .record_run_finish(run_id, RUN_STATUS_SKIPPED, cost_mist, Some(reason.clone()), 1)
             .await
             .map_err(|e| e.to_string())?;
 
-        if let Some(wf) = &self.workflow {
+        if let Some(wf) = self.workflow.as_ref().filter(|_| notify) {
             let key = format!("automation:skip:{}:{}", job.id, run_id);
             let _ = wf
                 .ingest_alert(
@@ -359,6 +420,7 @@ impl RunContext {
     async fn execute_action(
         &self,
         job: &AutomationJob,
+        event: Option<&PlatformEvent>,
         due_window: Option<&str>,
         reserved_cost: u64,
         attempts: u32,
@@ -398,19 +460,70 @@ impl RunContext {
                     cost_mist: reserved_cost,
                     summary: outcome.summary,
                     attempts,
+                    skipped: None,
                 })
             }
-            crate::JobActionKind::SocialAction | crate::JobActionKind::Webhook => {
-                // Still unimplemented. Returned as a non-retryable error so the
-                // run is recorded `failed` rather than as a success that did
-                // nothing — a stub reporting Ok would be a silent lie in the
-                // run history.
-                Err(BridgeError::Invalid {
-                    message: format!(
-                        "{:?} action is not implemented; no client is wired for it",
-                        job.action.kind
-                    ),
-                })
+            crate::JobActionKind::RegisteredAction => {
+                let result = registered_action::execute(
+                    &self.memory,
+                    job,
+                    event,
+                    due_window,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                Ok(ActionOutcome::chain(result, attempts, serde_json::json!({})))
+            }
+            crate::JobActionKind::Webhook => self.execute_webhook(job, event, attempts).await,
+        }
+    }
+
+    /// Ask the endpoint what to do about the event, then run its directive through the bridge.
+    async fn execute_webhook(
+        &self,
+        job: &AutomationJob,
+        event: Option<&PlatformEvent>,
+        attempts: u32,
+    ) -> Result<ActionOutcome, BridgeError> {
+        let invalid = |message: String| BridgeError::Invalid { message };
+        let config = webhook::parse_config(&job.action.config).map_err(invalid)?;
+        webhook::validate_config(&config, self.webhook.allow_private()).map_err(invalid)?;
+        let Some(event) = event else {
+            return Err(invalid("a webhook job must be triggered by an event".into()));
+        };
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Some(reason) = registered_action::stale_reason(&event.payload, now_ms) {
+            return Ok(ActionOutcome::skipped(reason, attempts));
+        }
+        if let PolicyVerdict::Skip(reason) = registered_action::evaluate_policy(&config.policy, &event.payload) {
+            return Ok(ActionOutcome::skipped(reason, attempts));
+        }
+
+        // One delivery id per (job, event): the endpoint can deduplicate on it, and it seeds the
+        // action's idempotency key below.
+        let delivery_id = registered_action::idempotency_key(job.id, Some(event), None, "webhook");
+        match self.webhook.call(&config, job, event, &delivery_id).await? {
+            Directive::Noop(reason) => Ok(ActionOutcome::skipped(
+                reason.unwrap_or_else(|| "the webhook chose not to act".into()),
+                attempts,
+            )),
+            Directive::Act { action_id, params } => {
+                let key = registered_action::idempotency_key(job.id, Some(event), None, &action_id);
+                let result = registered_action::submit(
+                    &self.memory,
+                    job,
+                    config.key_ref.as_deref(),
+                    &action_id,
+                    &params,
+                    &key,
+                )
+                .await?;
+                Ok(ActionOutcome::chain(
+                    result,
+                    attempts,
+                    serde_json::json!({ "webhook_action_id": action_id }),
+                ))
             }
         }
     }
@@ -594,6 +707,33 @@ mod tests {
         tick.event_type = "tick".into();
         assert!(is_tick(&tick));
         assert!(!is_tick(&event_for(None, None)));
+    }
+
+    #[test]
+    fn only_memory_actions_are_priced_by_the_credit_oracle() {
+        let mut job = job_with("0xaaa", "org-1", &[0]);
+        assert!(consumes_ai_credit(&job));
+        job.action.kind = crate::JobActionKind::RegisteredAction;
+        assert!(!consumes_ai_credit(&job));
+        job.action.kind = crate::JobActionKind::Webhook;
+        assert!(!consumes_ai_credit(&job));
+    }
+
+    #[test]
+    fn a_skipped_chain_result_becomes_a_skipped_outcome_not_a_success() {
+        let skipped = ActionOutcome::chain(ChainActionResult::Skipped("already settled".into()), 2, serde_json::json!({}));
+        assert_eq!(skipped.skipped.as_deref(), Some("already settled"));
+        assert_eq!(skipped.attempts, 2);
+        assert_eq!(skipped.cost_mist, 0);
+
+        let done = ActionOutcome::chain(
+            ChainActionResult::Executed(serde_json::json!({ "digest": "abc" })),
+            1,
+            serde_json::json!({ "webhook_action_id": "task.deliver.v1" }),
+        );
+        assert!(done.skipped.is_none());
+        assert_eq!(done.summary["digest"], "abc");
+        assert_eq!(done.summary["webhook_action_id"], "task.deliver.v1");
     }
 
     #[test]

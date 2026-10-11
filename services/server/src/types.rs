@@ -174,6 +174,9 @@ pub struct Config {
     /// Secret presented to the automation engine as `x-internal-sync-secret`.
     /// Falls back to [`Self::internal_sync_secret`] so one value covers the stack.
     pub automation_engine_secret: Option<String>,
+    /// Hosts `webhook` automation jobs may call (`AUTOMATION_WEBHOOK_ALLOWED_HOSTS`, comma
+    /// separated). Empty means any host the job itself allowlists.
+    pub automation_webhook_allowed_hosts: Vec<String>,
     /// GraphQL endpoint used to discover local shared-object IDs after regenesis.
     pub social_chain_graphql_url: Option<String>,
     /// Enables type-based discovery for missing social/messaging object IDs.
@@ -200,6 +203,7 @@ pub struct SocialChainConfig {
     pub memory_config_id: String,
     pub mydata_registry_id: String,
     pub social_graph_id: String,
+    pub task_config_id: String,
     pub messaging_package_id: String,
     pub messaging_version_id: String,
     pub messaging_config_id: String,
@@ -219,6 +223,7 @@ impl SocialChainConfig {
             memory_config_id: std::env::var("MEMORY_CONFIG_ID").unwrap_or_default(),
             mydata_registry_id: std::env::var("MYDATA_REGISTRY_ID").unwrap_or_default(),
             social_graph_id: std::env::var("SOCIAL_GRAPH_ID").unwrap_or_default(),
+            task_config_id: std::env::var("TASK_CONFIG_ID").unwrap_or_default(),
             messaging_package_id: std::env::var("MESSAGING_PACKAGE_ID").unwrap_or_default(),
             messaging_version_id: std::env::var("MESSAGING_VERSION_ID").unwrap_or_default(),
             messaging_config_id: std::env::var("MESSAGING_CONFIG_ID").unwrap_or_default(),
@@ -240,7 +245,7 @@ impl SocialChainConfig {
             && !self.mydata_registry_id.is_empty()
     }
 
-    pub fn env_pairs(&self) -> [(&'static str, &str); 14] {
+    pub fn env_pairs(&self) -> [(&'static str, &str); 15] {
         [
             ("USERNAME_REGISTRY_ID", &self.username_registry_id),
             ("PLATFORM_REGISTRY_ID", &self.platform_registry_id),
@@ -250,6 +255,7 @@ impl SocialChainConfig {
             ("MEMORY_CONFIG_ID", &self.memory_config_id),
             ("MYDATA_REGISTRY_ID", &self.mydata_registry_id),
             ("SOCIAL_GRAPH_ID", &self.social_graph_id),
+            ("TASK_CONFIG_ID", &self.task_config_id),
             ("MESSAGING_PACKAGE_ID", &self.messaging_package_id),
             ("MESSAGING_VERSION_ID", &self.messaging_version_id),
             ("MESSAGING_CONFIG_ID", &self.messaging_config_id),
@@ -405,6 +411,12 @@ impl Config {
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .or_else(|| std::env::var("INTERNAL_SYNC_SECRET").ok()),
+            automation_webhook_allowed_hosts: std::env::var("AUTOMATION_WEBHOOK_ALLOWED_HOSTS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|host| host.trim().to_ascii_lowercase())
+                .filter(|host| !host.is_empty())
+                .collect(),
             social_chain_graphql_url: std::env::var("SOCIAL_CHAIN_GRAPHQL_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -981,6 +993,8 @@ pub struct PublicSocialChainConfig {
     pub mydata_registry_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub social_graph_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub task_config_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub messaging_package_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]

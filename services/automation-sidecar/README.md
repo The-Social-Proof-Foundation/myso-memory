@@ -51,9 +51,36 @@ or lower the limit. See [§13 of the engine README](../automation/README.md#13-s
 | `POST /internal/memory/recall` | `x-internal-sync-secret` | Semantic recall as a delegate. |
 | `POST /internal/memory/remember` | `x-internal-sync-secret` | Store a memory as a delegate. |
 | `POST /internal/memory/probe` | `x-internal-sync-secret` | Check the relayer for a delegate. |
+| `POST /internal/chain/act` | `x-internal-sync-secret` | Run one task market action as a `task_worker` delegate. |
 
 Every `/internal/*` body carries `key_ref` and `account_id`. A ref only resolves for the account
 it belongs to, and a mismatch is indistinguishable from an unknown ref.
+
+### Chain actions (`/internal/chain/act`)
+
+Body: `{ key_ref, account_id, action_id, params, idempotency_key }`. Response: `{ status, action_id, digest }`.
+
+Four gates stand between a request and a signature:
+
+1. `action_id` must be one of the 14 `task.*.v1` actions. Nothing else can be signed, whatever the engine sends.
+2. `key_ref` must be `delegate:<name>`, and that delegate must be a `task_worker` that was registered for
+   that exact action (its `allowed_action_ids`). Static development keys never act on chain.
+3. The chain, through the relayer, must confirm the delegate is active, unexpired, spend-capped, expires within
+   90 days, holds the task market capability and holds nothing beyond memory and the task market.
+4. The relayer re-checks capability, approval-required caps and its action catalog while preparing the transaction.
+
+Nothing is cached: the key is opened, verified and used per request, so revoking or expiring the delegate takes
+effect on the next call. The signing key never appears in a response or a log.
+
+`task.create.v1` escrows funds from a coin the delegate owns, and an event cannot name one. When a job leaves
+`paymentCoinId` out, the bridge lists the delegate's own MYSO coins (`mysox_getCoins`) and uses the smallest single coin
+that covers `amountMist`, or answers 422 `insufficient_funds`. Fund the delegate's address (its derived address, shown by
+the relayer's `/api/agent/context`) before turning on a buying job; the on-chain spend cap still bounds each escrow.
+
+Failures are classified for the engine: **409** the task moved on (the engine records a skipped run), **403** the
+delegate may not do this (including an owner who requires approval for task actions, which an unattended worker
+cannot give), **422** the action was invalid, **502** retry. `idempotency_key` is passed through, so a retry or a
+re-delivered event returns the original result instead of acting twice.
 
 ## Configuration
 

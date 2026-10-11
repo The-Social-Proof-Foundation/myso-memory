@@ -11,6 +11,7 @@
  *   POST /internal/memory/recall    → semantic recall as a resolved agent
  *   POST /internal/memory/remember  → store a memory as a resolved agent
  *   POST /internal/memory/probe     → memory relayer reachability for an agent
+ *   POST /internal/chain/act        → run one task market action as a task_worker delegate
  *
  * Every `/internal/*` route requires `x-internal-sync-secret`, the same header
  * the automation engine and the messaging relayer already use.
@@ -109,7 +110,7 @@ function optionalPositiveInt(body: Record<string, unknown>, field: string): numb
 
 export interface BridgeServerDeps {
     config: SidecarConfig;
-    bridge: Pick<MemoryBridge, "recall" | "remember" | "probe">;
+    bridge: Pick<MemoryBridge, "recall" | "remember" | "probe" | "act">;
     /** Static dev keys, absent in production. Used by /health for a count. */
     store?: Pick<AgentKeyStore, "size">;
     /** Public MyData keys for browsers to encrypt delegate seeds to. Never private halves. */
@@ -207,6 +208,17 @@ export function createBridgeServer(deps: BridgeServerDeps): Server {
                     const result = await bridge.probe({
                         key_ref: requireString(body, "key_ref"),
                         account_id: requireString(body, "account_id"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
+                case "/internal/chain/act": {
+                    const result = await bridge.act({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                        action_id: requireString(body, "action_id"),
+                        params: body.params,
+                        idempotency_key: requireString(body, "idempotency_key"),
                     });
                     sendJson(res, 200, result);
                     return;

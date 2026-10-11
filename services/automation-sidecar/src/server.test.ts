@@ -37,7 +37,11 @@ const fakeBridge = {
         calls.push({ op: "probe", args });
         return { status: "ok", version: "0.0.6", namespace: "chat-app" };
     },
-} satisfies Pick<MemoryBridge, "recall" | "remember" | "probe">;
+    async act(args: { action_id: string }) {
+        calls.push({ op: "act", args });
+        return { status: "executed" as const, action_id: args.action_id, digest: "DIGEST1" };
+    },
+} satisfies Pick<MemoryBridge, "recall" | "remember" | "probe" | "act">;
 
 const config: SidecarConfig = {
     host: "127.0.0.1",
@@ -247,5 +251,42 @@ describe("route wiring", () => {
         const res = await post("/internal/memory/probe", { key_ref: "a", account_id: "0xacct" }, SECRET);
         assert.equal(res.status, 200);
         assert.equal(((await res.json()) as { version: string }).version, "0.0.6");
+    });
+});
+
+describe("POST /internal/chain/act", () => {
+    const body = {
+        key_ref: "delegate:worker",
+        account_id: "0xacct",
+        action_id: "task.accept.v1",
+        params: { taskId: "0xtask" },
+        idempotency_key: "auto:job-1:0123456789abcdef",
+    };
+
+    it("requires the shared secret", async () => {
+        assert.equal((await post("/internal/chain/act", body)).status, 401);
+        assert.equal((await post("/internal/chain/act", body, "wrong")).status, 401);
+    });
+
+    it("forwards the action and returns the digest", async () => {
+        calls.length = 0;
+        const res = await post("/internal/chain/act", body, SECRET);
+        assert.equal(res.status, 200);
+        assert.deepEqual(await res.json(), { status: "executed", action_id: "task.accept.v1", digest: "DIGEST1" });
+        assert.deepEqual(calls, [{ op: "act", args: body }]);
+    });
+
+    it("400s a missing action_id or idempotency_key", async () => {
+        for (const field of ["key_ref", "account_id", "action_id", "idempotency_key"]) {
+            const { [field]: _omitted, ...rest } = body as Record<string, unknown>;
+            const res = await post("/internal/chain/act", rest, SECRET);
+            assert.equal(res.status, 400, field);
+            assert.match(((await res.json()) as { error: string }).error, new RegExp(field));
+        }
+    });
+
+    it("rejects a GET", async () => {
+        const res = await fetch(`${baseUrl}/internal/chain/act`, { headers: { "x-internal-sync-secret": SECRET } });
+        assert.equal(res.status, 405);
     });
 });

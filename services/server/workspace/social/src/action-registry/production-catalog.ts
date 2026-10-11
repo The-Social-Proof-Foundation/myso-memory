@@ -10,10 +10,11 @@ import {
     CAP_POST_PUBLISH,
     CAP_REACT,
     CAP_SOCIAL_GRAPH,
+    CAP_TASK_TRADE,
     CAP_TRADE_EXECUTE,
 } from "../contract.js";
 
-export const PRODUCTION_ACTION_CATALOG_VERSION = "1.3.0" as const;
+export const PRODUCTION_ACTION_CATALOG_VERSION = "1.4.0" as const;
 
 export const TIER_1_ACTION_IDS = Object.freeze([
     "social.react_to_post.v1",
@@ -38,6 +39,20 @@ export const TIER_1_ACTION_IDS = Object.freeze([
     "agent.update_child.v1",
     "agent.deactivate_child.v1",
     "agent.revoke_child.v1",
+    "task.create.v1",
+    "task.accept.v1",
+    "task.decline.v1",
+    "task.cancel_offer.v1",
+    "task.deliver.v1",
+    "task.settle.v1",
+    "task.refund.v1",
+    "task.release.v1",
+    "task.expire_offer.v1",
+    "task.propose_refund.v1",
+    "task.accept_refund.v1",
+    "task.reject_refund.v1",
+    "task.withdraw_refund.v1",
+    "task.review.v1",
 ] as const);
 
 export const TIER_2_ACTION_IDS = Object.freeze([
@@ -157,6 +172,20 @@ const tierOneCapabilities: Readonly<Record<string, number>> = Object.freeze({
     "agent.update_child.v1": CAP_AGENT_UPDATE,
     "agent.deactivate_child.v1": CAP_AGENT_REVOKE,
     "agent.revoke_child.v1": CAP_AGENT_REVOKE,
+    "task.create.v1": CAP_TASK_TRADE,
+    "task.accept.v1": CAP_TASK_TRADE,
+    "task.decline.v1": CAP_TASK_TRADE,
+    "task.cancel_offer.v1": CAP_TASK_TRADE,
+    "task.deliver.v1": CAP_TASK_TRADE,
+    "task.settle.v1": CAP_TASK_TRADE,
+    "task.refund.v1": CAP_TASK_TRADE,
+    "task.release.v1": CAP_TASK_TRADE,
+    "task.expire_offer.v1": CAP_TASK_TRADE,
+    "task.propose_refund.v1": CAP_TASK_TRADE,
+    "task.accept_refund.v1": CAP_TASK_TRADE,
+    "task.reject_refund.v1": CAP_TASK_TRADE,
+    "task.withdraw_refund.v1": CAP_TASK_TRADE,
+    "task.review.v1": CAP_TASK_TRADE,
 });
 
 const tierOneBlockers: Readonly<Record<string, string>> = Object.freeze({});

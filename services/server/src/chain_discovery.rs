@@ -78,6 +78,13 @@ const TARGETS: &[ObjectTarget] = &[
         messaging: false,
     },
     ObjectTarget {
+        alias: "taskConfig",
+        env_name: "TASK_CONFIG_ID",
+        module: "agent_task",
+        struct_name: "TaskConfig",
+        messaging: false,
+    },
+    ObjectTarget {
         alias: "messagingVersion",
         env_name: "MESSAGING_VERSION_ID",
         module: "version",
@@ -316,6 +323,7 @@ fn chain_value<'a>(chain: &'a SocialChainConfig, alias: &str) -> &'a str {
         "memoryConfig" => &chain.memory_config_id,
         "mydataRegistry" => &chain.mydata_registry_id,
         "socialGraph" => &chain.social_graph_id,
+        "taskConfig" => &chain.task_config_id,
         "messagingVersion" => &chain.messaging_version_id,
         "messagingConfig" => &chain.messaging_config_id,
         "messagingNamespace" => &chain.messaging_namespace_id,
@@ -335,6 +343,7 @@ fn set_chain_value(chain: &mut SocialChainConfig, alias: &str, value: String) {
         "memoryConfig" => chain.memory_config_id = value,
         "mydataRegistry" => chain.mydata_registry_id = value,
         "socialGraph" => chain.social_graph_id = value,
+        "taskConfig" => chain.task_config_id = value,
         "messagingVersion" => chain.messaging_version_id = value,
         "messagingConfig" => chain.messaging_config_id = value,
         "messagingNamespace" => chain.messaging_namespace_id = value,
@@ -369,6 +378,7 @@ mod tests {
         let query = discovery_query("0x50c1", "0xe110");
         assert!(query.contains("0x50c1::memory::MemoryConfig"));
         assert!(query.contains("0xe110::messaging::MessagingNamespace"));
+        assert!(query.contains("0x50c1::agent_task::TaskConfig"));
         assert!(query.contains("ownerKind: SHARED"));
         assert!(!query.contains("first: 1"));
     }

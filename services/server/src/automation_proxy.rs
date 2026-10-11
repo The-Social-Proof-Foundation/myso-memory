@@ -232,7 +232,11 @@ pub async fn list_jobs(
         "/v1/automation/jobs?account_id={}&limit={limit}",
         urlencode(&auth.account_id)
     );
-    Ok(Json(engine.get(&path).await?))
+    let mut jobs = engine.get(&path).await?;
+    if let Some(list) = jobs.as_array_mut() {
+        list.iter_mut().for_each(redact_job_secrets);
+    }
+    Ok(Json(jobs))
 }
 
 /// `GET /api/automation/jobs/:id` — one job, if it belongs to the caller.
@@ -242,7 +246,20 @@ pub async fn get_job(
     Path(job_id): Path<String>,
 ) -> Result<Json<Value>, ProxyError> {
     let engine = EngineClient::from_config(&state.config)?;
-    Ok(Json(assert_owned(&engine, &job_id, &auth).await?))
+    let mut job = assert_owned(&engine, &job_id, &auth).await?;
+    redact_job_secrets(&mut job);
+    Ok(Json(job))
+}
+
+/// A webhook job carries its HMAC secret in `action.config`. The owner supplied it, so there is
+/// no reason to ever send it back to a browser.
+fn redact_job_secrets(job: &mut Value) {
+    let Some(config) = job.pointer_mut("/action/config").and_then(Value::as_object_mut) else {
+        return;
+    };
+    if config.remove("secret").is_some() {
+        config.insert("secret_set".into(), Value::Bool(true));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,6 +317,18 @@ pub async fn create_job(
 
     ensure_target_is_caller(&body.target_agent_object_id, &auth.agent_object_id)?;
 
+    let mut trigger_set = body.trigger_set;
+    if is_chain_action(&body.action) {
+        let delegate = find_delegate(&engine, &auth.account_id, &body.target_agent_key_ref).await?;
+        validate_chain_job(
+            &body.action,
+            &mut trigger_set,
+            &auth.account_id,
+            &delegate,
+            &state.config.automation_webhook_allowed_hosts,
+        )?;
+    }
+
     // Ownership is stamped from the verified identity. `account_id`,
     // `owner_address` and `organization_id` are not accepted from the request
     // body at all. `owner_address` is what the AI credit oracle bills against.
@@ -308,7 +337,7 @@ pub async fn create_job(
         "account_id": auth.account_id,
         "owner_address": auth.owner,
         "name": body.name,
-        "trigger_set": body.trigger_set,
+        "trigger_set": trigger_set,
         "target_agent_object_id": body.target_agent_object_id,
         "target_agent_key_ref": body.target_agent_key_ref,
         "action": body.action,
@@ -364,6 +393,10 @@ pub struct PutDelegateBody {
     pub mydata_key_id: String,
     /// The encrypted envelope (base64url). Opaque to this service.
     pub encrypted_key: String,
+    /// `memory` (default) or `task_worker`.
+    pub delegate_class: Option<String>,
+    /// Task actions a `task_worker` may run. Must be empty or absent for `memory`.
+    pub allowed_action_ids: Option<Vec<String>>,
 }
 
 /// `PUT /api/automation/delegates/:ref` — store a encrypted delegate key.
@@ -379,6 +412,9 @@ pub async fn put_delegate(
             "delegate name must be 1-64 characters of letters, digits, '.', '_' or '-'".into(),
         ));
     }
+    let delegate_class = body.delegate_class.clone().unwrap_or_else(|| "memory".into());
+    let allowed_action_ids = body.allowed_action_ids.clone().unwrap_or_default();
+    validate_delegate_class(&delegate_class, &allowed_action_ids)?;
     // `account_id` comes from the verified signature, never the body.
     let payload = serde_json::json!({
         "account_id": auth.account_id,
@@ -386,11 +422,194 @@ pub async fn put_delegate(
         "agent_object_id": body.agent_object_id,
         "mydata_key_id": body.mydata_key_id,
         "encrypted_key": body.encrypted_key,
+        "delegate_class": delegate_class,
+        "allowed_action_ids": allowed_action_ids,
     });
     engine
         .send_no_content(reqwest::Method::PUT, "/v1/automation/delegates", Some(&payload))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Mirrors the engine's rule: a memory delegate runs no chain actions; a task worker runs task
+/// market actions only. The engine and the bridge check it again.
+fn validate_delegate_class(class: &str, allowed_action_ids: &[String]) -> Result<(), ProxyError> {
+    let invalid = |message: &str| Err(ProxyError::InvalidRequest(message.to_string()));
+    match class {
+        "memory" if allowed_action_ids.is_empty() => Ok(()),
+        "memory" => invalid("a memory delegate cannot run chain actions; use the task_worker class"),
+        "task_worker" => {
+            if allowed_action_ids.is_empty() || allowed_action_ids.len() > 16 {
+                return invalid("a task_worker delegate needs 1 to 16 allowed_action_ids");
+            }
+            if allowed_action_ids.iter().any(|id| !is_task_action_id(id)) {
+                return invalid("a task_worker delegate may only be allowed task.* actions");
+            }
+            Ok(())
+        }
+        _ => invalid("unknown delegate_class"),
+    }
+}
+
+/// `task.<name>.v<digits>` with lowercase letters and underscores in the name.
+fn is_task_action_id(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('.').collect();
+    let [namespace, name, version] = parts.as_slice() else {
+        return false;
+    };
+    *namespace == "task"
+        && !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        && version.len() > 1
+        && version.starts_with('v')
+        && version[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// What the proxy needs to know about a stored delegate to authorize a job against it.
+#[derive(Debug, Clone, PartialEq)]
+struct DelegateInfo {
+    agent_object_id: String,
+    class: String,
+    allowed_action_ids: Vec<String>,
+}
+
+fn is_chain_action(action: &Value) -> bool {
+    matches!(
+        action.get("kind").and_then(Value::as_str),
+        Some("registered_action" | "webhook")
+    )
+}
+
+/// Resolve `delegate:<name>` to the caller's own stored delegate. Only that account's rows are
+/// listed, so a job can never be bound to another account's delegate.
+async fn find_delegate(
+    engine: &EngineClient<'_>,
+    account_id: &str,
+    key_ref: &str,
+) -> Result<DelegateInfo, ProxyError> {
+    let name = key_ref.strip_prefix("delegate:").ok_or_else(|| {
+        ProxyError::InvalidRequest("chain actions must use a delegate:<name> key ref".into())
+    })?;
+    let listing = engine
+        .get(&format!(
+            "/v1/automation/delegates?account_id={}",
+            urlencode(account_id)
+        ))
+        .await?;
+    let row = listing
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("delegate_ref").and_then(Value::as_str) == Some(name))
+        })
+        .ok_or_else(|| ProxyError::InvalidRequest(format!("no delegate named `{name}` is registered")))?;
+    Ok(DelegateInfo {
+        agent_object_id: row
+            .get("agent_object_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        class: row
+            .get("delegate_class")
+            .and_then(Value::as_str)
+            .unwrap_or("memory")
+            .to_string(),
+        allowed_action_ids: row
+            .get("allowed_action_ids")
+            .and_then(Value::as_array)
+            .map(|ids| ids.iter().filter_map(|id| id.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// The form the indexer writes object ids in: `0x` and 64 lowercase hex digits. The engine matches
+/// a trigger's account and agent against an event by exact string, so a delegate stored as `0xAB`
+/// would otherwise never fire.
+fn canonical_object_id(id: &str) -> String {
+    let hex = id.trim().trim_start_matches("0x").trim_start_matches("0X").to_ascii_lowercase();
+    format!("0x{hex:0>64}")
+}
+
+fn host_of(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+}
+
+/// Authorize a `registered_action` / `webhook` job and bind its triggers to the delegate.
+///
+/// The job may only name actions the delegate was registered for, may only fire on `task` events,
+/// and its triggers are stamped with the caller's account and the delegate's agent, so an owner
+/// cannot subscribe to another account's events or act outside the delegate's scope.
+fn validate_chain_job(
+    action: &Value,
+    trigger_set: &mut Value,
+    account_id: &str,
+    delegate: &DelegateInfo,
+    webhook_allowed_hosts: &[String],
+) -> Result<(), ProxyError> {
+    let invalid = |message: String| Err(ProxyError::InvalidRequest(message));
+    if delegate.class != "task_worker" {
+        return invalid("chain actions need a task_worker delegate".into());
+    }
+    let config = action.get("config").cloned().unwrap_or(Value::Null);
+    let permitted = |id: &str| delegate.allowed_action_ids.iter().any(|allowed| allowed == id);
+
+    match action.get("kind").and_then(Value::as_str) {
+        Some("registered_action") => {
+            let id = config.get("action_id").and_then(Value::as_str).unwrap_or_default();
+            if !is_task_action_id(id) || !permitted(id) {
+                return invalid(format!("`{id}` is not an action this delegate may run"));
+            }
+        }
+        Some("webhook") => {
+            let ids: Vec<&str> = config
+                .get("allowed_action_ids")
+                .and_then(Value::as_array)
+                .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if ids.is_empty() || ids.iter().any(|id| !is_task_action_id(id) || !permitted(id)) {
+                return invalid(
+                    "webhook allowed_action_ids must be task actions this delegate may run".into(),
+                );
+            }
+            if !webhook_allowed_hosts.is_empty() {
+                let host = config.get("url").and_then(Value::as_str).and_then(host_of);
+                if !host.is_some_and(|host| webhook_allowed_hosts.iter().any(|allowed| *allowed == host)) {
+                    return invalid("the webhook host is not on this deployment's allowlist".into());
+                }
+            }
+        }
+        _ => return invalid("not a chain action".into()),
+    }
+    if let Some(key_ref) = config.get("key_ref") {
+        if !key_ref.is_null() {
+            return invalid("key_ref is set by the job, not its action config".into());
+        }
+    }
+
+    let triggers = trigger_set
+        .get_mut("triggers")
+        .and_then(Value::as_array_mut)
+        .filter(|triggers| !triggers.is_empty())
+        .ok_or_else(|| ProxyError::InvalidRequest("a chain action needs at least one trigger".into()))?;
+    for trigger in triggers.iter_mut() {
+        let is_task_event = trigger.get("kind").and_then(Value::as_str) == Some("event")
+            && trigger.get("event_family").and_then(Value::as_str) == Some("task");
+        if !is_task_event {
+            return invalid("chain action jobs may only use task event triggers".into());
+        }
+        let Some(object) = trigger.as_object_mut() else {
+            return invalid("malformed trigger".into());
+        };
+        object.remove("organization_id");
+        object.insert("account_id".into(), Value::String(canonical_object_id(account_id)));
+        object.insert(
+            "agent_object_id".into(),
+            Value::String(canonical_object_id(&delegate.agent_object_id)),
+        );
+    }
+    Ok(())
 }
 
 /// `GET /api/automation/delegates` — this account's delegates. Metadata only.
@@ -508,6 +727,135 @@ mod tests {
         assert!(ensure_target_is_caller("0xAbC", "0xabc").is_ok());
         assert!(ensure_target_is_caller("0xother", "0xabc").is_err());
         assert!(ensure_target_is_caller("", "0xabc").is_err());
+    }
+
+    fn worker() -> DelegateInfo {
+        DelegateInfo {
+            agent_object_id: "0xagent".into(),
+            class: "task_worker".into(),
+            allowed_action_ids: vec!["task.accept.v1".into(), "task.deliver.v1".into()],
+        }
+    }
+
+    fn task_triggers() -> Value {
+        serde_json::json!({
+            "match_mode": "any",
+            "triggers": [{
+                "kind": "event", "event_family": "task", "event_type": "offered",
+                "organization_id": "0xother-org", "account_id": "0xsomeone-else",
+                "agent_object_id": "0xsomeone-elses-agent",
+            }],
+        })
+    }
+
+    fn accept_action() -> Value {
+        serde_json::json!({ "kind": "registered_action", "config": { "action_id": "task.accept.v1" } })
+    }
+
+    #[test]
+    fn chain_jobs_are_bound_to_the_callers_account_and_delegate() {
+        let mut triggers = task_triggers();
+        validate_chain_job(&accept_action(), &mut triggers, "0xmine", &worker(), &[]).unwrap();
+        let trigger = &triggers["triggers"][0];
+        // The caller cannot subscribe to another account's or agent's events.
+        assert_eq!(trigger["account_id"], canonical_object_id("0xmine"));
+        assert_eq!(trigger["agent_object_id"], canonical_object_id("0xagent"));
+        assert!(trigger.get("organization_id").is_none());
+    }
+
+    #[test]
+    fn trigger_ids_use_the_form_the_indexer_writes() {
+        assert_eq!(canonical_object_id("0xAB"), format!("0x{}ab", "0".repeat(62)));
+        assert_eq!(canonical_object_id("ab"), canonical_object_id("0xAB"));
+        let full = format!("0x{}", "1f".repeat(32));
+        assert_eq!(canonical_object_id(&full.to_uppercase().replace("0X", "0x")), full);
+        assert_eq!(canonical_object_id(&full).len(), 66);
+    }
+
+    #[test]
+    fn chain_jobs_may_only_run_actions_the_delegate_was_registered_for() {
+        let run = |action: Value| validate_chain_job(&action, &mut task_triggers(), "0xmine", &worker(), &[]);
+        assert!(run(accept_action()).is_ok());
+        for id in ["task.settle.v1", "social.create_post.v1", "agent.revoke_child.v1", "0x2::coin::transfer"] {
+            let action = serde_json::json!({ "kind": "registered_action", "config": { "action_id": id } });
+            assert!(run(action).is_err(), "{id}");
+        }
+    }
+
+    #[test]
+    fn chain_jobs_need_a_task_worker_delegate() {
+        let mut memory_only = worker();
+        memory_only.class = "memory".into();
+        assert!(validate_chain_job(&accept_action(), &mut task_triggers(), "0xmine", &memory_only, &[]).is_err());
+    }
+
+    #[test]
+    fn chain_jobs_only_fire_on_task_events() {
+        for bad in [
+            serde_json::json!({ "kind": "event", "event_family": "memory", "event_type": "created" }),
+            serde_json::json!({ "kind": "interval", "event_family": "task", "event_type": "offered", "interval_ms": 1000 }),
+        ] {
+            let mut triggers = serde_json::json!({ "match_mode": "any", "triggers": [bad] });
+            assert!(validate_chain_job(&accept_action(), &mut triggers, "0xmine", &worker(), &[]).is_err());
+        }
+        let mut none = serde_json::json!({ "match_mode": "any", "triggers": [] });
+        assert!(validate_chain_job(&accept_action(), &mut none, "0xmine", &worker(), &[]).is_err());
+    }
+
+    #[test]
+    fn webhook_jobs_are_checked_against_the_delegate_and_the_host_allowlist() {
+        let webhook = |ids: Value, url: &str| {
+            serde_json::json!({ "kind": "webhook", "config": { "url": url, "allowed_action_ids": ids } })
+        };
+        let hosts = vec!["worker.example.com".to_string()];
+        let ok = webhook(serde_json::json!(["task.deliver.v1"]), "https://worker.example.com/hook");
+        assert!(validate_chain_job(&ok, &mut task_triggers(), "0xmine", &worker(), &hosts).is_ok());
+
+        let wider = webhook(serde_json::json!(["task.deliver.v1", "task.settle.v1"]), "https://worker.example.com/hook");
+        assert!(validate_chain_job(&wider, &mut task_triggers(), "0xmine", &worker(), &hosts).is_err());
+        let elsewhere = webhook(serde_json::json!(["task.deliver.v1"]), "https://evil.example.com/hook");
+        assert!(validate_chain_job(&elsewhere, &mut task_triggers(), "0xmine", &worker(), &hosts).is_err());
+        // With no deployment allowlist the engine's per-job allowed_hosts is the only host rule.
+        assert!(validate_chain_job(&elsewhere, &mut task_triggers(), "0xmine", &worker(), &[]).is_ok());
+        let empty = webhook(serde_json::json!([]), "https://worker.example.com/hook");
+        assert!(validate_chain_job(&empty, &mut task_triggers(), "0xmine", &worker(), &[]).is_err());
+    }
+
+    #[test]
+    fn an_action_config_cannot_name_a_different_key_ref() {
+        let action = serde_json::json!({
+            "kind": "registered_action",
+            "config": { "action_id": "task.accept.v1", "key_ref": "delegate:someone-else" },
+        });
+        assert!(validate_chain_job(&action, &mut task_triggers(), "0xmine", &worker(), &[]).is_err());
+    }
+
+    #[test]
+    fn delegate_classes_are_validated_before_they_reach_the_engine() {
+        let ids = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(validate_delegate_class("memory", &[]).is_ok());
+        assert!(validate_delegate_class("memory", &ids(&["task.accept.v1"])).is_err());
+        assert!(validate_delegate_class("task_worker", &ids(&["task.accept.v1"])).is_ok());
+        assert!(validate_delegate_class("task_worker", &[]).is_err());
+        assert!(validate_delegate_class("task_worker", &ids(&["social.create_post.v1"])).is_err());
+        assert!(validate_delegate_class("task_worker", &ids(&["task.accept"])).is_err());
+        assert!(validate_delegate_class("admin", &[]).is_err());
+    }
+
+    #[test]
+    fn the_webhook_secret_is_never_returned_to_the_browser() {
+        let mut job = serde_json::json!({
+            "id": "j1",
+            "action": { "kind": "webhook", "config": { "url": "https://w.example.com/", "secret": "hunter2hunter2hunter2" } },
+        });
+        redact_job_secrets(&mut job);
+        assert!(job["action"]["config"].get("secret").is_none());
+        assert_eq!(job["action"]["config"]["secret_set"], true);
+        assert!(!job.to_string().contains("hunter2"));
+
+        let mut memory = serde_json::json!({ "action": { "kind": "memory_relayer_call", "config": {} } });
+        redact_job_secrets(&mut memory);
+        assert!(memory["action"]["config"].get("secret_set").is_none());
     }
 
     #[test]

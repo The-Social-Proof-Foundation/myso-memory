@@ -8,6 +8,7 @@ import {
     CAP_POST_PUBLISH,
     CAP_REACT,
     CAP_SOCIAL_GRAPH,
+    CAP_TASK_TRADE,
 } from "../contract.js";
 import {
     buildCreateCommentTx,
@@ -52,6 +53,22 @@ import {
     buildUpdateOrganizationMetadataTx,
     validateAgentPolicy,
 } from "../ptb/organization.js";
+import {
+    buildAcceptRefundTx,
+    buildAcceptTaskTx,
+    buildCancelOfferTx,
+    buildCreateTaskTx,
+    buildDeclineTaskTx,
+    buildDeliverTaskTx,
+    buildExpireOfferTx,
+    buildProposeRefundTx,
+    buildRefundTaskTx,
+    buildRejectRefundTx,
+    buildReleaseTaskTx,
+    buildReviewTaskTx,
+    buildSettleTaskTx,
+    buildWithdrawRefundTx,
+} from "../ptb/task.js";
 import type { BuildTxContext } from "../ptb/post.js";
 import { hashActionParameters, isSha256Digest } from "./canonical.js";
 import {
@@ -413,6 +430,8 @@ const createMessagingGroup = defineAction({
         initialMembers: MAX_32_STRINGS,
         crossPrincipalPeerAccountId: NON_EMPTY_STRING,
         platformObjectId: NON_EMPTY_STRING,
+        roomKind: U8,
+        roomTaskId: NON_EMPTY_STRING,
     }),
     idempotency: IDEMPOTENCY_POLICY,
     buildTransaction: buildCreateMessagingGroupTx,
@@ -725,6 +744,217 @@ const deleteComment = defineAction({
         ),
 });
 
+const TASK_ID_PROPERTY = Object.freeze({ taskId: NON_EMPTY_STRING } as const);
+const U64_STRING = NON_EMPTY_STRING;
+const HEX_DIGEST = NON_EMPTY_STRING;
+const STARS = Object.freeze({ type: "integer", minimum: 1, maximum: 5 } as const);
+
+const taskCreate = defineAction({
+    id: "task.create.v1",
+    version: 1,
+    legacyAction: "task_create",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(
+        [
+            "sellerAccountId",
+            "sellerAgentId",
+            "amountMist",
+            "scopeDigestHex",
+            "title",
+            "acceptWindowMs",
+            "deliveryWindowMs",
+            "settleWindowMs",
+            "paymentCoinId",
+        ],
+        {
+            sellerAccountId: NON_EMPTY_STRING,
+            sellerAgentId: NON_EMPTY_STRING,
+            amountMist: U64_STRING,
+            scopeDigestHex: HEX_DIGEST,
+            title: NON_EMPTY_STRING,
+            acceptWindowMs: U64_STRING,
+            deliveryWindowMs: U64_STRING,
+            settleWindowMs: U64_STRING,
+            paymentCoinId: NON_EMPTY_STRING,
+            roomGroupId: NON_EMPTY_STRING,
+            platformId: NON_EMPTY_STRING,
+        },
+    ),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildCreateTaskTx,
+});
+
+const taskAccept = defineAction({
+    id: "task.accept.v1",
+    version: 1,
+    legacyAction: "task_accept",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId", "sellerAgentId", "termsDigestHex"], {
+        ...TASK_ID_PROPERTY,
+        sellerAgentId: NON_EMPTY_STRING,
+        termsDigestHex: HEX_DIGEST,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildAcceptTaskTx,
+});
+
+const taskDecline = defineAction({
+    id: "task.decline.v1",
+    version: 1,
+    legacyAction: "task_decline",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId", "sellerAgentId"], {
+        ...TASK_ID_PROPERTY,
+        sellerAgentId: NON_EMPTY_STRING,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildDeclineTaskTx,
+});
+
+const taskCancelOffer = defineAction({
+    id: "task.cancel_offer.v1",
+    version: 1,
+    legacyAction: "task_cancel_offer",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId"], TASK_ID_PROPERTY),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildCancelOfferTx,
+});
+
+const taskDeliver = defineAction({
+    id: "task.deliver.v1",
+    version: 1,
+    legacyAction: "task_deliver",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId", "sellerAgentId", "digestHex", "uri"], {
+        ...TASK_ID_PROPERTY,
+        sellerAgentId: NON_EMPTY_STRING,
+        digestHex: HEX_DIGEST,
+        uri: NON_EMPTY_STRING,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildDeliverTaskTx,
+});
+
+const taskSettle = defineAction({
+    id: "task.settle.v1",
+    version: 1,
+    legacyAction: "task_settle",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId", "sellerAccountId"], {
+        ...TASK_ID_PROPERTY,
+        sellerAccountId: NON_EMPTY_STRING,
+        platformObjectId: NON_EMPTY_STRING,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildSettleTaskTx,
+});
+
+const taskRefund = defineAction({
+    id: "task.refund.v1",
+    version: 1,
+    legacyAction: "task_refund",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId"], TASK_ID_PROPERTY),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildRefundTaskTx,
+});
+
+const taskRelease = defineAction({
+    id: "task.release.v1",
+    version: 1,
+    legacyAction: "task_release",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId", "buyerAccountId", "sellerAccountId"], {
+        ...TASK_ID_PROPERTY,
+        buyerAccountId: NON_EMPTY_STRING,
+        sellerAccountId: NON_EMPTY_STRING,
+        platformObjectId: NON_EMPTY_STRING,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildReleaseTaskTx,
+});
+
+const taskExpireOffer = defineAction({
+    id: "task.expire_offer.v1",
+    version: 1,
+    legacyAction: "task_expire_offer",
+    requiredCapability: CAP_TASK_TRADE,
+    riskTier: "1B",
+    inputSchema: objectSchema(["taskId"], TASK_ID_PROPERTY),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildExpireOfferTx,
+});
+
+function refundProposalAction<
+    TId extends
+        | "task.propose_refund.v1"
+        | "task.accept_refund.v1"
+        | "task.reject_refund.v1"
+        | "task.withdraw_refund.v1",
+>(
+    id: TId,
+    legacyAction: SocialActionDescriptor<TId>["legacyAction"],
+    buildTransaction: typeof buildProposeRefundTx,
+): SocialActionDescriptor<TId> {
+    return defineAction<TId>({
+        id,
+        version: 1,
+        legacyAction,
+        requiredCapability: CAP_TASK_TRADE,
+        riskTier: "1B",
+        inputSchema: objectSchema(["taskId", "buyerAccountId", "sellerAgentId"], {
+            ...TASK_ID_PROPERTY,
+            buyerAccountId: NON_EMPTY_STRING,
+            sellerAgentId: NON_EMPTY_STRING,
+        }),
+        idempotency: IDEMPOTENCY_POLICY,
+        buildTransaction: buildTransaction as SocialActionDescriptor<TId>["buildTransaction"],
+    });
+}
+
+const taskProposeRefund = refundProposalAction("task.propose_refund.v1", "task_propose_refund", buildProposeRefundTx);
+const taskAcceptRefund = refundProposalAction("task.accept_refund.v1", "task_accept_refund", buildAcceptRefundTx);
+const taskRejectRefund = refundProposalAction("task.reject_refund.v1", "task_reject_refund", buildRejectRefundTx);
+const taskWithdrawRefund = refundProposalAction("task.withdraw_refund.v1", "task_withdraw_refund", buildWithdrawRefundTx);
+
+const taskReview = defineAction(
+    {
+        id: "task.review.v1",
+        version: 1,
+        legacyAction: "task_review",
+        requiredCapability: CAP_TASK_TRADE,
+        riskTier: "1B",
+        inputSchema: objectSchema(["taskId", "raterRole", "stars", "buyerAccountId", "sellerAgentId"], {
+            ...TASK_ID_PROPERTY,
+            raterRole: NON_EMPTY_STRING,
+            stars: STARS,
+            buyerAccountId: NON_EMPTY_STRING,
+            sellerAgentId: NON_EMPTY_STRING,
+            sellerAccountId: NON_EMPTY_STRING,
+            buyerAgentId: NON_EMPTY_STRING,
+        }),
+        idempotency: IDEMPOTENCY_POLICY,
+        buildTransaction: buildReviewTaskTx,
+    },
+    (input) => {
+        if (input.raterRole !== "buyer" && input.raterRole !== "seller") {
+            throw new TypeError("raterRole must be \"buyer\" or \"seller\"");
+        }
+        if (input.raterRole === "buyer" && !input.sellerAccountId) {
+            throw new TypeError("sellerAccountId is required when the buyer rates the seller");
+        }
+    },
+);
+
 export const SOCIAL_ACTION_REGISTRY: SocialActionRegistry = Object.freeze({
     "social.react_to_post.v1": reactToPost,
     "social.remove_post_reaction.v1": removePostReaction,
@@ -760,6 +990,20 @@ export const SOCIAL_ACTION_REGISTRY: SocialActionRegistry = Object.freeze({
     "agent.revoke_child.v1": revokeManagedAgent,
     "social.delete_post.v1": deletePost,
     "social.delete_comment.v1": deleteComment,
+    "task.create.v1": taskCreate,
+    "task.accept.v1": taskAccept,
+    "task.decline.v1": taskDecline,
+    "task.cancel_offer.v1": taskCancelOffer,
+    "task.deliver.v1": taskDeliver,
+    "task.settle.v1": taskSettle,
+    "task.refund.v1": taskRefund,
+    "task.release.v1": taskRelease,
+    "task.expire_offer.v1": taskExpireOffer,
+    "task.propose_refund.v1": taskProposeRefund,
+    "task.accept_refund.v1": taskAcceptRefund,
+    "task.reject_refund.v1": taskRejectRefund,
+    "task.withdraw_refund.v1": taskWithdrawRefund,
+    "task.review.v1": taskReview,
 });
 
 const SOCIAL_ACTION_ID_SET: ReadonlySet<string> = new Set(SOCIAL_ACTION_IDS);

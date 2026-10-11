@@ -26,11 +26,21 @@ import type {
     RegisterChildAgentParams,
     UpdateManagedAgentParams,
     ManagedAgentParams,
+    TaskAcceptParams,
+    TaskCancelOfferParams,
+    TaskCreateParams,
+    TaskDeliverParams,
+    TaskPermissionlessParams,
+    TaskRefundProposalParams,
+    TaskReleaseParams,
+    TaskReviewParams,
+    TaskSellerParams,
+    TaskSettleParams,
     SocialExecuteAction,
 } from "../types.js";
 import type { BuildTxContext } from "../ptb/post.js";
 
-export const SOCIAL_ACTION_REGISTRY_VERSION = "1.3.0" as const;
+export const SOCIAL_ACTION_REGISTRY_VERSION = "1.4.0" as const;
 
 export const SOCIAL_ACTION_IDS = Object.freeze([
     "social.react_to_post.v1",
@@ -67,6 +77,20 @@ export const SOCIAL_ACTION_IDS = Object.freeze([
     "agent.revoke_child.v1",
     "social.delete_post.v1",
     "social.delete_comment.v1",
+    "task.create.v1",
+    "task.accept.v1",
+    "task.decline.v1",
+    "task.cancel_offer.v1",
+    "task.deliver.v1",
+    "task.settle.v1",
+    "task.refund.v1",
+    "task.release.v1",
+    "task.expire_offer.v1",
+    "task.propose_refund.v1",
+    "task.accept_refund.v1",
+    "task.reject_refund.v1",
+    "task.withdraw_refund.v1",
+    "task.review.v1",
 ] as const);
 
 export type SocialActionId = (typeof SOCIAL_ACTION_IDS)[number];
@@ -106,6 +130,20 @@ export interface SocialActionInputMap {
     "agent.revoke_child.v1": ManagedAgentParams;
     "social.delete_post.v1": DeletePostParams;
     "social.delete_comment.v1": DeleteCommentParams;
+    "task.create.v1": TaskCreateParams;
+    "task.accept.v1": TaskAcceptParams;
+    "task.decline.v1": TaskSellerParams;
+    "task.cancel_offer.v1": TaskCancelOfferParams;
+    "task.deliver.v1": TaskDeliverParams;
+    "task.settle.v1": TaskSettleParams;
+    "task.refund.v1": TaskPermissionlessParams;
+    "task.release.v1": TaskReleaseParams;
+    "task.expire_offer.v1": TaskPermissionlessParams;
+    "task.propose_refund.v1": TaskRefundProposalParams;
+    "task.accept_refund.v1": TaskRefundProposalParams;
+    "task.reject_refund.v1": TaskRefundProposalParams;
+    "task.withdraw_refund.v1": TaskRefundProposalParams;
+    "task.review.v1": TaskReviewParams;
 }
 
 export type SocialActionInput<TId extends SocialActionId> =

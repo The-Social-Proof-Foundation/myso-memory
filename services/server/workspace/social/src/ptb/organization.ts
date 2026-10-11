@@ -17,7 +17,10 @@ import type {
     UpdateOrganizationMetadataParams,
 } from "../types.js";
 import type { BuildTxContext } from "./post.js";
-import { MYSO_CLOCK, optString } from "./helpers.js";
+import { MYSO_CLOCK, optAddress, optString, optU8 } from "./helpers.js";
+
+/** `messaging::room_kind_agent_room()`; the only room kind defined on-chain. */
+const AGENT_ROOM_KIND = 1;
 
 const MAX_U64 = (1n << 64n) - 1n;
 const ADDRESS = /^0x[0-9a-fA-F]{1,64}$/;
@@ -344,6 +347,17 @@ export function buildCreateMessagingGroupTx(ctx: BuildTxContext, params: CreateM
     if (encryptedDek.length === 0 || encryptedDek.length > 4096) {
         throw new TypeError("encryptedDekHex must contain between 1 and 4096 bytes");
     }
+    if (params.roomKind !== undefined && params.roomKind !== AGENT_ROOM_KIND) {
+        throw new TypeError("roomKind must be 1 (agent room)");
+    }
+    if (params.roomTaskId !== undefined) {
+        if (params.roomKind === undefined) {
+            throw new TypeError("roomTaskId requires roomKind");
+        }
+        if (!ADDRESS.test(params.roomTaskId)) {
+            throw new TypeError("roomTaskId must be an object id");
+        }
+    }
     const tx = new ctx.Transaction();
     const packageId = requiredChainField(ctx.chain, "messagingPackageId");
     tx.moveCall({
@@ -362,6 +376,9 @@ export function buildCreateMessagingGroupTx(ctx: BuildTxContext, params: CreateM
             tx.pure("string", params.uuid),
             tx.pure("vector<u8>", encryptedDek),
             tx.pure("vector<address>", params.initialMembers),
+            optU8(tx, params.roomKind),
+            // `ID` has the same BCS bytes as an address.
+            optAddress(tx, params.roomTaskId),
             tx.object(ctx.chain.clockId ?? MYSO_CLOCK),
         ],
     });

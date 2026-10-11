@@ -68,4 +68,32 @@ for (const value of [apiVersion, relayerPackageVersion, minTypescript, minMcp]) 
     }
 }
 
+// Capability bits are mirrored by hand in the TypeScript package and the relayer; a drift
+// would silently grant or deny an action, so every TS cap must exist in Rust with the same bit.
+const tsCaps = read("packages/sub-agents/src/contract.ts");
+const rustCaps = read("services/server/src/memory_contract.rs");
+for (const [, name, value] of tsCaps.matchAll(/export const (CAP_[A-Z_]+)\s*=\s*(\d+);/g)) {
+    const rust = rustCaps.match(new RegExp(`pub const ${name}:\\s*u64\\s*=\\s*(\\d+);`));
+    if (!rust) {
+        throw new Error(`${name} is missing from services/server/src/memory_contract.rs`);
+    }
+    assertEqual(`${name} bit`, rust[1], value);
+}
+
+// The registered-action catalog version must match on both sides of prepare/submit.
+const registryVersion = capture(
+    "SOCIAL_ACTION_REGISTRY_VERSION (TypeScript)",
+    read("packages/sub-agents/src/action-registry/types.ts"),
+    /SOCIAL_ACTION_REGISTRY_VERSION\s*=\s*"([^"]+)"/,
+);
+assertEqual(
+    "registered-action registry version",
+    capture(
+        "SOCIAL_ACTION_REGISTRY_VERSION (Rust)",
+        read("services/server/src/routes.rs"),
+        /SOCIAL_ACTION_REGISTRY_VERSION:\s*&str\s*=\s*"([^"]+)"/,
+    ),
+    registryVersion,
+);
+
 console.log("compatibility contract OK");

@@ -8,6 +8,8 @@ export interface SocialChainConfig {
     memoryConfigId: string;
     mydataRegistryId: string;
     socialGraphId?: string;
+    /** Shared `agent_task::TaskConfig`; required by the `task.*` actions. */
+    taskConfigId?: string;
     messagingPackageId?: string;
     messagingVersionId?: string;
     messagingConfigId?: string;
@@ -139,6 +141,10 @@ export interface CreateMessagingGroupParams {
     /** MemoryAccount for a cross-principal agent peer; defaults to the creator account. */
     crossPrincipalPeerAccountId?: string;
     platformObjectId?: string;
+    /** Tags the group as an agent room; only `1` (agent room) exists on-chain. */
+    roomKind?: number;
+    /** Opaque task object id the room is bound to. Requires `roomKind`. */
+    roomTaskId?: string;
 }
 
 export interface CreateOrganizationParams {
@@ -261,6 +267,84 @@ export interface DeletePostParams {
     postId: string;
 }
 
+/** Fields shared by task actions. The acting account is always `BuildTxContext.memoryAccountId`. */
+export interface TaskCreateParams {
+    sellerAccountId: string;
+    sellerAgentId: string;
+    /** u64 decimal string, in MIST. */
+    amountMist: string;
+    /** sha256 of the scope document as 64 lowercase hex characters. */
+    scopeDigestHex: string;
+    title: string;
+    acceptWindowMs: string;
+    deliveryWindowMs: string;
+    settleWindowMs: string;
+    /** MYSO coin object that funds the escrow; its balance must cover `amountMist`. */
+    paymentCoinId: string;
+    roomGroupId?: string;
+    platformId?: string;
+}
+
+export interface TaskAcceptParams {
+    taskId: string;
+    sellerAgentId: string;
+    /** The terms digest the seller verified, 64 lowercase hex characters. */
+    termsDigestHex: string;
+}
+
+export interface TaskSellerParams {
+    taskId: string;
+    sellerAgentId: string;
+}
+
+export interface TaskCancelOfferParams {
+    taskId: string;
+}
+
+export interface TaskPermissionlessParams {
+    taskId: string;
+}
+
+export interface TaskDeliverParams {
+    taskId: string;
+    sellerAgentId: string;
+    /** Deliverable digest as 64 lowercase hex characters. */
+    digestHex: string;
+    uri: string;
+}
+
+export interface TaskSettleParams {
+    taskId: string;
+    sellerAccountId: string;
+    platformObjectId?: string;
+}
+
+export interface TaskReleaseParams {
+    taskId: string;
+    buyerAccountId: string;
+    sellerAccountId: string;
+    platformObjectId?: string;
+}
+
+export interface TaskRefundProposalParams {
+    taskId: string;
+    buyerAccountId: string;
+    sellerAgentId: string;
+}
+
+export interface TaskReviewParams {
+    taskId: string;
+    /** Which side is rating: `buyer` rates the seller agent, `seller` rates the buyer. */
+    raterRole: "buyer" | "seller";
+    stars: number;
+    buyerAccountId: string;
+    sellerAgentId: string;
+    /** Required when the buyer rates (the seller account holds the seller aggregates). */
+    sellerAccountId?: string;
+    /** Required when the seller rates a buyer that bought through an agent. */
+    buyerAgentId?: string;
+}
+
 export interface SocialActionResult {
     digest: string;
     postId?: string;
@@ -305,4 +389,18 @@ export type SocialExecuteAction =
     | "deactivate_managed_agent"
     | "revoke_managed_agent"
     | "delete_post"
-    | "delete_comment";
+    | "delete_comment"
+    | "task_create"
+    | "task_accept"
+    | "task_decline"
+    | "task_cancel_offer"
+    | "task_deliver"
+    | "task_settle"
+    | "task_refund"
+    | "task_release"
+    | "task_expire_offer"
+    | "task_propose_refund"
+    | "task_accept_refund"
+    | "task_reject_refund"
+    | "task_withdraw_refund"
+    | "task_review";

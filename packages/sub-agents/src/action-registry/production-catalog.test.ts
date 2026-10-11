@@ -8,15 +8,16 @@ import {
     TIER_3_ACTION_IDS,
     getProductionActionDescriptor,
 } from "./production-catalog.js";
+import { CAP_TASK_TRADE } from "../contract.js";
 import { isSocialActionId } from "./registry.js";
 
 test("production catalog contains the exact unique organization-control release set", () => {
-    assert.equal(TIER_1_ACTION_IDS.length, 22);
+    assert.equal(TIER_1_ACTION_IDS.length, 36);
     assert.equal(TIER_2_ACTION_IDS.length, 20);
     assert.equal(TIER_3_ACTION_IDS.length, 27);
-    assert.equal(PRODUCTION_ACTION_IDS.length, 69);
-    assert.equal(new Set(PRODUCTION_ACTION_IDS).size, 69);
-    assert.equal(PRODUCTION_ACTION_CATALOG.length, 69);
+    assert.equal(PRODUCTION_ACTION_IDS.length, 83);
+    assert.equal(new Set(PRODUCTION_ACTION_IDS).size, 83);
+    assert.equal(PRODUCTION_ACTION_CATALOG.length, 83);
 });
 
 test("only implemented registry actions are reported as enabled", () => {
@@ -58,5 +59,17 @@ test("approval modes are tier-authoritative", () => {
         if (action.tier === "1") assert.equal(action.approval, "agent-capability");
         if (action.tier === "2") assert.equal(action.approval, "owner-wallet");
         if (action.tier === "3") assert.equal(action.approval, "owner-wallet-and-cosign");
+    }
+});
+
+test("every task action is a tier-1 agent-capability action gated by the task-trade cap", () => {
+    const taskIds = TIER_1_ACTION_IDS.filter((id) => id.startsWith("task."));
+    assert.equal(taskIds.length, 14);
+    for (const id of taskIds) {
+        const action = getProductionActionDescriptor(id);
+        assert.equal(action?.tier, "1", id);
+        assert.equal(action?.approval, "agent-capability", id);
+        assert.equal(action?.requiredCapability, CAP_TASK_TRADE, id);
+        assert.equal(action?.availability, "enabled", id);
     }
 });

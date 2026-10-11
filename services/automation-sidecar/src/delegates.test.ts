@@ -34,11 +34,19 @@ function sourceWith(respond: (url: string, init: RequestInit) => Response) {
     };
 }
 
-function row(seed: Buffer, account: string, ref: string, agent: string, keyId = "k1") {
+function row(
+    seed: Buffer,
+    account: string,
+    ref: string,
+    agent: string,
+    keyId = "k1",
+    extra: Record<string, unknown> = {},
+) {
     return {
         agent_object_id: agent,
         mydata_key_id: keyId,
         encrypted_key: encryptSeed(seed, pair.publicKey, delegateAad(account, ref, agent)),
+        ...extra,
     };
 }
 
@@ -55,6 +63,34 @@ describe("EngineDelegateSource", () => {
             calls[0]?.url,
             "http://engine.internal:8010/v1/automation/delegates/key?account_id=0xacct&delegate_ref=nightly",
         );
+    });
+
+    it("treats a row from an engine without classes as a plain memory delegate", async () => {
+        const { source } = sourceWith(() => Response.json(row(randomBytes(32), "0xacct", "n", "0xagent")));
+        const opened = await source.open("0xacct", "n");
+        assert.equal(opened.delegateClass, "memory");
+        assert.deepEqual(opened.allowedActionIds, []);
+    });
+
+    it("reads a task worker's class and action allowlist", async () => {
+        const extra = { delegate_class: "task_worker", allowed_action_ids: ["task.accept.v1", "task.deliver.v1"] };
+        const { source } = sourceWith(() => Response.json(row(randomBytes(32), "0xacct", "n", "0xagent", "k1", extra)));
+        const opened = await source.open("0xacct", "n");
+        assert.equal(opened.delegateClass, "task_worker");
+        assert.deepEqual(opened.allowedActionIds, ["task.accept.v1", "task.deliver.v1"]);
+    });
+
+    it("refuses a row with an unknown class or a malformed action list", async () => {
+        for (const extra of [
+            { delegate_class: "root" },
+            { delegate_class: "task_worker", allowed_action_ids: "task.accept.v1" },
+            { delegate_class: "task_worker", allowed_action_ids: [1, 2] },
+        ]) {
+            const { source } = sourceWith(() => Response.json(row(randomBytes(32), "0xacct", "n", "0xagent", "k1", extra)));
+            const err = await source.open("0xacct", "n").catch((e: unknown) => e as BridgeError);
+            assert.ok(err instanceof BridgeError);
+            assert.equal(err.code, "delegate_unreadable", JSON.stringify(extra));
+        }
     });
 
     it("hits the engine on every open, so a deleted row stops working at once", async () => {

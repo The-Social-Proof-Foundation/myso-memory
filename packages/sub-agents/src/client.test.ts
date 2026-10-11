@@ -124,7 +124,7 @@ test("registered action preparation is authenticated, idempotent, and locally si
             return new Response(
                 JSON.stringify({
                     registryAction: body.registryAction,
-                    registryVersion: "1.3.0",
+                    registryVersion: "1.4.0",
                     idempotencyKey: body.idempotencyKey,
                     bytes: Buffer.from(Uint8Array.from({ length: 48 }, (_, index) => index + 1)).toString("base64"),
                     digest,
@@ -192,7 +192,7 @@ test("Tier 3 delete uses personal-message approval and owner wallet transaction 
         if (path === "/api/chain/approvals/request") {
             const body = JSON.parse(String(init?.body));
             return new Response(JSON.stringify({
-                approvalId, registryAction: body.registryAction, registryVersion: "1.3.0",
+                approvalId, registryAction: body.registryAction, registryVersion: "1.4.0",
                 idempotencyKey: body.idempotencyKey, parameterHash: `sha256:${"3".repeat(64)}`,
                 approvalIntent: `mysocial-action-approval-v1|${approvalId}|binding`, status: "pending",
                 expiresAtMs: Date.now() + 600_000,
@@ -206,7 +206,7 @@ test("Tier 3 delete uses personal-message approval and owner wallet transaction 
             const body = JSON.parse(String(init?.body));
             assert.equal(body.approvalId, approvalId);
             return new Response(JSON.stringify({
-                registryAction: body.registryAction, registryVersion: "1.3.0",
+                registryAction: body.registryAction, registryVersion: "1.4.0",
                 idempotencyKey: body.idempotencyKey,
                 bytes: Buffer.from(new Uint8Array(48).fill(7)).toString("base64"),
                 digest, expiresAtMs: Date.now() + 300_000,
@@ -237,4 +237,101 @@ test("Tier 3 delete uses personal-message approval and owner wallet transaction 
         `/api/chain/approvals/${approvalId}/approve`, "/api/chain/actions/prepare",
         "/api/chain/actions/submit",
     ]);
+});
+
+test("executeAction rejects unknown ids before any request", async () => {
+    let called = false;
+    globalThis.fetch = (async () => {
+        called = true;
+        return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    await assert.rejects(
+        client().executeAction("0x2::coin::transfer", {}),
+        /Unsupported social action/,
+    );
+    await assert.rejects(client().executeAction("task.steal_escrow.v1", {}), /Unsupported social action/);
+    assert.equal(called, false);
+});
+
+test("a task action runs through the same prepare, local signature and submit path", async () => {
+    const { Ed25519Keypair } = await import("@socialproof/myso/keypairs/ed25519");
+    const signer = Ed25519Keypair.fromSecretKey(Uint8Array.from(Buffer.from(SUB_AGENT_KEY, "hex")));
+    const digest = "4".repeat(43);
+    const paths: string[] = [];
+    let prepared: Record<string, unknown> = {};
+    const chain = {
+        packageId: "0x50c1", usernameRegistryId: "0x1", platformRegistryId: "0x2",
+        platformObjectId: "0x3", blockListRegistryId: "0x4", postConfigId: "0x5",
+        memoryConfigId: "0x6", mydataRegistryId: "0x7", clockId: "0x6", taskConfigId: "0x8",
+    };
+    globalThis.fetch = (async (input, init) => {
+        const path = new URL(String(input)).pathname;
+        paths.push(path);
+        if (path === "/config") {
+            return new Response(JSON.stringify({ network: "localnet", mysoRpcUrl: "http://127.0.0.1:9000", socialChain: chain }));
+        }
+        if (path === "/api/agent/context") {
+            return new Response(JSON.stringify({
+                memoryAccountId: "0xabc", derivedAddress: signer.toMySoAddress(),
+                capabilities: 131072, approvalRequiredCapabilities: 0, platformScope: null,
+                network: "localnet", rpcUrl: "http://127.0.0.1:9000", packageId: "0x50c1",
+                socialChain: chain, permittedRegistryActions: ["task.accept.v1"],
+            }));
+        }
+        if (path === "/api/chain/actions/prepare") {
+            prepared = JSON.parse(String(init?.body));
+            return new Response(JSON.stringify({
+                registryAction: prepared.registryAction, registryVersion: "1.4.0",
+                idempotencyKey: prepared.idempotencyKey,
+                bytes: Buffer.from(new Uint8Array(48).fill(9)).toString("base64"),
+                digest, expiresAtMs: Date.now() + 300_000,
+            }));
+        }
+        if (path === "/api/chain/actions/submit") {
+            return new Response(JSON.stringify({ digest }));
+        }
+        return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const params = { taskId: "0xtask", sellerAgentId: "0xagent", termsDigestHex: "ab".repeat(32) };
+    const result = await client().executeAction("task.accept.v1", params, {
+        idempotencyKey: "auto:job:0123456789abcdef",
+    });
+    assert.equal(result.digest, digest);
+    assert.equal(prepared.registryAction, "task.accept.v1");
+    assert.equal(prepared.idempotencyKey, "auto:job:0123456789abcdef");
+    assert.deepEqual(prepared.parameters, params);
+    assert.deepEqual(paths, [
+        "/config", "/api/agent/context", "/api/chain/actions/prepare", "/api/chain/actions/submit",
+    ]);
+});
+
+test("a delegate without the task-trade capability cannot run a task action", async () => {
+    const { Ed25519Keypair } = await import("@socialproof/myso/keypairs/ed25519");
+    const signer = Ed25519Keypair.fromSecretKey(Uint8Array.from(Buffer.from(SUB_AGENT_KEY, "hex")));
+    const chain = {
+        packageId: "0x50c1", usernameRegistryId: "0x1", platformRegistryId: "0x2",
+        platformObjectId: "0x3", blockListRegistryId: "0x4", postConfigId: "0x5",
+        memoryConfigId: "0x6", mydataRegistryId: "0x7", clockId: "0x6",
+    };
+    const paths: string[] = [];
+    globalThis.fetch = (async (input) => {
+        const path = new URL(String(input)).pathname;
+        paths.push(path);
+        if (path === "/config") {
+            return new Response(JSON.stringify({ network: "localnet", mysoRpcUrl: "http://127.0.0.1:9000", socialChain: chain }));
+        }
+        return new Response(JSON.stringify({
+            memoryAccountId: "0xabc", derivedAddress: signer.toMySoAddress(), capabilities: 7,
+            approvalRequiredCapabilities: 0, platformScope: null, network: "localnet",
+            rpcUrl: "http://127.0.0.1:9000", packageId: "0x50c1", socialChain: chain,
+        }));
+    }) as typeof fetch;
+
+    await assert.rejects(
+        client().executeAction("task.settle.v1", { taskId: "0xt", sellerAccountId: "0xs" }),
+        /lacks capability/,
+    );
+    assert.ok(!paths.includes("/api/chain/actions/prepare"));
 });

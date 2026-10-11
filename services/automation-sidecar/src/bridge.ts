@@ -15,12 +15,18 @@
 import { createHash } from "node:crypto";
 
 import { Memory } from "@socialproof/memory";
+import { SOCIAL_ACTION_IDS, SocialClient } from "@socialproof/sub-agents";
 
 import { BridgeError } from "./bridge-error.js";
 import { normalizeObjectId } from "./ids.js";
 import { DELEGATE_REF_PREFIX, type DelegateSource } from "./delegates.js";
 import type { AgentKeyStore, ResolvedAgentKey } from "./keys.js";
-import { NEEDS_RECALL, NEEDS_REMEMBER, type DelegateVerifier } from "./verify.js";
+import {
+    CAP_TASK_TRADE,
+    NEEDS_RECALL,
+    NEEDS_REMEMBER,
+    type DelegateVerifier,
+} from "./verify.js";
 
 export { BridgeError, normalizeObjectId };
 
@@ -83,6 +89,50 @@ export interface ProbeResponse {
     namespace: string;
 }
 
+/** Task market actions are the only chain actions the bridge will run for a delegate. */
+export const TASK_ACTION_IDS: ReadonlySet<string> = new Set(
+    SOCIAL_ACTION_IDS.filter((id) => id.startsWith("task.")),
+);
+
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:/-]{8,128}$/;
+const MAX_ACTION_PARAMS_BYTES = 32 * 1024;
+
+export interface ChainActRequest {
+    key_ref: string;
+    /** MemoryAccount the delegate acts for. */
+    account_id: string;
+    action_id: string;
+    params: unknown;
+    /** Stable per (job, event, action): a retry or a re-delivered event must not act twice. */
+    idempotency_key: string;
+}
+
+export interface ChainActResponse {
+    status: "executed";
+    action_id: string;
+    digest: string;
+}
+
+/** The slice of `SocialClient` the bridge uses, so tests need no network or chain. */
+export interface ChainClient {
+    executeAction(
+        actionId: string,
+        params: unknown,
+        options: { idempotencyKey: string },
+    ): Promise<{ digest: string }>;
+}
+
+export interface ChainClientTarget {
+    seedHex: string;
+    accountId: string;
+    serverUrl: string;
+}
+
+interface CoinRecord {
+    coinObjectId: string;
+    balance: string;
+}
+
 export interface MemoryBridgeOptions {
     /**
      * Static key file/variable. Development only: it holds plaintext seeds, so
@@ -102,6 +152,8 @@ export interface MemoryBridgeOptions {
     eventsSecret?: string;
     /** Injectable for tests. */
     createClient?: (agent: ResolvedAgentKey) => Memory;
+    /** Injectable for tests. Built per call and never cached: a chain client holds the signing key. */
+    createChainClient?: (target: ChainClientTarget) => ChainClient;
     fetchImpl?: typeof fetch;
 }
 
@@ -134,6 +186,14 @@ function defaultCreateClient(agent: ResolvedAgentKey): Memory {
     });
 }
 
+function defaultCreateChainClient(target: ChainClientTarget): ChainClient {
+    return SocialClient.create({
+        key: target.seedHex,
+        accountId: target.accountId,
+        serverUrl: target.serverUrl,
+    });
+}
+
 export class MemoryBridge {
     /**
      * One client per (key_ref, key, serverUrl, namespace). The SDK caches MYDATA
@@ -146,10 +206,12 @@ export class MemoryBridge {
      */
     private readonly clients = new Map<string, Memory>();
     private readonly createClient: (agent: ResolvedAgentKey) => Memory;
+    private readonly createChainClient: (target: ChainClientTarget) => ChainClient;
     private readonly fetchImpl: typeof fetch;
 
     constructor(private readonly opts: MemoryBridgeOptions) {
         this.createClient = opts.createClient ?? defaultCreateClient;
+        this.createChainClient = opts.createChainClient ?? defaultCreateChainClient;
         this.fetchImpl = opts.fetchImpl ?? fetch;
     }
 
@@ -217,6 +279,11 @@ export class MemoryBridge {
                 accountId,
                 agentObjectId: opened.agentObjectId,
                 needs,
+                // Only a non-default class is passed, so a plain memory delegate is verified
+                // exactly as before.
+                ...(opened.delegateClass && opened.delegateClass !== "memory"
+                    ? { delegateClass: opened.delegateClass }
+                    : {}),
             });
         } else {
             if (!this.opts.store) throw unknown();
@@ -305,6 +372,159 @@ export class MemoryBridge {
         }
     }
 
+    /**
+     * Run one task market action as a `task_worker` delegate.
+     *
+     * Four independent gates stand between a request and a signature, and any one failing is
+     * enough: the action must be a task action; the delegate must be a `task_worker` that was
+     * registered for that exact action; the chain must confirm it is active, unexpired,
+     * spend-capped and holds the task-trade capability and nothing beyond the class; and the
+     * relayer re-checks capability, approval-required caps and the action catalog when it
+     * prepares the transaction. Nothing is cached: revoking or expiring the delegate takes
+     * effect on the next call.
+     */
+    async act(req: ChainActRequest): Promise<ChainActResponse> {
+        if (!TASK_ACTION_IDS.has(req.action_id)) {
+            throw new BridgeError(
+                `${JSON.stringify(req.action_id)} is not a task market action`,
+                403,
+                "action_not_allowed",
+            );
+        }
+        if (typeof req.idempotency_key !== "string" || !IDEMPOTENCY_KEY.test(req.idempotency_key)) {
+            throw new BridgeError(
+                "idempotency_key must be 8-128 URL-safe characters",
+                400,
+                "invalid_request",
+            );
+        }
+        if (!req.params || typeof req.params !== "object" || Array.isArray(req.params)) {
+            throw new BridgeError("params must be a JSON object", 400, "invalid_request");
+        }
+        if (Buffer.byteLength(JSON.stringify(req.params)) > MAX_ACTION_PARAMS_BYTES) {
+            throw new BridgeError(
+                `params exceed ${MAX_ACTION_PARAMS_BYTES} bytes`,
+                413,
+                "payload_too_large",
+            );
+        }
+        if (!req.key_ref.startsWith(DELEGATE_REF_PREFIX)) {
+            throw new BridgeError(
+                "chain actions can only be signed by a delegate:<name> key",
+                403,
+                "chain_requires_delegate",
+            );
+        }
+
+        const { delegates, verifier, delegateDefaults } = this.opts;
+        if (!delegates || !verifier || !delegateDefaults?.serverUrl) {
+            throw new BridgeError(
+                `unknown agent key ref ${JSON.stringify(req.key_ref)}`,
+                404,
+                "key_store:unknown_ref",
+            );
+        }
+        const opened = await delegates.open(req.account_id, req.key_ref.slice(DELEGATE_REF_PREFIX.length));
+        if (opened.delegateClass !== "task_worker") {
+            throw new BridgeError(
+                "this delegate is not a task worker; register one with the task_worker class",
+                403,
+                "delegate_wrong_class",
+            );
+        }
+        if (!opened.allowedActionIds.includes(req.action_id)) {
+            throw new BridgeError(
+                `this delegate was not registered to run ${req.action_id}`,
+                403,
+                "action_not_allowed",
+            );
+        }
+        const context = await verifier.verify({
+            seedHex: opened.seedHex,
+            serverUrl: delegateDefaults.serverUrl,
+            accountId: req.account_id,
+            agentObjectId: opened.agentObjectId,
+            needs: CAP_TASK_TRADE,
+            delegateClass: "task_worker",
+        });
+
+        const params = await this.withPaymentCoin(req.action_id, req.params as Record<string, unknown>, context);
+        const client = this.createChainClient({
+            seedHex: opened.seedHex,
+            accountId: req.account_id,
+            serverUrl: delegateDefaults.serverUrl,
+        });
+        try {
+            const result = await client.executeAction(req.action_id, params, {
+                idempotencyKey: req.idempotency_key,
+            });
+            return { status: "executed", action_id: req.action_id, digest: result.digest };
+        } catch (err) {
+            throw wrapChainError(err, req.action_id);
+        }
+    }
+
+    /**
+     * `task.create.v1` escrows funds from a coin the delegate owns, and an event cannot name one.
+     * When the job leaves `paymentCoinId` out, pick the smallest MYSO coin at the delegate's own
+     * address that covers the amount. The delegate's spend cap still bounds the escrow on chain.
+     * The choice is deterministic, so a retry of an unsubmitted action picks the same coin.
+     */
+    private async withPaymentCoin(
+        actionId: string,
+        params: Record<string, unknown>,
+        context: { derivedAddress?: string | null; rpcUrl?: string | null },
+    ): Promise<Record<string, unknown>> {
+        if (actionId !== "task.create.v1" || params.paymentCoinId !== undefined) return params;
+
+        const amountText = params.amountMist;
+        if (typeof amountText !== "string" || !/^[1-9][0-9]{0,19}$/.test(amountText)) {
+            throw new BridgeError("amountMist must be a positive decimal string", 400, "invalid_request");
+        }
+        const amount = BigInt(amountText);
+        if (!context.derivedAddress || !context.rpcUrl) {
+            throw new BridgeError(
+                "this relayer does not report the delegate's address, so a payment coin cannot be chosen; name one with paymentCoinId",
+                422,
+                "payment_coin_required",
+            );
+        }
+
+        let coins: CoinRecord[];
+        try {
+            const res = await this.fetchImpl(context.rpcUrl, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    jsonrpc: "2.0",
+                    id: 1,
+                    method: "mysox_getCoins",
+                    params: [context.derivedAddress, "0x2::myso::MYSO", null, 50],
+                }),
+                signal: AbortSignal.timeout(this.opts.requestTimeoutMs),
+            });
+            const body = (await res.json()) as { result?: { data?: CoinRecord[] } };
+            coins = body.result?.data ?? [];
+        } catch {
+            throw new BridgeError("could not list the delegate's coins", 502, "relayer_unavailable");
+        }
+
+        const best = coins
+            .filter((coin) => /^[0-9]+$/.test(coin.balance) && BigInt(coin.balance) >= amount)
+            .sort((a, b) => {
+                const diff = BigInt(a.balance) - BigInt(b.balance);
+                return diff < 0n ? -1 : diff > 0n ? 1 : a.coinObjectId.localeCompare(b.coinObjectId);
+            })[0];
+        if (!best) {
+            throw new BridgeError(
+                `the delegate's address holds no single MYSO coin of at least ${amountText} MIST; fund it first`,
+                422,
+                "insufficient_funds",
+            );
+        }
+        return { ...params, paymentCoinId: best.coinObjectId };
+    }
+
     async probe(req: ProbeRequest): Promise<ProbeResponse> {
         const agent = await this.resolve(req.key_ref, req.account_id, 0);
         const client = this.client(agent, req.key_ref, agent.namespace);
@@ -384,4 +604,39 @@ function wrapSdkError(err: unknown, op: string): BridgeError {
         return new BridgeError(`${op} rejected by memory relayer: ${message}`, status, "relayer_rejected");
     }
     return new BridgeError(`${op} failed: ${message}`, 502, "relayer_unavailable");
+}
+
+/**
+ * Map a failed chain action onto the status the engine acts on: 409 means the task moved on and
+ * the run is skipped, other 4xx are the caller's to fix and are never retried, and anything else
+ * is an outage and retries. The relayer's own status is read from the SDK's error message.
+ */
+export function wrapChainError(err: unknown, actionId: string): BridgeError {
+    if (err instanceof BridgeError) return err;
+    const message = err instanceof Error ? err.message : String(err);
+    const status = Number(/\((\d{3})\)/.exec(message)?.[1] ?? 0);
+
+    if (/lacks capability/i.test(message)) {
+        return new BridgeError(`${actionId}: the delegate lacks the capability it needs`, 403, "delegate_missing_capability");
+    }
+    if (/wallet approval|owner wallet|approval required/i.test(message)) {
+        return new BridgeError(
+            `${actionId} needs the owner's approval, which an unattended worker cannot give`,
+            403,
+            "approval_required",
+        );
+    }
+    if (/not present in the authenticated action catalog|outside the agent platform scope/i.test(message)) {
+        return new BridgeError(`${actionId} is not permitted for this delegate`, 403, "action_not_allowed");
+    }
+    if (status === 409) {
+        return new BridgeError(`${actionId}: ${message}`, 409, "chain_state");
+    }
+    if (status === 401 || status === 403) {
+        return new BridgeError(`${actionId} was refused by the relayer`, 403, "delegate_rejected");
+    }
+    if (status >= 400 && status < 500 && status !== 429) {
+        return new BridgeError(`${actionId} was rejected: ${message}`, 422, "action_invalid");
+    }
+    return new BridgeError(`${actionId} failed: ${message}`, 502, "relayer_unavailable");
 }

@@ -16,6 +16,7 @@
 import { BridgeError } from "./bridge-error.js";
 import { normalizeObjectId } from "./ids.js";
 import { DelegateCryptoError, MyDataKeyRing, delegateAad } from "./delegate-crypto.js";
+import type { DelegateClass } from "./verify.js";
 
 /** `delegate:<name>` in a job's `target_agent_key_ref` selects this path. */
 export const DELEGATE_REF_PREFIX = "delegate:";
@@ -25,6 +26,10 @@ export interface OpenedDelegate {
     seedHex: string;
     /** The on-chain SubAgent object this key is registered as. */
     agentObjectId: string;
+    /** `memory` unless the owner registered the delegate for the task market. */
+    delegateClass: DelegateClass;
+    /** Registered actions this delegate may run; always empty for `memory`. */
+    allowedActionIds: readonly string[];
 }
 
 export interface DelegateSource {
@@ -35,6 +40,23 @@ interface EncryptedRow {
     agent_object_id: string;
     mydata_key_id: string;
     encrypted_key: string;
+    /** Absent on an engine that predates delegate classes, which means `memory`. */
+    delegate_class?: string;
+    allowed_action_ids?: unknown;
+}
+
+function parseDelegateClass(value: unknown): DelegateClass {
+    if (value === undefined || value === "memory") return "memory";
+    if (value === "task_worker") return "task_worker";
+    throw new BridgeError("the stored delegate has an unknown class", 409, "delegate_unreadable");
+}
+
+function parseActionIds(value: unknown): string[] {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.some((id) => typeof id !== "string")) {
+        throw new BridgeError("the stored delegate has a malformed action list", 409, "delegate_unreadable");
+    }
+    return value as string[];
 }
 
 export interface EngineDelegateSourceOptions {
@@ -72,7 +94,12 @@ export class EngineDelegateSource implements DelegateSource {
             }
             throw err;
         }
-        return { seedHex: seed.toString("hex"), agentObjectId: normalizeObjectId(row.agent_object_id) };
+        return {
+            seedHex: seed.toString("hex"),
+            agentObjectId: normalizeObjectId(row.agent_object_id),
+            delegateClass: parseDelegateClass(row.delegate_class),
+            allowedActionIds: parseActionIds(row.allowed_action_ids),
+        };
     }
 
     private async fetchEncryptedRow(accountId: string, delegateRef: string): Promise<EncryptedRow> {

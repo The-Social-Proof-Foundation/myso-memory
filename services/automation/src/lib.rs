@@ -6,8 +6,10 @@ pub mod event_bus;
 pub mod executor;
 pub mod handlers;
 pub mod memory_bridge;
+pub mod registered_action;
 pub mod store;
 pub mod trigger_eval;
+pub mod webhook;
 
 pub use config::Config;
 pub use event_bus::EventBus;
@@ -104,7 +106,9 @@ pub struct TriggerSet {
 #[serde(rename_all = "snake_case")]
 pub enum JobActionKind {
     MemoryRelayerCall,
-    SocialAction,
+    /// One on-chain action from the relayer's registered-action catalog, run as the job's delegate.
+    RegisteredAction,
+    /// Ask the owner's endpoint what to do, then run its directive as a registered action.
     Webhook,
 }
 

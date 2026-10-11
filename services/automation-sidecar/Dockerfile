@@ -31,6 +31,9 @@ RUN corepack pnpm install --frozen-lockfile
 # build failure, which is exactly the kind of break that only shows up in prod.
 RUN corepack pnpm build:sdk
 
+# Chain actions go through the registered-action client, which is also gitignored output.
+RUN corepack pnpm --filter @socialproof/sub-agents build
+
 # Compiled output, so the runtime image ships no TypeScript and no tsx.
 RUN corepack pnpm --filter @socialproof/automation-sidecar build
 
@@ -48,6 +51,7 @@ WORKDIR /app
 COPY --from=builder /app/package.json /app/pnpm-workspace.yaml /app/
 COPY --from=builder /app/node_modules /app/node_modules
 COPY --from=builder /app/packages/sdk /app/packages/sdk
+COPY --from=builder /app/packages/sub-agents /app/packages/sub-agents
 COPY --from=builder /app/services/automation-sidecar /app/services/automation-sidecar
 
 ENV NODE_ENV=production

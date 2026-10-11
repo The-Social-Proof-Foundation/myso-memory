@@ -15,6 +15,7 @@ export const CAP_AGENT_UPDATE = 4096;
 export const CAP_AGENT_REGISTER = 8192;
 export const CAP_BUDGET_MANAGE = 32768;
 export const CAP_SOCIAL_GRAPH = 65536;
+export const CAP_TASK_TRADE = 131072;
 
 /** Mirrors `post::POST_ACCESS_*`. */
 export const POST_ACCESS_PUBLIC = 1;

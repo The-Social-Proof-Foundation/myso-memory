@@ -29,6 +29,16 @@ import type {
     SocialActionOptions,
     SocialClientConfig,
     OwnerWalletSigner,
+    TaskAcceptParams,
+    TaskCancelOfferParams,
+    TaskCreateParams,
+    TaskDeliverParams,
+    TaskPermissionlessParams,
+    TaskRefundProposalParams,
+    TaskReleaseParams,
+    TaskReviewParams,
+    TaskSellerParams,
+    TaskSettleParams,
 } from "./types.js";
 import { sha256hex, hexToBytes, bytesToHex, normalizeServerUrl } from "./signing.js";
 import { MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION } from "@socialproof/memory";
@@ -112,6 +122,7 @@ function assertAuthenticatedDeployment(
     }
     for (const field of [
         "socialGraphId",
+        "taskConfigId",
         "messagingPackageId",
         "messagingVersionId",
         "messagingConfigId",
@@ -343,6 +354,76 @@ export class SocialClient {
 
     async revokeChildAgent(params: ManagedAgentParams, options?: SocialActionOptions) {
         return this.executeRegistered("agent.revoke_child.v1", params, options);
+    }
+
+    /**
+     * Runs a registered action chosen at run time, for unattended workers whose action comes from
+     * an event or a directive. Unknown ids throw; tier-3 and approval-required actions still go
+     * through the owner-approval path and fail without an owner wallet.
+     */
+    async executeAction(
+        actionId: string,
+        params: unknown,
+        options?: SocialActionOptions,
+    ): Promise<SocialActionResult> {
+        const descriptor = getSocialActionDescriptor(actionId);
+        return this.executeRegistered(descriptor.id, params, options);
+    }
+
+    async createTask(params: TaskCreateParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.create.v1", params, options);
+    }
+
+    async acceptTask(params: TaskAcceptParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.accept.v1", params, options);
+    }
+
+    async declineTask(params: TaskSellerParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.decline.v1", params, options);
+    }
+
+    async cancelTaskOffer(params: TaskCancelOfferParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.cancel_offer.v1", params, options);
+    }
+
+    async deliverTask(params: TaskDeliverParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.deliver.v1", params, options);
+    }
+
+    async settleTask(params: TaskSettleParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.settle.v1", params, options);
+    }
+
+    async refundTask(params: TaskPermissionlessParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.refund.v1", params, options);
+    }
+
+    async releaseTask(params: TaskReleaseParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.release.v1", params, options);
+    }
+
+    async expireTaskOffer(params: TaskPermissionlessParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.expire_offer.v1", params, options);
+    }
+
+    async proposeTaskRefund(params: TaskRefundProposalParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.propose_refund.v1", params, options);
+    }
+
+    async acceptTaskRefund(params: TaskRefundProposalParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.accept_refund.v1", params, options);
+    }
+
+    async rejectTaskRefund(params: TaskRefundProposalParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.reject_refund.v1", params, options);
+    }
+
+    async withdrawTaskRefund(params: TaskRefundProposalParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.withdraw_refund.v1", params, options);
+    }
+
+    async reviewTask(params: TaskReviewParams, options?: SocialActionOptions) {
+        return this.executeRegistered("task.review.v1", params, options);
     }
 
     async deletePost(

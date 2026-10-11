@@ -43,6 +43,10 @@ export function optStringVec(tx: any, values: string[] | undefined): unknown {
     );
 }
 
+export function optU8(tx: any, value: number | undefined): unknown {
+    return tx.pure("option<u8>", value ?? null);
+}
+
 export function optU64(tx: any, value: number | undefined): unknown {
     return tx.pure("option<u64>", value ?? null);
 }

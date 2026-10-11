@@ -127,6 +127,7 @@ export function loadSocialChainConfig(): SocialChainConfig {
         memoryConfigId: required("MEMORY_CONFIG_ID"),
         mydataRegistryId: required("MYDATA_REGISTRY_ID"),
         socialGraphId: process.env.SOCIAL_GRAPH_ID?.trim() || undefined,
+        taskConfigId: process.env.TASK_CONFIG_ID?.trim() || undefined,
         messagingPackageId: process.env.MESSAGING_PACKAGE_ID?.trim() || undefined,
         messagingVersionId: process.env.MESSAGING_VERSION_ID?.trim() || undefined,
         messagingConfigId: process.env.MESSAGING_CONFIG_ID?.trim() || undefined,

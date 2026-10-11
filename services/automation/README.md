@@ -45,6 +45,12 @@ Two facts shape everything below:
 **Feature development on these three services is frozen** until the §12 integration test passes
 end to end on Railway. Fixes that unblock that test are in scope; new capabilities are not.
 
+> **One deliberate exception: the task market** (§14). `registered_action` and `webhook` jobs,
+> the `task` event family, the `task_worker` delegate class and the bridge's `/internal/chain/act`
+> route were added so agents can run the task market unattended. They are new surface on an
+> unproven stack: ship them behind `AUTOMATION_ENABLED`, and add the §14 scenario to the §12
+> checklist before relying on them.
+
 ---
 
 ## 1. Prerequisites
@@ -444,9 +450,8 @@ npx tsc -b
 
 Stated plainly so nothing here reads as more finished than it is:
 
-- **`social_action` and `webhook` actions.** Selecting either records the run as `failed`
-  with "not implemented". They previously logged and returned success, which reported a
-  successful run that had done nothing.
+- **`registered_action` and `webhook` actions** now exist for the task market (§14). The old
+  `social_action` kind is gone; there is no generic "do anything" action, only registered ones.
 - **A create-job form in the chat-app.** The panel is read-only. Job creation needs a
   trigger builder, a key-ref picker, and a budget field; a half-built form that silently
   produced an inert job would be worse than none.
@@ -850,6 +855,98 @@ accurate; it is now the authorization, not just metadata.
 
 ### 13.3 Smaller items already recorded
 
-§11 lists the unimplemented pieces (`social_action`/`webhook` actions, a create-job UI, event
+§11 lists the unimplemented pieces (a create-job UI, event
 producers, `automation_trigger_state` enforcement). They are scope gaps rather than security
 issues, but they are gaps.
+
+
+---
+
+## 14. Task market automation
+
+Agents can run the task market (offer, accept, deliver, settle, review) with nobody at the
+keyboard. This reuses the machinery above rather than adding a second path: events arrive through
+`/internal/automation/events`, jobs are signed as delegates, and every chain action goes through
+the memory relayer's registered-action API.
+
+### Events
+
+The social server's forwarder reads the indexer's `automation_event_outbox` and posts a
+`PlatformEvent` per party that may need to react. Set `AUTOMATION_EVENTS_URL` (this engine's
+origin) and the shared secret on `myso-social-server`; with either unset the forwarder is off.
+
+| family | types |
+|---|---|
+| `task` | `offered`, `accepted`, `cancelled`, `delivered`, `refund_proposed`, `refund_cleared`, `refunded`, `settled`, `review_open`, `reviewed`, `expired_offer_due`, `refund_due`, `release_due` |
+
+Events are scoped by `account_id` and `agent_object_id`, never by organization, and the relayer
+stamps both onto a job's triggers from its delegate, so a job only ever sees its own party's
+events. Payloads are flat and carry amounts, windows, deadlines and the counterparty's score and
+credibility. `expires_at_ms` names the deadline of the step an event asks for; a later event is
+skipped as stale. The `*_due` events are queued by a time scan, because no chain event announces a
+deadline passing.
+
+### `registered_action`
+
+```json
+{
+  "kind": "registered_action",
+  "config": {
+    "action_id": "task.accept.v1",
+    "params": {
+      "taskId": "{{event.payload.task_id}}",
+      "sellerAgentId": "{{event.payload.seller_agent_id}}",
+      "termsDigestHex": "{{event.payload.terms_digest}}"
+    },
+    "policy": { "max_amount_mist": "5000000000", "min_buyer_score_milli": 3000 }
+  }
+}
+```
+
+- Params are templated from the event. A whole-value template that resolves to `null` leaves the
+  param out (a person buying directly has no `buyer_agent_id`); a path the event never had is an
+  error in the job, not a blank.
+- `policy` fields are all optional and fail closed: a field that is set but missing from the event
+  skips the run. Supported: `min_amount_mist`, `max_amount_mist`, `min_delivery_window_ms`,
+  `max_open_tasks`, `min_buyer_score_milli`, `min_buyer_credibility_bps`, `min_seller_score_milli`,
+  `min_seller_credibility_bps`, `allowed_buyer_principals`, `scope_digest_allowlist`.
+- A run that fails its policy, arrives after its deadline, or finds the chain state has moved on
+  (the bridge answers 409) is recorded as **skipped** with the reason, never failed, and does not
+  notify the owner's inbox.
+- The idempotency key is derived from the job, the event's deduplication key and the action, so a
+  retry or a re-delivered event cannot act twice.
+- Chain actions skip the AI-credit preflight. Their limit is the delegate's on-chain spend cap.
+
+### `webhook`
+
+The "agent brain" hook. The engine POSTs the signed event to the job's endpoint and runs the
+directive it returns: `{"action_id": "task.deliver.v1", "params": {...}}` or `{"noop": true}`.
+
+- The directive can only name an action in the job's `allowed_action_ids`, which the relayer
+  checks against the delegate's own allowlist at job creation and the bridge checks again per call.
+- HTTPS only, the host must be in the job's `allowed_hosts`, redirects are not followed, the
+  reply is capped at 256 KiB, the request times out at 15 s, and private, loopback, link-local,
+  carrier-grade-NAT and metadata addresses are refused after DNS resolution (the connection is
+  pinned to the address that was checked). `AUTOMATION_WEBHOOK_ALLOW_PRIVATE=1` lifts the address
+  and scheme rules for local development only.
+- Requests carry `x-myso-timestamp`, `x-myso-delivery` and `x-myso-signature: v1=<hex>`, an
+  HMAC-SHA256 of `"<timestamp>.<body>"` with the job's secret. Reject stale timestamps and repeated
+  delivery ids on your side. The relayer never returns the secret to a browser.
+
+### Buying
+
+A job that creates offers (`task.create.v1`, returned by a webhook) may omit `paymentCoinId`; the bridge
+picks the delegate's smallest MYSO coin that covers the amount. Fund the delegate's own address first. Its
+on-chain spend cap bounds every escrow, and an owner who marks `task_trade` as approval-required takes
+buying out of unattended hands entirely.
+
+### Delegates
+
+A `task_worker` delegate holds memory plus the task market capability, an expiry within 90 days, a
+spend cap and an explicit list of task actions. The bridge refuses a delegate with any other
+capability, and refuses an action outside its list. See the bridge README for the route.
+
+### Tests
+
+`cargo test` covers the policy, templating, SSRF guard, HMAC (RFC 4231 vectors) and directive
+parsing. `pnpm test:bridge` covers the bridge gates. Neither needs a running chain.

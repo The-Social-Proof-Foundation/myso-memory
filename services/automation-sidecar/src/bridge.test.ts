@@ -11,7 +11,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { BridgeError, MemoryBridge, normalizeObjectId } from "./bridge.js";
+import {
+    BridgeError,
+    MemoryBridge,
+    TASK_ACTION_IDS,
+    normalizeObjectId,
+    wrapChainError,
+    type ChainClientTarget,
+} from "./bridge.js";
 import type { AgentKeyEntry, AgentKeyStore, ResolvedAgentKey } from "./keys.js";
 
 const SERVER_URL = "http://127.0.0.1:8000";
@@ -562,5 +569,330 @@ describe("delegate refs", () => {
             .catch((e: unknown) => e as BridgeError);
         assert.equal((err as BridgeError).code, "key_store:unknown_ref");
         assert.equal(built.length, 0);
+    });
+});
+
+describe("chain actions", () => {
+    const SEED = "ab".repeat(32);
+    const ALLOWED = ["task.accept.v1", "task.deliver.v1"];
+    const KEY = "auto:job-1:0123456789abcdef";
+
+    type Opened = {
+        seedHex: string;
+        agentObjectId: string;
+        delegateClass: "memory" | "task_worker";
+        allowedActionIds: string[];
+    };
+
+    function actBridge(
+        options: {
+            open?: () => Promise<Opened>;
+            verify?: (target: unknown) => Promise<unknown>;
+            execute?: (actionId: string, params: unknown) => Promise<{ digest: string }>;
+            withDelegates?: boolean;
+            fetchImpl?: typeof fetch;
+        } = {},
+    ) {
+        const verified: unknown[] = [];
+        const clients: ChainClientTarget[] = [];
+        const executed: Array<{ actionId: string; params: unknown; idempotencyKey: string }> = [];
+        let opens = 0;
+        const bridge = new MemoryBridge({
+            delegates:
+                options.withDelegates === false
+                    ? undefined
+                    : {
+                          open: async () => {
+                              opens += 1;
+                              return (
+                                  options.open ??
+                                  (async () => ({
+                                      seedHex: SEED,
+                                      agentObjectId: "agent1",
+                                      delegateClass: "task_worker" as const,
+                                      allowedActionIds: ALLOWED,
+                                  }))
+                              )();
+                          },
+                      },
+            verifier: {
+                verify: async (target: unknown) => {
+                    verified.push(target);
+                    return options.verify ? options.verify(target) : {};
+                },
+            } as never,
+            delegateDefaults: { serverUrl: SERVER_URL, namespace: "chat-app" },
+            requestTimeoutMs: 5_000,
+            fetchImpl: options.fetchImpl,
+            createChainClient: (target) => {
+                clients.push(target);
+                return {
+                    executeAction: async (actionId, params, opts) => {
+                        if (options.execute) return options.execute(actionId, params);
+                        executed.push({ actionId, params, idempotencyKey: opts.idempotencyKey });
+                        return { digest: "DIGEST1" };
+                    },
+                };
+            },
+        });
+        return { bridge, verified, clients, executed, opens: () => opens };
+    }
+
+    const request = (overrides: Record<string, unknown> = {}) => ({
+        key_ref: "delegate:worker",
+        account_id: "0xacct",
+        action_id: "task.accept.v1",
+        params: { taskId: "0xtask" },
+        idempotency_key: KEY,
+        ...overrides,
+    });
+
+    async function failure(promise: Promise<unknown>): Promise<BridgeError> {
+        const err = await promise.then(
+            () => undefined,
+            (e: unknown) => e,
+        );
+        assert.ok(err instanceof BridgeError, `expected a BridgeError, got ${String(err)}`);
+        return err;
+    }
+
+    it("covers exactly the task market actions", () => {
+        assert.equal(TASK_ACTION_IDS.size, 14);
+        assert.ok([...TASK_ACTION_IDS].every((id) => id.startsWith("task.")));
+    });
+
+    it("runs an allowed action after verifying the delegate under the task_worker class", async () => {
+        const { bridge, verified, clients, executed } = actBridge();
+        const result = await bridge.act(request());
+
+        assert.deepEqual(result, { status: "executed", action_id: "task.accept.v1", digest: "DIGEST1" });
+        assert.deepEqual(verified, [
+            {
+                seedHex: SEED,
+                serverUrl: SERVER_URL,
+                accountId: "0xacct",
+                agentObjectId: "agent1",
+                needs: 131072,
+                delegateClass: "task_worker",
+            },
+        ]);
+        assert.deepEqual(clients, [{ seedHex: SEED, accountId: "0xacct", serverUrl: SERVER_URL }]);
+        assert.deepEqual(executed, [
+            { actionId: "task.accept.v1", params: { taskId: "0xtask" }, idempotencyKey: KEY },
+        ]);
+    });
+
+    it("never puts the delegate key in a response", async () => {
+        const { bridge } = actBridge();
+        assert.equal(JSON.stringify(await bridge.act(request())).includes(SEED), false);
+    });
+
+    it("refuses anything that is not a task action before it opens a key", async () => {
+        const { bridge, opens } = actBridge();
+        for (const action_id of ["social.create_post.v1", "agent.revoke_child.v1", "task.mint.v1", "0x2::coin::transfer", ""]) {
+            const err = await failure(bridge.act(request({ action_id })));
+            assert.equal(err.status, 403, action_id);
+            assert.equal(err.code, "action_not_allowed", action_id);
+        }
+        assert.equal(opens(), 0);
+    });
+
+    it("refuses a task action the delegate was not registered for", async () => {
+        const { bridge, verified, clients } = actBridge();
+        const err = await failure(bridge.act(request({ action_id: "task.settle.v1" })));
+        assert.equal(err.code, "action_not_allowed");
+        assert.equal(verified.length, 0);
+        assert.equal(clients.length, 0);
+    });
+
+    it("refuses a memory delegate even if its list somehow named the action", async () => {
+        const { bridge, clients } = actBridge({
+            open: async () => ({
+                seedHex: SEED,
+                agentObjectId: "agent1",
+                delegateClass: "memory",
+                allowedActionIds: ALLOWED,
+            }),
+        });
+        const err = await failure(bridge.act(request()));
+        assert.equal(err.code, "delegate_wrong_class");
+        assert.equal(clients.length, 0);
+    });
+
+    it("only signs chain actions with a delegate, never a static key", async () => {
+        const { bridge, opens } = actBridge();
+        const err = await failure(bridge.act(request({ key_ref: "agent-a" })));
+        assert.equal(err.code, "chain_requires_delegate");
+        assert.equal(opens(), 0);
+    });
+
+    it("is unknown when delegates are not configured", async () => {
+        const { bridge } = actBridge({ withDelegates: false });
+        assert.equal((await failure(bridge.act(request()))).code, "key_store:unknown_ref");
+    });
+
+    it("signs nothing when the chain says the delegate is revoked, and re-checks every call", async () => {
+        let revoked = false;
+        const { bridge, verified, clients } = actBridge({
+            verify: async () => {
+                if (revoked) throw new BridgeError("revoked", 403, "delegate_rejected");
+                return {};
+            },
+        });
+        await bridge.act(request());
+        revoked = true;
+        const err = await failure(bridge.act(request()));
+        assert.equal(err.code, "delegate_rejected");
+        assert.equal(verified.length, 2);
+        // A fresh client per call: no signing key survives between requests.
+        assert.equal(clients.length, 1);
+    });
+
+    it("validates the idempotency key and params", async () => {
+        const { bridge, opens } = actBridge();
+        for (const idempotency_key of ["short", "has space in it!", "x".repeat(129), undefined]) {
+            assert.equal((await failure(bridge.act(request({ idempotency_key })))).code, "invalid_request");
+        }
+        for (const params of [undefined, null, [], "str", 7]) {
+            assert.equal((await failure(bridge.act(request({ params })))).code, "invalid_request");
+        }
+        const big = await failure(bridge.act(request({ params: { blob: "x".repeat(33 * 1024) } })));
+        assert.equal(big.status, 413);
+        assert.equal(opens(), 0);
+    });
+
+    it("classifies relayer failures by what the caller can do about them", () => {
+        const classify = (message: string) => {
+            const err = wrapChainError(new Error(message), "task.accept.v1");
+            return [err.status, err.code];
+        };
+        assert.deepEqual(classify("Social API POST /api/chain/actions/prepare failed (409): {\"error\":\"x\"}"), [409, "chain_state"]);
+        assert.deepEqual(classify("Social API POST /api/chain/actions/prepare failed (400): bad"), [422, "action_invalid"]);
+        assert.deepEqual(classify("Social API POST /api/chain/actions/prepare failed (403): no"), [403, "delegate_rejected"]);
+        assert.deepEqual(classify("Social API POST /api/chain/actions/prepare failed (429): slow down"), [502, "relayer_unavailable"]);
+        assert.deepEqual(classify("Social API POST /api/chain/actions/submit failed (503): down"), [502, "relayer_unavailable"]);
+        assert.deepEqual(classify("fetch failed"), [502, "relayer_unavailable"]);
+        assert.deepEqual(classify("Agent lacks capability required by task.accept.v1"), [403, "delegate_missing_capability"]);
+        assert.deepEqual(classify("owner wallet approval flow is required"), [403, "approval_required"]);
+        assert.deepEqual(classify("task.accept.v1 is not present in the authenticated action catalog"), [403, "action_not_allowed"]);
+        const passthrough = new BridgeError("x", 418, "teapot");
+        assert.equal(wrapChainError(passthrough, "task.accept.v1"), passthrough);
+    });
+
+    describe("choosing a payment coin for task.create", () => {
+        const createParams = {
+            sellerAccountId: "0xsa",
+            sellerAgentId: "0xsag",
+            amountMist: "5000",
+            scopeDigestHex: "ab".repeat(32),
+            title: "t",
+            acceptWindowMs: "1",
+            deliveryWindowMs: "1",
+            settleWindowMs: "1",
+        };
+        const allowCreate = async () => ({
+            seedHex: SEED,
+            agentObjectId: "agent1",
+            delegateClass: "task_worker" as const,
+            allowedActionIds: ["task.create.v1"],
+        });
+        const context = { derivedAddress: "0xdelegate", rpcUrl: "http://rpc.example" };
+
+        function rpc(coins: Array<{ coinObjectId: string; balance: string }>, seen: unknown[] = []) {
+            return (async (url: string, init: RequestInit) => {
+                seen.push({ url, body: JSON.parse(String(init.body)) });
+                return new Response(JSON.stringify({ result: { data: coins } }));
+            }) as unknown as typeof fetch;
+        }
+
+        it("uses the smallest coin that covers the amount", async () => {
+            const seen: unknown[] = [];
+            const { bridge, executed } = actBridge({
+                open: allowCreate,
+                verify: async () => context,
+                fetchImpl: rpc(
+                    [
+                        { coinObjectId: "0xbig", balance: "900000" },
+                        { coinObjectId: "0xtiny", balance: "4999" },
+                        { coinObjectId: "0xfit", balance: "5000" },
+                    ],
+                    seen,
+                ),
+            });
+            await bridge.act(request({ action_id: "task.create.v1", params: createParams }));
+            assert.equal((executed[0]?.params as { paymentCoinId: string }).paymentCoinId, "0xfit");
+            assert.deepEqual(seen, [
+                {
+                    url: "http://rpc.example",
+                    body: { jsonrpc: "2.0", id: 1, method: "mysox_getCoins", params: ["0xdelegate", "0x2::myso::MYSO", null, 50] },
+                },
+            ]);
+        });
+
+        it("leaves a coin the job named alone and never looks one up", async () => {
+            const seen: unknown[] = [];
+            const { bridge, executed } = actBridge({
+                open: allowCreate,
+                verify: async () => context,
+                fetchImpl: rpc([], seen),
+            });
+            await bridge.act(request({ action_id: "task.create.v1", params: { ...createParams, paymentCoinId: "0xmine" } }));
+            assert.equal((executed[0]?.params as { paymentCoinId: string }).paymentCoinId, "0xmine");
+            assert.equal(seen.length, 0);
+        });
+
+        it("only looks for a coin for task.create", async () => {
+            const seen: unknown[] = [];
+            const { bridge } = actBridge({ fetchImpl: rpc([], seen), verify: async () => context });
+            await bridge.act(request());
+            assert.equal(seen.length, 0);
+        });
+
+        it("refuses when no single coin covers the amount", async () => {
+            const { bridge, clients } = actBridge({
+                open: allowCreate,
+                verify: async () => context,
+                fetchImpl: rpc([{ coinObjectId: "0xa", balance: "10" }, { coinObjectId: "0xb", balance: "20" }]),
+            });
+            const err = await failure(bridge.act(request({ action_id: "task.create.v1", params: createParams })));
+            assert.equal(err.code, "insufficient_funds");
+            assert.equal(clients.length, 0);
+        });
+
+        it("refuses a bad amount or a relayer that does not report the delegate's address", async () => {
+            const { bridge } = actBridge({ open: allowCreate, verify: async () => context, fetchImpl: rpc([]) });
+            for (const amountMist of ["0", "-5", "1.5", "abc", 7, undefined]) {
+                const err = await failure(
+                    bridge.act(request({ action_id: "task.create.v1", params: { ...createParams, amountMist } })),
+                );
+                assert.equal(err.code, "invalid_request", String(amountMist));
+            }
+            const old = actBridge({ open: allowCreate, verify: async () => ({}), fetchImpl: rpc([]) });
+            const err = await failure(old.bridge.act(request({ action_id: "task.create.v1", params: createParams })));
+            assert.equal(err.code, "payment_coin_required");
+        });
+
+        it("maps a fullnode outage to a retryable 502", async () => {
+            const { bridge } = actBridge({
+                open: allowCreate,
+                verify: async () => context,
+                fetchImpl: (async () => {
+                    throw new Error("connection refused");
+                }) as unknown as typeof fetch,
+            });
+            const err = await failure(bridge.act(request({ action_id: "task.create.v1", params: createParams })));
+            assert.equal(err.status, 502);
+        });
+    });
+
+    it("surfaces a task-state conflict as a 409 the engine can skip", async () => {
+        const { bridge } = actBridge({
+            execute: async () => {
+                throw new Error("Social API POST /api/chain/actions/prepare failed (409): MoveAbort agent_task");
+            },
+        });
+        const err = await failure(bridge.act(request()));
+        assert.equal(err.status, 409);
+        assert.equal(err.code, "chain_state");
     });
 });

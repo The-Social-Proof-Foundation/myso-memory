@@ -28,8 +28,22 @@ import { normalizeObjectId } from "./ids.js";
 export const CAP_MEMORY_READ = 1;
 export const CAP_MEMORY_WRITE = 2;
 export const CAP_MYDATA_READ = 4;
-/** The most a delegate may hold. Anything else on the key disqualifies it. */
+export const CAP_TASK_TRADE = 131072;
+/** The most a `memory` delegate may hold. Anything else on the key disqualifies it. */
 export const DELEGATE_ALLOWED_CAPS = CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_MYDATA_READ;
+
+/**
+ * A delegate's class fixes the most capability it may hold. `task_worker` adds only the task
+ * market; it can never carry posting, trading, spending or agent-management capability.
+ */
+export type DelegateClass = "memory" | "task_worker";
+export const DELEGATE_CLASS_CAPS: Readonly<Record<DelegateClass, number>> = Object.freeze({
+    memory: DELEGATE_ALLOWED_CAPS,
+    task_worker: DELEGATE_ALLOWED_CAPS | CAP_TASK_TRADE,
+});
+
+/** A chain-acting delegate must expire within this window, so a leaked key has a short life. */
+export const MAX_TASK_WORKER_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
 
 /** Recall and remember both decrypt through MYDATA, so both need it. */
 export const NEEDS_RECALL = CAP_MEMORY_READ | CAP_MYDATA_READ;
@@ -43,6 +57,10 @@ export interface AgentContext {
     capabilities: number;
     maxActionSpendMist: number | null;
     expiresAtMs: number | null;
+    /** The address the delegate signs from; where its coins live. Absent on an old relayer. */
+    derivedAddress?: string | null;
+    /** The fullnode the relayer reads from. Absent on an old relayer. */
+    rpcUrl?: string | null;
 }
 
 export interface VerifyTarget {
@@ -53,6 +71,8 @@ export interface VerifyTarget {
     agentObjectId: string;
     /** Capability bits this operation needs. */
     needs: number;
+    /** Defaults to `memory`. */
+    delegateClass?: DelegateClass;
 }
 
 export interface DelegateVerifierOptions {
@@ -68,18 +88,21 @@ function refuse(message: string, code: string): never {
 /** Pure policy check over a fetched context. Exported for tests. */
 export function assertDelegateAllowed(
     ctx: AgentContext,
-    target: Pick<VerifyTarget, "accountId" | "agentObjectId" | "needs">,
+    target: Pick<VerifyTarget, "accountId" | "agentObjectId" | "needs" | "delegateClass">,
     nowMs: number,
 ): void {
+    const delegateClass = target.delegateClass ?? "memory";
     if (normalizeObjectId(ctx.memoryAccountId) !== normalizeObjectId(target.accountId)) {
         refuse("the delegate is not registered under this account", "delegate_wrong_account");
     }
     if (normalizeObjectId(ctx.agentObjectId) !== normalizeObjectId(target.agentObjectId)) {
         refuse("the stored key is not the registered delegate", "delegate_mismatch");
     }
-    if ((ctx.capabilities & ~DELEGATE_ALLOWED_CAPS) !== 0) {
+    if ((ctx.capabilities & ~DELEGATE_CLASS_CAPS[delegateClass]) !== 0) {
         refuse(
-            "the delegate holds capabilities beyond memory read/write; register a narrower one",
+            delegateClass === "task_worker"
+                ? "the delegate holds capabilities beyond memory and the task market; register a narrower one"
+                : "the delegate holds capabilities beyond memory read/write; register a narrower one",
             "delegate_overscoped",
         );
     }
@@ -94,6 +117,12 @@ export function assertDelegateAllowed(
     }
     if (ctx.expiresAtMs <= nowMs) {
         refuse("the delegate has expired", "delegate_expired");
+    }
+    if (delegateClass === "task_worker" && ctx.expiresAtMs - nowMs > MAX_TASK_WORKER_LIFETIME_MS) {
+        refuse(
+            "a task worker must expire within 90 days; register one with a nearer expiry",
+            "delegate_expiry_too_far",
+        );
     }
 }
 
@@ -179,6 +208,8 @@ export class DelegateVerifier {
             capabilities: body.capabilities,
             maxActionSpendMist: nullableNumber(body.maxActionSpendMist),
             expiresAtMs: nullableNumber(body.expiresAtMs),
+            derivedAddress: typeof body.derivedAddress === "string" ? body.derivedAddress : null,
+            rpcUrl: typeof body.rpcUrl === "string" ? body.rpcUrl : null,
         };
     }
 }

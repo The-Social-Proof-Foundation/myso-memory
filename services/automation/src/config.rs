@@ -25,6 +25,9 @@ pub struct Config {
     pub memory_bridge_secret: String,
     pub tick_interval_secs: u64,
     pub enabled: bool,
+    /// `AUTOMATION_WEBHOOK_ALLOW_PRIVATE`: lets `webhook` jobs call http and private-network
+    /// hosts. For local development only; the default refuses both.
+    pub webhook_allow_private: bool,
     /// True when no secret was configured and the dev placeholder is in use.
     pub secret_is_placeholder: bool,
 }
@@ -102,6 +105,7 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
             enabled: parse_bool(lookup("AUTOMATION_ENABLED"), true),
+            webhook_allow_private: parse_bool(lookup("AUTOMATION_WEBHOOK_ALLOW_PRIVATE"), false),
             secret_is_placeholder,
         }
     }
@@ -285,5 +289,14 @@ mod tests {
         assert_eq!(Config::from_lookup(&blank).oracle_api_secret, None);
         let set = |k: &str| (k == "AI_CREDIT_ORACLE_API_SECRET").then(|| "s3".to_string());
         assert_eq!(Config::from_lookup(&set).oracle_api_secret.as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn webhooks_refuse_private_hosts_unless_the_dev_flag_is_set() {
+        assert!(!Config::from_lookup(&lookup_from(&[])).webhook_allow_private);
+        let on = lookup_from(&[("AUTOMATION_WEBHOOK_ALLOW_PRIVATE", "true")]);
+        assert!(Config::from_lookup(&on).webhook_allow_private);
+        let junk = lookup_from(&[("AUTOMATION_WEBHOOK_ALLOW_PRIVATE", "yes please")]);
+        assert!(!Config::from_lookup(&junk).webhook_allow_private);
     }
 }

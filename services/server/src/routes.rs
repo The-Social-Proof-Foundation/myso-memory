@@ -62,6 +62,8 @@ pub struct AgentContextSocialChain {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub social_graph_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
+    pub task_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub messaging_package_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub messaging_version_id: String,
@@ -288,7 +290,7 @@ pub async fn agent_context(
     use crate::memory_contract::{
         has_cap, CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_AI_SPEND, CAP_COMMENT,
         CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MESSAGE_SEND, CAP_MYDATA_READ, CAP_POST_PUBLISH,
-        CAP_REACT, CAP_SOCIAL_GRAPH,
+        CAP_REACT, CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
     };
 
     let mut actions = Vec::new();
@@ -333,6 +335,26 @@ pub async fn agent_context(
             "social.unfollow_profile.v1",
             "social.block_profile.v1",
             "social.unblock_profile.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_TASK_TRADE)
+        && !state.config.social_chain.task_config_id.is_empty()
+    {
+        actions.extend([
+            "task.create.v1",
+            "task.accept.v1",
+            "task.decline.v1",
+            "task.cancel_offer.v1",
+            "task.deliver.v1",
+            "task.settle.v1",
+            "task.refund.v1",
+            "task.release.v1",
+            "task.expire_offer.v1",
+            "task.propose_refund.v1",
+            "task.accept_refund.v1",
+            "task.reject_refund.v1",
+            "task.withdraw_refund.v1",
+            "task.review.v1",
         ]);
     }
     if has_cap(auth.capabilities, CAP_MESSAGE_SEND)
@@ -404,6 +426,7 @@ pub async fn agent_context(
             memory_config_id: state.config.social_chain.memory_config_id.clone(),
             mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
             social_graph_id: state.config.social_chain.social_graph_id.clone(),
+            task_config_id: state.config.social_chain.task_config_id.clone(),
             messaging_package_id: state.config.social_chain.messaging_package_id.clone(),
             messaging_version_id: state.config.social_chain.messaging_version_id.clone(),
             messaging_config_id: state.config.social_chain.messaging_config_id.clone(),
@@ -1683,6 +1706,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigRespon
             memory_config_id: state.config.social_chain.memory_config_id.clone(),
             mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
             social_graph_id: state.config.social_chain.social_graph_id.clone(),
+            task_config_id: state.config.social_chain.task_config_id.clone(),
             messaging_package_id: state.config.social_chain.messaging_package_id.clone(),
             messaging_version_id: state.config.social_chain.messaging_version_id.clone(),
             messaging_config_id: state.config.social_chain.messaging_config_id.clone(),
@@ -2885,12 +2909,12 @@ pub async fn restore(
 // Registry-only chain action prepare / submit
 // ============================================================
 
-const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.3.0";
+const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.4.0";
 
 fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
     use crate::memory_contract::{
         CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_COMMENT, CAP_MEMORY_READ,
-        CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT, CAP_SOCIAL_GRAPH,
+        CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT, CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
     };
     match action {
         "social.create_post.v1"
@@ -2924,6 +2948,20 @@ fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
         "agent.deactivate_child.v1" | "agent.revoke_child.v1" => Some((CAP_AGENT_REVOKE, "1B")),
         "social.delete_post.v1" => Some((CAP_POST_PUBLISH, "3")),
         "social.delete_comment.v1" => Some((CAP_COMMENT, "3")),
+        "task.create.v1"
+        | "task.accept.v1"
+        | "task.decline.v1"
+        | "task.cancel_offer.v1"
+        | "task.deliver.v1"
+        | "task.settle.v1"
+        | "task.refund.v1"
+        | "task.release.v1"
+        | "task.expire_offer.v1"
+        | "task.propose_refund.v1"
+        | "task.accept_refund.v1"
+        | "task.reject_refund.v1"
+        | "task.withdraw_refund.v1"
+        | "task.review.v1" => Some((CAP_TASK_TRADE, "1B")),
         _ => None,
     }
 }
@@ -3060,6 +3098,11 @@ fn assert_registered_action_policy(
     {
         return Err(AppError::Internal(
             "social graph action object is not configured".into(),
+        ));
+    }
+    if action.starts_with("task.") && state.config.social_chain.task_config_id.is_empty() {
+        return Err(AppError::Internal(
+            "task market config object is not configured".into(),
         ));
     }
     if !has_cap(auth.capabilities, policy.0) {
@@ -3289,11 +3332,27 @@ async fn simulate_sponsored_transaction(
         .and_then(|status| status.get("status"))
         .and_then(|status| status.as_str());
     if status != Some("success") {
-        return Err(AppError::BadRequest(
-            "registered action simulation failed".into(),
-        ));
+        let detail = result
+            .pointer("/effects/status/error")
+            .and_then(|error| error.as_str())
+            .unwrap_or_default();
+        return Err(if is_task_state_abort(detail) {
+            // The task moved on (already settled, deadline passed, someone else won the race).
+            // A 409 lets an unattended caller skip instead of retrying or alerting its owner.
+            AppError::Conflict(format!(
+                "registered action simulation failed: {}",
+                detail.chars().take(300).collect::<String>()
+            ))
+        } else {
+            AppError::BadRequest("registered action simulation failed".into())
+        });
     }
     Ok(result)
+}
+
+/// A dry run that aborted inside the task market module, as opposed to a malformed request.
+fn is_task_state_abort(detail: &str) -> bool {
+    detail.contains("MoveAbort") && detail.contains("agent_task")
 }
 
 fn approval_response(row: &crate::action_approvals::ActionApprovalRow) -> ActionApprovalResponse {
@@ -4376,6 +4435,45 @@ mod more_tests {
         );
         assert!(registered_action_policy("social.mute_profile.v1").is_none());
         assert!(registered_action_policy("social.unmute_profile.v1").is_none());
+    }
+
+    #[test]
+    fn only_task_market_aborts_are_treated_as_chain_state() {
+        let abort = r#"MoveAbort(MoveLocation { module: ModuleId { address: 50c1, name: Identifier("agent_task") }, function: 5, instruction: 12, function_name: Some("accept_task") }, 3) in command 0"#;
+        assert!(is_task_state_abort(abort));
+        assert!(!is_task_state_abort(
+            r#"MoveAbort(MoveLocation { module: ModuleId { address: 50c1, name: Identifier("post") }, function: 1, instruction: 2, function_name: Some("create_post") }, 7) in command 0"#
+        ));
+        assert!(!is_task_state_abort("InsufficientGas"));
+        assert!(!is_task_state_abort(""));
+    }
+
+    #[test]
+    fn task_actions_require_the_task_trade_capability_at_tier_1b() {
+        for action in [
+            "task.create.v1",
+            "task.accept.v1",
+            "task.decline.v1",
+            "task.cancel_offer.v1",
+            "task.deliver.v1",
+            "task.settle.v1",
+            "task.refund.v1",
+            "task.release.v1",
+            "task.expire_offer.v1",
+            "task.propose_refund.v1",
+            "task.accept_refund.v1",
+            "task.reject_refund.v1",
+            "task.withdraw_refund.v1",
+            "task.review.v1",
+        ] {
+            assert_eq!(
+                registered_action_policy(action),
+                Some((crate::memory_contract::CAP_TASK_TRADE, "1B")),
+                "{action}"
+            );
+        }
+        assert!(registered_action_policy("task.transfer_escrow.v1").is_none());
+        assert!(registered_action_policy("task.create.v2").is_none());
     }
 
     #[test]

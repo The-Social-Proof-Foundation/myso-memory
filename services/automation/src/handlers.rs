@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::clients::{AuditClient, OracleClient, WorkflowClient};
 use crate::executor::RunContext;
 use crate::memory_bridge::MemoryBridgeClient;
+use crate::webhook::WebhookClient;
 use crate::store::{AutomationStore, JobFilter, RunSummary};
 use crate::{
     AutomationJob, EventBus, EventTrigger, JobAction, MatchMode, PlatformEvent,
@@ -72,6 +73,8 @@ pub async fn create_job(
     // this directly — it goes through the memory relayer, which enforces owner
     // auth and then presents the shared secret on the caller's behalf.
     verify_internal_secret(&headers, &state.internal_sync_secret)?;
+    validate_job_action(&req.action, state.run_ctx.webhook.allow_private())
+        .map_err(AppError::BadRequest)?;
 
     let job = AutomationJob {
         id: Uuid::new_v4(),
@@ -94,6 +97,22 @@ pub async fn create_job(
         name: saved.name,
         enabled: saved.enabled,
     }))
+}
+
+/// Structural checks for the chain-action kinds, so a malformed config is a 400 at creation rather
+/// than a failed run later. `memory_relayer_call` is validated when it runs, as before.
+pub fn validate_job_action(action: &JobAction, webhook_allow_private: bool) -> Result<(), String> {
+    match action.kind {
+        crate::JobActionKind::MemoryRelayerCall => Ok(()),
+        crate::JobActionKind::RegisteredAction => {
+            let config = crate::registered_action::parse_config(&action.config)?;
+            crate::registered_action::validate_config(&config)
+        }
+        crate::JobActionKind::Webhook => {
+            let config = crate::webhook::parse_config(&action.config)?;
+            crate::webhook::validate_config(&config, webhook_allow_private)
+        }
+    }
 }
 
 pub async fn get_job(
@@ -224,6 +243,49 @@ pub struct PutDelegateRequest {
     pub agent_object_id: String,
     pub mydata_key_id: String,
     pub encrypted_key: String,
+    /// `memory` (default) or `task_worker`.
+    #[serde(default = "default_delegate_class")]
+    pub delegate_class: String,
+    /// Required for `task_worker`; must be empty for `memory`.
+    #[serde(default)]
+    pub allowed_action_ids: Vec<String>,
+}
+
+fn default_delegate_class() -> String {
+    DELEGATE_CLASS_MEMORY.into()
+}
+
+pub const DELEGATE_CLASS_MEMORY: &str = "memory";
+pub const DELEGATE_CLASS_TASK_WORKER: &str = "task_worker";
+const MAX_DELEGATE_ACTIONS: usize = 16;
+
+/// A task worker may run task market actions and nothing else; a memory delegate runs no chain
+/// actions at all. Checked here and again by the bridge, so neither can be bypassed alone.
+pub fn validate_delegate_class(class: &str, allowed_action_ids: &[String]) -> Result<(), String> {
+    match class {
+        DELEGATE_CLASS_MEMORY => {
+            if allowed_action_ids.is_empty() {
+                Ok(())
+            } else {
+                Err("a memory delegate cannot run chain actions; use the task_worker class".into())
+            }
+        }
+        DELEGATE_CLASS_TASK_WORKER => {
+            if allowed_action_ids.is_empty() || allowed_action_ids.len() > MAX_DELEGATE_ACTIONS {
+                return Err(format!(
+                    "a task_worker delegate needs 1 to {MAX_DELEGATE_ACTIONS} allowed_action_ids"
+                ));
+            }
+            match allowed_action_ids
+                .iter()
+                .find(|id| !(crate::registered_action::valid_action_id(id) && id.starts_with("task.")))
+            {
+                Some(bad) => Err(format!("`{bad}` is not a task market action")),
+                None => Ok(()),
+            }
+        }
+        other => Err(format!("unknown delegate_class `{other}`")),
+    }
 }
 
 pub async fn put_delegate(
@@ -243,6 +305,8 @@ pub async fn put_delegate(
     if req.encrypted_key.trim().is_empty() || req.encrypted_key.len() > MAX_ENCRYPTED_KEY_BYTES {
         return Err(AppError::BadRequest("encrypted is required and must be small".into()));
     }
+    validate_delegate_class(&req.delegate_class, &req.allowed_action_ids)
+        .map_err(AppError::BadRequest)?;
     state
         .store
         .put_delegate(crate::store::DelegateRecord {
@@ -251,6 +315,8 @@ pub async fn put_delegate(
             agent_object_id: req.agent_object_id,
             mydata_key_id: req.mydata_key_id,
             encrypted_key: req.encrypted_key,
+            delegate_class: req.delegate_class,
+            allowed_action_ids: req.allowed_action_ids,
             created_at: chrono::Utc::now(),
         })
         .await
@@ -296,6 +362,8 @@ pub struct EncryptedDelegateResponse {
     pub agent_object_id: String,
     pub mydata_key_id: String,
     pub encrypted_key: String,
+    pub delegate_class: String,
+    pub allowed_action_ids: Vec<String>,
 }
 
 /// The encrypted envelope, for the bridge to open. Still ciphertext on the wire.
@@ -317,6 +385,8 @@ pub async fn get_delegate_key(
         agent_object_id: record.agent_object_id,
         mydata_key_id: record.mydata_key_id,
         encrypted_key: record.encrypted_key,
+        delegate_class: record.delegate_class,
+        allowed_action_ids: record.allowed_action_ids,
     }))
 }
 
@@ -443,6 +513,7 @@ pub fn build_run_context(
         store,
         oracle: OracleClient::new(config),
         memory: MemoryBridgeClient::new(config),
+        webhook: WebhookClient::new(config),
         workflow: WorkflowClient::new(config),
         audit: AuditClient::new(config),
     }
@@ -457,6 +528,59 @@ mod tests {
         let set = sample_trigger_set();
         let v = serde_json::to_value(&set).unwrap();
         assert_eq!(v["match_mode"], "any");
+    }
+
+    #[test]
+    fn chain_action_configs_are_validated_when_a_job_is_created() {
+        let registered = |config: serde_json::Value| JobAction {
+            kind: crate::JobActionKind::RegisteredAction,
+            config,
+        };
+        assert!(validate_job_action(
+            &registered(serde_json::json!({ "action_id": "task.accept.v1", "params": {} })),
+            false
+        )
+        .is_ok());
+        assert!(validate_job_action(&registered(serde_json::json!({ "action_id": "nope" })), false).is_err());
+        assert!(validate_job_action(&registered(serde_json::json!({})), false).is_err());
+
+        let webhook = |config: serde_json::Value| JobAction {
+            kind: crate::JobActionKind::Webhook,
+            config,
+        };
+        let good = serde_json::json!({
+            "url": "https://worker.example.com/hook",
+            "secret": "0123456789abcdef",
+            "allowed_hosts": ["worker.example.com"],
+            "allowed_action_ids": ["task.deliver.v1"],
+        });
+        assert!(validate_job_action(&webhook(good.clone()), false).is_ok());
+        let mut http = good;
+        http["url"] = "http://worker.example.com/hook".into();
+        assert!(validate_job_action(&webhook(http.clone()), false).is_err());
+        assert!(validate_job_action(&webhook(http), true).is_ok());
+
+        let memory = JobAction {
+            kind: crate::JobActionKind::MemoryRelayerCall,
+            config: serde_json::json!({}),
+        };
+        assert!(validate_job_action(&memory, false).is_ok());
+    }
+
+    #[test]
+    fn delegate_classes_constrain_which_actions_may_be_allowlisted() {
+        let ids = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(validate_delegate_class("memory", &[]).is_ok());
+        assert!(validate_delegate_class("memory", &ids(&["task.accept.v1"])).is_err());
+
+        assert!(validate_delegate_class("task_worker", &ids(&["task.accept.v1", "task.deliver.v1"])).is_ok());
+        assert!(validate_delegate_class("task_worker", &[]).is_err());
+        assert!(validate_delegate_class("task_worker", &ids(&["social.create_post.v1"])).is_err());
+        assert!(validate_delegate_class("task_worker", &ids(&["task.accept.v1", "agent.revoke_child.v1"])).is_err());
+        assert!(validate_delegate_class("task_worker", &ids(&["task.accept"])).is_err());
+        let too_many: Vec<String> = (0..17).map(|i| format!("task.a{}.v1", "b".repeat(i % 3 + 1))).collect();
+        assert!(validate_delegate_class("task_worker", &too_many).is_err());
+        assert!(validate_delegate_class("root", &[]).is_err());
     }
 
     #[test]

@@ -13,6 +13,23 @@ Sub-agents with on-chain capabilities from `social_contracts::memory` request re
 | `social.react_to_comment.v1` | 1A | `post::react_to_comment` | `CAP_REACT` (1024) |
 | `social.delete_post.v1` | 3 | `post::delete_post` | owner intent + wallet transaction signature |
 | `social.delete_comment.v1` | 3 | `post::delete_comment` | owner intent + wallet transaction signature |
+| `task.create.v1` | 1B | `agent_task::create_task` | `CAP_TASK_TRADE` (131072); escrow bounded by the agent's per-action spend cap |
+| `task.accept.v1` | 1B | `agent_task::accept_task` | `CAP_TASK_TRADE`; carries the terms digest the seller verified |
+| `task.decline.v1` | 1B | `agent_task::decline_task` | `CAP_TASK_TRADE` |
+| `task.cancel_offer.v1` | 1B | `agent_task::cancel_offer` | `CAP_TASK_TRADE` |
+| `task.deliver.v1` | 1B | `agent_task::mark_delivered` | `CAP_TASK_TRADE` |
+| `task.settle.v1` | 1B | `agent_task::settle_task` | `CAP_TASK_TRADE` |
+| `task.refund.v1` | 1B | `agent_task::refund_task` | `CAP_TASK_TRADE`; the contract allows anyone, only after a missed delivery |
+| `task.release.v1` | 1B | `agent_task::release_task` | `CAP_TASK_TRADE`; anyone, after the settle window and grace |
+| `task.expire_offer.v1` | 1B | `agent_task::expire_offer` | `CAP_TASK_TRADE`; anyone, after the accept deadline |
+| `task.propose_refund.v1` / `accept_refund` / `reject_refund` / `withdraw_refund` | 1B | `agent_task::*_refund` | `CAP_TASK_TRADE`; a delivered task is refunded only by mutual agreement |
+| `task.review.v1` | 1B | `agent_task::review_seller` / `review_buyer_agent` / `review_buyer_principal` | `CAP_TASK_TRADE`; the builder picks the entry from `raterRole` and `buyerAgentId` |
+
+Task actions need `TASK_CONFIG_ID` on the relayer (discovered automatically on localnet). They are
+ordinary registered actions: an owner who lists `task_trade` in an agent's approval-required caps
+forces wallet approval for them, and an unattended delegate then cannot run them. A dry run that
+aborts inside the task market (the task was already settled, a deadline passed) is answered with
+`409`, which automation treats as "skip", not "retry".
 
 ## Security flow
 
@@ -36,6 +53,7 @@ POST_CONFIG_ID=
 MEMORY_CONFIG_ID=
 MYDATA_REGISTRY_ID=
 SOCIAL_GRAPH_ID=
+TASK_CONFIG_ID=
 MESSAGING_PACKAGE_ID=
 MESSAGING_VERSION_ID=
 MESSAGING_CONFIG_ID=

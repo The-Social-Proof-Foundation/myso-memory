@@ -17,7 +17,9 @@
     "gen:mydata-key": "tsx src/gen-mydata-key.ts"
   },
   "dependencies": {
-    "@socialproof/memory": "workspace:*"
+    "@socialproof/memory": "workspace:*",
+    "@socialproof/myso": "0.0.4",
+    "@socialproof/sub-agents": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.8.6",

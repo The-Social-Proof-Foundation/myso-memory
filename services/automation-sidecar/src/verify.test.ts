@@ -12,9 +12,11 @@ import {
     CAP_MEMORY_READ,
     CAP_MEMORY_WRITE,
     CAP_MYDATA_READ,
+    CAP_TASK_TRADE,
     DelegateVerifier,
     NEEDS_RECALL,
     NEEDS_REMEMBER,
+    MAX_TASK_WORKER_LIFETIME_MS,
     assertDelegateAllowed,
     type AgentContext,
 } from "./verify.js";
@@ -205,5 +207,53 @@ describe("DelegateVerifier", () => {
         const err = await verifier.verify(target).catch((e: unknown) => e as BridgeError);
         assert.equal(JSON.stringify(seen).includes(seedHex), false);
         assert.equal((err as BridgeError).message.includes(seedHex), false);
+    });
+});
+
+describe("task_worker delegates", () => {
+    const WORKER = { ...TARGET, needs: CAP_TASK_TRADE, delegateClass: "task_worker" as const };
+    const MEMORY = CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_MYDATA_READ;
+
+    it("allows memory plus the task market, capped and expiring", () => {
+        assert.equal(refusal(ctx({ capabilities: MEMORY | CAP_TASK_TRADE }), WORKER), "allowed");
+    });
+
+    it("still refuses a memory delegate that holds the task market", () => {
+        assert.equal(refusal(ctx({ capabilities: MEMORY | CAP_TASK_TRADE })), "delegate_overscoped");
+    });
+
+    it("refuses every capability beyond the class, however narrow the extra", () => {
+        // post, message send, trade execute, agent register, AI spend, social graph.
+        for (const extra of [16, 64, 256, 8192, 16384, 65536]) {
+            assert.equal(
+                refusal(ctx({ capabilities: MEMORY | CAP_TASK_TRADE | extra }), WORKER),
+                "delegate_overscoped",
+                `extra capability ${extra}`,
+            );
+        }
+    });
+
+    it("requires the task-trade capability itself", () => {
+        assert.equal(refusal(ctx({ capabilities: MEMORY }), WORKER), "delegate_missing_capability");
+    });
+
+    it("keeps the spend cap and expiry rules", () => {
+        const caps = MEMORY | CAP_TASK_TRADE;
+        assert.equal(refusal(ctx({ capabilities: caps, maxActionSpendMist: null }), WORKER), "delegate_no_spend_limit");
+        assert.equal(refusal(ctx({ capabilities: caps, expiresAtMs: null }), WORKER), "delegate_no_expiry");
+        assert.equal(refusal(ctx({ capabilities: caps, expiresAtMs: NOW - 1 }), WORKER), "delegate_expired");
+    });
+
+    it("limits a chain-acting key to a 90 day life, a memory key is unaffected", () => {
+        const caps = MEMORY | CAP_TASK_TRADE;
+        assert.equal(
+            refusal(ctx({ capabilities: caps, expiresAtMs: NOW + MAX_TASK_WORKER_LIFETIME_MS }), WORKER),
+            "allowed",
+        );
+        assert.equal(
+            refusal(ctx({ capabilities: caps, expiresAtMs: NOW + MAX_TASK_WORKER_LIFETIME_MS + 1 }), WORKER),
+            "delegate_expiry_too_far",
+        );
+        assert.equal(refusal(ctx({ expiresAtMs: NOW + 400 * 86_400_000 })), "allowed");
     });
 });
