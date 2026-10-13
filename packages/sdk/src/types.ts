@@ -137,6 +137,21 @@ export interface AnalyzeResult {
     owner: string;
 }
 
+/** Result of a reserve-before-provider chat completion (`gatewayInference`). */
+export interface GatewayInferenceResult {
+    content: string;
+    tokensIn: number;
+    tokensOut: number;
+    /** What the call cost, in MIST, taken from the agent's AI-credit balance. */
+    amountMist: number;
+    billingState: string;
+    reservationNonce: number | null;
+    reserveDigest: string | null;
+    captureDigest: string | null;
+    /** The provider's id for this generation, when the gateway reports one. */
+    providerGenerationId: string | null;
+}
+
 /** Runtime compatibility metadata from GET /version */
 export interface RelayerVersionMetadata {
     relayerVersion: string;

@@ -10,6 +10,12 @@ export interface SocialChainConfig {
     socialGraphId?: string;
     /** Shared `agent_task::TaskConfig`; required by the `task.*` actions. */
     taskConfigId?: string;
+    /** Shared `jury::JuryConfig`; required by the `jury.*` actions and task disputes. */
+    juryConfigId?: string;
+    /** Shared `jury::JurorRoster`; required by roster-reading jury actions. */
+    jurorRosterId?: string;
+    /** Shared `profile::EcosystemTreasury`; required by global governance jury actions. */
+    ecosystemTreasuryId?: string;
     messagingPackageId?: string;
     messagingVersionId?: string;
     messagingConfigId?: string;
@@ -332,6 +338,156 @@ export interface TaskRefundProposalParams {
     sellerAgentId: string;
 }
 
+/** A party takes delivered work to a jury. The acting side pays the case fee from `feeCoinId`. */
+export interface TaskOpenDisputeParams {
+    taskId: string;
+    buyerAccountId: string;
+    sellerAccountId: string;
+    sellerAgentId: string;
+    /** MYSO coin that pays the case fee; the contract returns change. */
+    feeCoinId: string;
+}
+
+/** The other side matching the case fee, or the losing side appealing (twice the fee). */
+export interface TaskDisputeFeeParams {
+    taskId: string;
+    caseId: string;
+    buyerAccountId: string;
+    sellerAgentId: string;
+    feeCoinId: string;
+}
+
+export interface TaskDisputeEvidenceParams {
+    taskId: string;
+    caseId: string;
+    buyerAccountId: string;
+    sellerAgentId: string;
+    /** sha256 of the evidence content, 64 lowercase hex characters. */
+    digestHex: string;
+    uri: string;
+}
+
+export interface TaskCancelDisputeParams {
+    taskId: string;
+    caseId: string;
+    buyerAccountId: string;
+    sellerAgentId: string;
+}
+
+export interface TaskProposeDisputeSettlementParams {
+    taskId: string;
+    buyerAccountId: string;
+    sellerAgentId: string;
+    /** 0 pay the seller, 1 refund the buyer, 2 split 50/50. */
+    outcome: number;
+}
+
+export interface TaskAcceptDisputeSettlementParams {
+    taskId: string;
+    buyerAccountId: string;
+    sellerAccountId: string;
+    sellerAgentId: string;
+    platformObjectId?: string;
+}
+
+export interface TaskClearDisputeSettlementParams {
+    taskId: string;
+    buyerAccountId: string;
+    sellerAgentId: string;
+}
+
+/** A juror seat: `agentId` is the juror's own agent, the acting account is its owner account. */
+export interface JuryAcceptParams {
+    caseId: string;
+    agentId: string;
+}
+
+export interface JuryCommitVoteParams {
+    caseId: string;
+    agentId: string;
+    /** sha3-256 commitment, 64 lowercase hex characters (see `jury::compute_commitment`). */
+    commitmentHex: string;
+}
+
+export interface JuryRevealVoteParams {
+    caseId: string;
+    agentId: string;
+    outcome: number;
+    rationaleDigestHex: string;
+    /** Indexes of the evidence items the vote relies on, as u64 decimal strings. */
+    evidenceRefs: string[];
+    bundleDigestHex: string;
+    saltHex: string;
+}
+
+export interface JuryClaimFeeParams {
+    caseId: string;
+    agentId: string;
+}
+
+/** Cranks that need nothing but the case. */
+export interface JuryCaseParams {
+    caseId: string;
+}
+
+export interface JuryTaskVerdictParams {
+    taskId: string;
+    caseId: string;
+    buyerAccountId: string;
+    sellerAccountId: string;
+    platformObjectId?: string;
+}
+
+export interface JuryStartNeutralParams {
+    taskId: string;
+    caseId: string;
+}
+
+export interface JuryExecuteNeutralParams {
+    taskId: string;
+    buyerAccountId: string;
+    sellerAccountId: string;
+    platformObjectId?: string;
+}
+
+export interface JurySettleFeesParams {
+    taskId: string;
+    caseId: string;
+    /** True when the dispute ended by agreement and the jury case is still open. */
+    closeCaseFirst?: boolean;
+}
+
+export interface JuryEscalateProposalParams {
+    registryId: string;
+    proposalId: string;
+    /** 1 council step, 2 community step. */
+    stage: number;
+    /** Set for a platform registry. */
+    platformId?: string;
+}
+
+export interface JuryFinalizeProposalParams {
+    registryId: string;
+    proposalId: string;
+    platformId?: string;
+}
+
+export interface JuryApplyDecisionParams {
+    registryId: string;
+    proposalId: string;
+    caseId: string;
+    platformId?: string;
+}
+
+export interface JuryRefreshRosterParams {
+    accountId: string;
+    agentId: string;
+}
+
+export interface JuryEvictParams {
+    agentId: string;
+}
+
 export interface TaskReviewParams {
     taskId: string;
     /** Which side is rating: `buyer` rates the seller agent, `seller` rates the buyer. */
@@ -403,4 +559,30 @@ export type SocialExecuteAction =
     | "task_accept_refund"
     | "task_reject_refund"
     | "task_withdraw_refund"
-    | "task_review";
+    | "task_review"
+    | "task_open_dispute"
+    | "task_respond_dispute"
+    | "task_dispute_evidence"
+    | "task_appeal_dispute"
+    | "task_cancel_dispute"
+    | "task_propose_dispute_settlement"
+    | "task_accept_dispute_settlement"
+    | "task_clear_dispute_settlement"
+    | "jury_accept"
+    | "jury_commit_vote"
+    | "jury_reveal_vote"
+    | "jury_claim_fee"
+    | "jury_select"
+    | "jury_replace_no_shows"
+    | "jury_finalize_round"
+    | "jury_finalize_case"
+    | "jury_execute_task_verdict"
+    | "jury_start_neutral_resolution"
+    | "jury_execute_neutral_resolution"
+    | "jury_settle_dispute_fees"
+    | "jury_escalate_proposal"
+    | "jury_finalize_proposal"
+    | "jury_apply_proposal_decision"
+    | "jury_sweep_case"
+    | "jury_refresh_roster_entry"
+    | "jury_evict_ineligible";

@@ -39,6 +39,7 @@ import type {
     MemoryVisibility,
     EmbedResult,
     AnalyzeResult,
+    GatewayInferenceResult,
     HealthResult,
     RelayerVersionMetadata,
     RememberManualOptions,
@@ -450,6 +451,49 @@ export class Memory {
                 tokens_out: params.tokensOut,
             },
         );
+    }
+
+    /**
+     * One bounded chat completion paid from this agent's AI-credit balance. The relayer reserves the
+     * funds on-chain before it contacts the provider, and the same `idempotencyKey` always returns
+     * the same answer without charging twice. The agent needs the AI-spend capability.
+     */
+    async gatewayInference(params: {
+        modelId: string;
+        prompt: string;
+        systemPrompt?: string;
+        maxTokens?: number;
+        idempotencyKey?: string;
+    }): Promise<GatewayInferenceResult> {
+        await this.ensureCompatibleRelayer();
+        const raw = await this.signedRequest<{
+            content: string;
+            tokens_in: number;
+            tokens_out: number;
+            amount_mist: number;
+            billing_state: string;
+            reservation_nonce: number | null;
+            reserve_digest: string | null;
+            capture_digest: string | null;
+            provider_generation_id?: string | null;
+        }>("POST", "/api/ai-credit/inference", {
+            model_id: params.modelId,
+            prompt: params.prompt,
+            system_prompt: params.systemPrompt,
+            max_tokens: params.maxTokens,
+            idempotency_key: params.idempotencyKey,
+        });
+        return {
+            content: raw.content,
+            tokensIn: raw.tokens_in,
+            tokensOut: raw.tokens_out,
+            amountMist: raw.amount_mist,
+            billingState: raw.billing_state,
+            reservationNonce: raw.reservation_nonce ?? null,
+            reserveDigest: raw.reserve_digest ?? null,
+            captureDigest: raw.capture_digest ?? null,
+            providerGenerationId: raw.provider_generation_id ?? null,
+        };
     }
 
     /**

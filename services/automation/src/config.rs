@@ -24,6 +24,11 @@ pub struct Config {
     /// so one value covers the whole stack.
     pub memory_bridge_secret: String,
     pub tick_interval_secs: u64,
+    /// `AUTOMATION_EVENT_BUS_CAPACITY`: events the bus buffers for a slow consumer.
+    pub event_bus_capacity: usize,
+    /// `AUTOMATION_EVENT_CONCURRENCY`: events evaluated at once. One slow webhook must not hold up
+    /// every event behind it.
+    pub event_concurrency: usize,
     pub enabled: bool,
     /// `AUTOMATION_WEBHOOK_ALLOW_PRIVATE`: lets `webhook` jobs call http and private-network
     /// hosts. For local development only; the default refuses both.
@@ -104,6 +109,14 @@ impl Config {
             tick_interval_secs: non_blank(lookup("AUTOMATION_TICK_INTERVAL_SECS"))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(60),
+            event_bus_capacity: non_blank(lookup("AUTOMATION_EVENT_BUS_CAPACITY"))
+                .and_then(|v| v.parse().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(crate::event_bus::DEFAULT_BUS_CAPACITY),
+            event_concurrency: non_blank(lookup("AUTOMATION_EVENT_CONCURRENCY"))
+                .and_then(|v| v.parse().ok())
+                .filter(|v| (1..=256).contains(v))
+                .unwrap_or(8),
             enabled: parse_bool(lookup("AUTOMATION_ENABLED"), true),
             webhook_allow_private: parse_bool(lookup("AUTOMATION_WEBHOOK_ALLOW_PRIVATE"), false),
             secret_is_placeholder,
@@ -267,6 +280,26 @@ mod tests {
         for value in ["false", "FALSE", "0", "no"] {
             let lookup = lookup_from(&[("AUTOMATION_ENABLED", value)]);
             assert!(!Config::from_lookup(&lookup).enabled, "{value} should disable");
+        }
+    }
+
+    #[test]
+    fn the_event_bus_defaults_to_room_for_a_jury_burst_and_ignores_nonsense() {
+        let config = Config::from_lookup(&lookup_from(&[]));
+        assert_eq!(config.event_bus_capacity, crate::event_bus::DEFAULT_BUS_CAPACITY);
+        assert_eq!(config.event_concurrency, 8);
+        let set = Config::from_lookup(&lookup_from(&[
+            ("AUTOMATION_EVENT_BUS_CAPACITY", "50000"),
+            ("AUTOMATION_EVENT_CONCURRENCY", "32"),
+        ]));
+        assert_eq!((set.event_bus_capacity, set.event_concurrency), (50_000, 32));
+        for bad in [("0", "0"), ("nope", "999"), ("-1", "")] {
+            let config = Config::from_lookup(&lookup_from(&[
+                ("AUTOMATION_EVENT_BUS_CAPACITY", bad.0),
+                ("AUTOMATION_EVENT_CONCURRENCY", bad.1),
+            ]));
+            assert_eq!(config.event_bus_capacity, crate::event_bus::DEFAULT_BUS_CAPACITY, "{bad:?}");
+            assert_eq!(config.event_concurrency, 8, "{bad:?}");
         }
     }
 

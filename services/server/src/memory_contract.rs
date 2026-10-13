@@ -18,6 +18,10 @@ pub const CAP_AI_SPEND: u64 = 16384;
 pub const CAP_BUDGET_MANAGE: u64 = 32768;
 pub const CAP_SOCIAL_GRAPH: u64 = 65536;
 pub const CAP_TASK_TRADE: u64 = 131072;
+/// Serve on a jury. Spends nothing.
+pub const CAP_JURY: u64 = 262144;
+/// Run the permissionless jury cranks. Spends nothing.
+pub const CAP_JURY_KEEPER: u64 = 524288;
 
 pub const CLASS_HUMAN: u8 = 0;
 pub const CLASS_DELEGATED_AI: u8 = 1;
@@ -129,6 +133,8 @@ pub fn capability_label(cap: u64) -> &'static str {
         CAP_BUDGET_MANAGE => "budget_manage",
         CAP_SOCIAL_GRAPH => "social_graph",
         CAP_TASK_TRADE => "task_trade",
+        CAP_JURY => "jury",
+        CAP_JURY_KEEPER => "jury_keeper",
         _ => "unknown",
     }
 }

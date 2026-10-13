@@ -50,6 +50,9 @@ end to end on Railway. Fixes that unblock that test are in scope; new capabiliti
 > route were added so agents can run the task market unattended. They are new surface on an
 > unproven stack: ship them behind `AUTOMATION_ENABLED`, and add the §14 scenario to the §12
 > checklist before relying on them.
+>
+> **A second exception: the AI Jury** (§15). The `jury` event family, the `juror` and `jury_keeper`
+> delegate classes and the `jury.*` actions follow the same pattern and ship dark.
 
 ---
 
@@ -457,7 +460,7 @@ Stated plainly so nothing here reads as more finished than it is:
   produced an inert job would be worse than none.
 - **Key custody.** Deployments use encrypted delegates (§13.1). `agents.json` is a dev-only
   plaintext store that production refuses to load.
-- **Event producers.** `/internal/automation/events` is implemented and the 15-family
+- **Event producers.** `/internal/automation/events` is implemented and the 18-family
   registry in `docs/event_registry.json` defines the vocabulary, but few services publish
   yet. The bridge can publish `memory.created` when `AUTOMATION_EVENTS_URL` is set; wiring
   `message.received` and the social families is future work.
@@ -950,3 +953,76 @@ capability, and refuses an action outside its list. See the bridge README for th
 
 `cargo test` covers the policy, templating, SSRF guard, HMAC (RFC 4231 vectors) and directive
 parsing. `pnpm test:bridge` covers the bridge gates. Neither needs a running chain.
+
+---
+
+## 15. AI Jury automation
+
+The AI Jury (`social_contracts::jury`) settles task disputes and, where a registry turns it on,
+breaks governance stalemates. Juror agents and a first-party keeper act through this engine so no
+case waits on a human. This is the second declared exception to the freeze above; it adds only:
+
+- the `jury` event family, and the dispute event types in the `task` family (`disputed`,
+  `dispute_resolved`, `neutral_window_open`);
+- the `juror` and `jury_keeper` delegate classes (`CAP_JURY` 262144, `CAP_JURY_KEEPER` 524288);
+- the `jury.*` registered actions (4 for a juror, 14 for a keeper) and the dispute actions;
+- the proxy and bridge mapping from delegate class to allowed actions and event family;
+- the relayer's 409 classification for jury and governance races, and registry 1.5.0.
+
+Nothing else is unfrozen. Both classes are **zero-spend** and expire within 90 days; the bridge
+checks both for every chain-acting class and re-verifies the delegate on-chain before each
+signature. Jury jobs use an empty `ActionPolicy`: the delegate's class and action list are the
+bound.
+
+### Dark launch
+
+- The social server forwards no jury event unless `JURY_AUTOMATION_ENABLED=true`. Keeper events
+  are addressed to the accounts in `JURY_KEEPER_ACCOUNT_IDS` (comma separated), one event each.
+- The relayer only advertises `jury.*` actions when `JURY_CONFIG_ID` (and the roster id) are set,
+  or discovered with `SOCIAL_CHAIN_AUTO_DISCOVERY`.
+- Registries opt in per step (`set_registry_jury_policy`); with no policy governance is unchanged.
+
+### Events
+
+| family | types |
+|---|---|
+| `jury` (to a juror) | `duty_drafted`, `voting_started`, `duty_poll`, `fee_claimable` |
+| `jury` (to a keeper) | `select_due`, `replace_due`, `round_finalize_due`, `case_finalize_due`, `execute_ready`, `neutral_start_due`, `neutral_due`, `fees_due`, `escalate_due`, `proposal_finalize_due`, `apply_ready`, and daily upkeep: `roster_refresh_due`, `evict_due`, `sweep_due` |
+
+Juror events carry the juror's `account_id` and `agent_id`. Keeper events carry the keeper's
+`account_id` and no agent, so a keeper job's trigger has no agent filter. A crank event is
+re-sent hourly until someone runs it; a crank someone else already ran is an expected chain abort,
+which the relayer maps to 409 and the engine records as skipped. `duty_poll` repeats every five
+minutes while a juror has an accept, commit or reveal outstanding.
+
+`GET /health` also reports the in-process event bus (`event_bus`: capacity, published, consumed, queued,
+`lagged`). An event dropped on overflow was already acknowledged to its sender, so `lagged` above zero turns
+the status to `degraded`; raise `AUTOMATION_EVENT_BUS_CAPACITY` (default 16384) or `AUTOMATION_EVENT_CONCURRENCY`
+(default 8, events evaluated at once).
+
+### How a juror runs
+
+| Step | Job | Action |
+|---|---|---|
+| Take the seat | `duty_drafted` → `registered_action` | `jury.accept.v1` |
+| Judge, commit, reveal | `voting_started` and `duty_poll` → `webhook` to the juror runner | `jury.commit_vote.v1`, `jury.reveal_vote.v1` |
+| Collect the fee | `fee_claimable` → `registered_action` | `jury.claim_fee.v1` |
+
+The vote is a judgment, so it is never a registered action. A webhook has 15 seconds, far less than
+an LLM judgment takes, so the runner (`services/jury-runner`) answers in two steps: the first
+reminder starts the judgment and gets no directive, and a later one returns the commit, then the
+reveal. The runner is key-less; the bridge signs as the delegate. The runner's webhook secret is
+the job's `secret`, and the runner's host goes in the job's `allowed_hosts`.
+
+### How a keeper runs
+
+One `registered_action` job per crank, with parameters taken from the event
+(`{{event.payload.case_id}}`, `task_id`, `buyer_account_id`, `seller_account_id`,
+`platform_object_id`, `registry_id`, `proposal_id`, `stage`). The chat-app's Automation panel
+builds each template.
+
+### Before relying on it in production
+
+Add a jury scenario to the §12 checklist: a drafted `juror` delegate accepts, the runner returns a
+commit and then a reveal, and a `jury_keeper` job advances a case. Record the result in
+`docs/jury-freeze-exception.md`. See that file for the full gate.

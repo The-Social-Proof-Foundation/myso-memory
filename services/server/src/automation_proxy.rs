@@ -393,9 +393,9 @@ pub struct PutDelegateBody {
     pub mydata_key_id: String,
     /// The encrypted envelope (base64url). Opaque to this service.
     pub encrypted_key: String,
-    /// `memory` (default) or `task_worker`.
+    /// `memory` (default), `task_worker`, `juror` or `jury_keeper`.
     pub delegate_class: Option<String>,
-    /// Task actions a `task_worker` may run. Must be empty or absent for `memory`.
+    /// The actions a chain-acting delegate may run. Must be empty or absent for `memory`.
     pub allowed_action_ids: Option<Vec<String>>,
 }
 
@@ -431,19 +431,66 @@ pub async fn put_delegate(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Mirrors the engine's rule: a memory delegate runs no chain actions; a task worker runs task
-/// market actions only. The engine and the bridge check it again.
+/// A juror's own steps. Must match the engine's and the bridge's lists.
+const JUROR_ACTION_IDS: &[&str] = &[
+    "jury.accept.v1",
+    "jury.commit_vote.v1",
+    "jury.reveal_vote.v1",
+    "jury.claim_fee.v1",
+];
+
+/// The permissionless jury cranks. Must match the engine's and the bridge's lists.
+const KEEPER_ACTION_IDS: &[&str] = &[
+    "jury.select_jury.v1",
+    "jury.replace_no_shows.v1",
+    "jury.finalize_round.v1",
+    "jury.finalize_case.v1",
+    "jury.execute_task_verdict.v1",
+    "jury.start_neutral_resolution.v1",
+    "jury.execute_neutral_resolution.v1",
+    "jury.settle_dispute_fees.v1",
+    "jury.escalate_proposal.v1",
+    "jury.finalize_proposal.v1",
+    "jury.apply_proposal_decision.v1",
+    "jury.sweep_case.v1",
+    "jury.refresh_roster_entry.v1",
+    "jury.evict_ineligible.v1",
+];
+
+/// The event family a chain-acting class's jobs may subscribe to.
+fn class_event_family(class: &str) -> Option<&'static str> {
+    match class {
+        "task_worker" => Some("task"),
+        "juror" | "jury_keeper" => Some("jury"),
+        _ => None,
+    }
+}
+
+/// Whether a delegate of `class` may be allowed to run `id`.
+fn class_may_run(class: &str, id: &str) -> bool {
+    match class {
+        "task_worker" => is_action_id_in(id, "task"),
+        "juror" => is_action_id_in(id, "jury") && JUROR_ACTION_IDS.contains(&id),
+        "jury_keeper" => is_action_id_in(id, "jury") && KEEPER_ACTION_IDS.contains(&id),
+        _ => false,
+    }
+}
+
+/// Mirrors the engine's rule: a memory delegate runs no chain actions; every other class runs only
+/// its own. The engine and the bridge check it again.
 fn validate_delegate_class(class: &str, allowed_action_ids: &[String]) -> Result<(), ProxyError> {
     let invalid = |message: &str| Err(ProxyError::InvalidRequest(message.to_string()));
     match class {
         "memory" if allowed_action_ids.is_empty() => Ok(()),
-        "memory" => invalid("a memory delegate cannot run chain actions; use the task_worker class"),
-        "task_worker" => {
+        "memory" => invalid(
+            "a memory delegate cannot run chain actions; use the task_worker, juror or jury_keeper class",
+        ),
+        "task_worker" | "juror" | "jury_keeper" => {
             if allowed_action_ids.is_empty() || allowed_action_ids.len() > 16 {
-                return invalid("a task_worker delegate needs 1 to 16 allowed_action_ids");
+                return invalid("a chain-acting delegate needs 1 to 16 allowed_action_ids");
             }
-            if allowed_action_ids.iter().any(|id| !is_task_action_id(id)) {
-                return invalid("a task_worker delegate may only be allowed task.* actions");
+            if allowed_action_ids.iter().any(|id| !class_may_run(class, id)) {
+                return invalid("allowed_action_ids includes an action this delegate class may not run");
             }
             Ok(())
         }
@@ -451,13 +498,13 @@ fn validate_delegate_class(class: &str, allowed_action_ids: &[String]) -> Result
     }
 }
 
-/// `task.<name>.v<digits>` with lowercase letters and underscores in the name.
-fn is_task_action_id(id: &str) -> bool {
+/// `<namespace>.<name>.v<digits>` with lowercase letters and underscores in the name.
+fn is_action_id_in(id: &str, expected_namespace: &str) -> bool {
     let parts: Vec<&str> = id.split('.').collect();
     let [namespace, name, version] = parts.as_slice() else {
         return false;
     };
-    *namespace == "task"
+    *namespace == expected_namespace
         && !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
         && version.len() > 1
@@ -549,16 +596,16 @@ fn validate_chain_job(
     webhook_allowed_hosts: &[String],
 ) -> Result<(), ProxyError> {
     let invalid = |message: String| Err(ProxyError::InvalidRequest(message));
-    if delegate.class != "task_worker" {
-        return invalid("chain actions need a task_worker delegate".into());
-    }
+    let Some(family) = class_event_family(&delegate.class) else {
+        return invalid("chain actions need a task_worker, juror or jury_keeper delegate".into());
+    };
     let config = action.get("config").cloned().unwrap_or(Value::Null);
     let permitted = |id: &str| delegate.allowed_action_ids.iter().any(|allowed| allowed == id);
 
     match action.get("kind").and_then(Value::as_str) {
         Some("registered_action") => {
             let id = config.get("action_id").and_then(Value::as_str).unwrap_or_default();
-            if !is_task_action_id(id) || !permitted(id) {
+            if !class_may_run(&delegate.class, id) || !permitted(id) {
                 return invalid(format!("`{id}` is not an action this delegate may run"));
             }
         }
@@ -568,9 +615,9 @@ fn validate_chain_job(
                 .and_then(Value::as_array)
                 .map(|ids| ids.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            if ids.is_empty() || ids.iter().any(|id| !is_task_action_id(id) || !permitted(id)) {
+            if ids.is_empty() || ids.iter().any(|id| !class_may_run(&delegate.class, id) || !permitted(id)) {
                 return invalid(
-                    "webhook allowed_action_ids must be task actions this delegate may run".into(),
+                    "webhook allowed_action_ids must be actions this delegate may run".into(),
                 );
             }
             if !webhook_allowed_hosts.is_empty() {
@@ -594,20 +641,26 @@ fn validate_chain_job(
         .filter(|triggers| !triggers.is_empty())
         .ok_or_else(|| ProxyError::InvalidRequest("a chain action needs at least one trigger".into()))?;
     for trigger in triggers.iter_mut() {
-        let is_task_event = trigger.get("kind").and_then(Value::as_str) == Some("event")
-            && trigger.get("event_family").and_then(Value::as_str) == Some("task");
-        if !is_task_event {
-            return invalid("chain action jobs may only use task event triggers".into());
+        let is_family_event = trigger.get("kind").and_then(Value::as_str) == Some("event")
+            && trigger.get("event_family").and_then(Value::as_str) == Some(family);
+        if !is_family_event {
+            return invalid(format!("this delegate's jobs may only use {family} event triggers"));
         }
         let Some(object) = trigger.as_object_mut() else {
             return invalid("malformed trigger".into());
         };
         object.remove("organization_id");
         object.insert("account_id".into(), Value::String(canonical_object_id(account_id)));
-        object.insert(
-            "agent_object_id".into(),
-            Value::String(canonical_object_id(&delegate.agent_object_id)),
-        );
+        if delegate.class == "jury_keeper" {
+            // A crank event belongs to the keeper's account, not to one agent, so an agent filter
+            // would never match it.
+            object.remove("agent_object_id");
+        } else {
+            object.insert(
+                "agent_object_id".into(),
+                Value::String(canonical_object_id(&delegate.agent_object_id)),
+            );
+        }
     }
     Ok(())
 }
@@ -840,6 +893,104 @@ mod tests {
         assert!(validate_delegate_class("task_worker", &ids(&["social.create_post.v1"])).is_err());
         assert!(validate_delegate_class("task_worker", &ids(&["task.accept"])).is_err());
         assert!(validate_delegate_class("admin", &[]).is_err());
+    }
+
+    fn juror() -> DelegateInfo {
+        DelegateInfo {
+            agent_object_id: "0xjuror".into(),
+            class: "juror".into(),
+            allowed_action_ids: vec!["jury.accept.v1".into(), "jury.commit_vote.v1".into()],
+        }
+    }
+
+    fn keeper() -> DelegateInfo {
+        DelegateInfo {
+            agent_object_id: "0xkeeper".into(),
+            class: "jury_keeper".into(),
+            allowed_action_ids: vec!["jury.finalize_round.v1".into(), "jury.select_jury.v1".into()],
+        }
+    }
+
+    fn jury_triggers(event_type: &str) -> Value {
+        serde_json::json!({
+            "match_mode": "any",
+            "triggers": [{
+                "kind": "event", "event_family": "jury", "event_type": event_type,
+                "organization_id": "0xother-org", "account_id": "0xsomeone-else",
+                "agent_object_id": "0xsomeone-elses-agent",
+            }],
+        })
+    }
+
+    fn registered(id: &str) -> Value {
+        serde_json::json!({ "kind": "registered_action", "config": { "action_id": id } })
+    }
+
+    #[test]
+    fn a_jurors_jobs_are_bound_to_its_account_and_agent_on_jury_events() {
+        let mut triggers = jury_triggers("duty_drafted");
+        validate_chain_job(&registered("jury.accept.v1"), &mut triggers, "0xmine", &juror(), &[]).unwrap();
+        let trigger = &triggers["triggers"][0];
+        assert_eq!(trigger["account_id"], canonical_object_id("0xmine"));
+        assert_eq!(trigger["agent_object_id"], canonical_object_id("0xjuror"));
+        assert!(trigger.get("organization_id").is_none());
+    }
+
+    #[test]
+    fn a_keepers_jobs_are_bound_to_its_account_only() {
+        let mut triggers = jury_triggers("round_finalize_due");
+        validate_chain_job(&registered("jury.finalize_round.v1"), &mut triggers, "0xmine", &keeper(), &[]).unwrap();
+        let trigger = &triggers["triggers"][0];
+        assert_eq!(trigger["account_id"], canonical_object_id("0xmine"));
+        // Crank events name no agent, so the foreign agent filter must be removed, not replaced.
+        assert!(trigger.get("agent_object_id").is_none());
+    }
+
+    #[test]
+    fn jury_delegates_cannot_run_each_others_actions_or_task_actions() {
+        let run = |id: &str, delegate: &DelegateInfo| {
+            validate_chain_job(&registered(id), &mut jury_triggers("x"), "0xmine", delegate, &[])
+        };
+        assert!(run("jury.accept.v1", &juror()).is_ok());
+        assert!(run("jury.finalize_round.v1", &juror()).is_err());
+        assert!(run("jury.accept.v1", &keeper()).is_err());
+        assert!(run("task.settle.v1", &juror()).is_err());
+        assert!(run("task.settle.v1", &keeper()).is_err());
+        // Allowed by the class but not registered for this delegate.
+        assert!(run("jury.claim_fee.v1", &juror()).is_err());
+        assert!(run("jury.sweep_case.v1", &keeper()).is_err());
+    }
+
+    #[test]
+    fn each_class_may_only_subscribe_to_its_own_event_family() {
+        let on_family = |family: &str, delegate: &DelegateInfo, id: &str| {
+            let mut triggers = serde_json::json!({
+                "match_mode": "any",
+                "triggers": [{ "kind": "event", "event_family": family, "event_type": "x" }],
+            });
+            validate_chain_job(&registered(id), &mut triggers, "0xmine", delegate, &[])
+        };
+        assert!(on_family("jury", &juror(), "jury.accept.v1").is_ok());
+        assert!(on_family("task", &juror(), "jury.accept.v1").is_err());
+        assert!(on_family("task", &worker(), "task.accept.v1").is_ok());
+        assert!(on_family("jury", &worker(), "task.accept.v1").is_err());
+        assert!(on_family("jury", &keeper(), "jury.select_jury.v1").is_ok());
+        assert!(on_family("memory", &keeper(), "jury.select_jury.v1").is_err());
+    }
+
+    #[test]
+    fn jury_classes_are_validated_before_they_reach_the_engine() {
+        let ids = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(validate_delegate_class("juror", &ids(&["jury.accept.v1", "jury.reveal_vote.v1"])).is_ok());
+        assert!(validate_delegate_class("jury_keeper", &ids(KEEPER_ACTION_IDS)).is_ok());
+        assert!(validate_delegate_class("juror", &ids(&["jury.select_jury.v1"])).is_err());
+        assert!(validate_delegate_class("jury_keeper", &ids(&["jury.accept.v1"])).is_err());
+        assert!(validate_delegate_class("juror", &ids(&["task.accept.v1"])).is_err());
+        assert!(validate_delegate_class("task_worker", &ids(&["jury.accept.v1"])).is_err());
+        assert!(validate_delegate_class("juror", &[]).is_err());
+        assert_eq!(JUROR_ACTION_IDS.len(), 4);
+        assert_eq!(KEEPER_ACTION_IDS.len(), 14);
+        assert!(JUROR_ACTION_IDS.iter().all(|id| !KEEPER_ACTION_IDS.contains(id)));
     }
 
     #[test]

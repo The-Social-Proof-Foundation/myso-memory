@@ -14,7 +14,10 @@ import { describe, it } from "node:test";
 import {
     BridgeError,
     MemoryBridge,
+    JUROR_ACTION_IDS,
+    KEEPER_ACTION_IDS,
     TASK_ACTION_IDS,
+    classForAction,
     normalizeObjectId,
     wrapChainError,
     type ChainClientTarget,
@@ -580,7 +583,7 @@ describe("chain actions", () => {
     type Opened = {
         seedHex: string;
         agentObjectId: string;
-        delegateClass: "memory" | "task_worker";
+        delegateClass: "memory" | "task_worker" | "juror" | "jury_keeper";
         allowedActionIds: string[];
     };
 
@@ -657,8 +660,143 @@ describe("chain actions", () => {
     }
 
     it("covers exactly the task market actions", () => {
-        assert.equal(TASK_ACTION_IDS.size, 14);
+        assert.equal(TASK_ACTION_IDS.size, 22);
         assert.ok([...TASK_ACTION_IDS].every((id) => id.startsWith("task.")));
+    });
+
+    it("splits the jury actions between a juror and a keeper with no overlap", () => {
+        assert.deepEqual(
+            [...JUROR_ACTION_IDS].sort(),
+            ["jury.accept.v1", "jury.claim_fee.v1", "jury.commit_vote.v1", "jury.reveal_vote.v1"],
+        );
+        assert.equal(KEEPER_ACTION_IDS.size, 14);
+        assert.ok([...KEEPER_ACTION_IDS].every((id) => id.startsWith("jury.") && !JUROR_ACTION_IDS.has(id)));
+        for (const id of [...TASK_ACTION_IDS, ...JUROR_ACTION_IDS, ...KEEPER_ACTION_IDS]) {
+            assert.equal(
+                [TASK_ACTION_IDS, JUROR_ACTION_IDS, KEEPER_ACTION_IDS].filter((set) => set.has(id)).length,
+                1,
+                id,
+            );
+        }
+    });
+
+    it("names the one class that may run an action", () => {
+        assert.equal(classForAction("task.deliver.v1"), "task_worker");
+        assert.equal(classForAction("jury.commit_vote.v1"), "juror");
+        assert.equal(classForAction("jury.select_jury.v1"), "jury_keeper");
+        assert.equal(classForAction("jury.vote_for_me.v1"), undefined);
+        assert.equal(classForAction("social.create_post.v1"), undefined);
+    });
+
+    it("runs a juror's step as a juror, needing only the jury capability", async () => {
+        const { bridge, verified } = actBridge({
+            open: async () => ({
+                seedHex: SEED,
+                agentObjectId: "agent1",
+                delegateClass: "juror",
+                allowedActionIds: ["jury.commit_vote.v1"],
+            }),
+        });
+        const result = await bridge.act(request({ action_id: "jury.commit_vote.v1", params: { caseId: "0xc" } }));
+        assert.equal(result.status, "executed");
+        assert.deepEqual(verified, [
+            {
+                seedHex: SEED,
+                serverUrl: SERVER_URL,
+                accountId: "0xacct",
+                agentObjectId: "agent1",
+                needs: 262144,
+                delegateClass: "juror",
+            },
+        ]);
+    });
+
+    it("reports how long a delegate has left without signing or running anything", async () => {
+        const DAY = 24 * 60 * 60 * 1000;
+        const inspected: unknown[] = [];
+        const bridge = new MemoryBridge({
+            delegates: {
+                open: async () => ({
+                    seedHex: SEED,
+                    agentObjectId: "agent1",
+                    delegateClass: "jury_keeper" as const,
+                    allowedActionIds: [],
+                }),
+            },
+            verifier: {
+                inspect: async (target: unknown) => {
+                    inspected.push(target);
+                    return { expiresAtMs: Date.now() + 10 * DAY };
+                },
+            } as never,
+            delegateDefaults: { serverUrl: SERVER_URL, namespace: "chat-app" },
+            requestTimeoutMs: 5_000,
+        });
+        const status = await bridge.delegateStatus({ key_ref: "delegate:keeper", account_id: "0xacct" });
+        assert.equal(status.status, "active");
+        assert.equal(status.delegate_class, "jury_keeper");
+        assert.ok((status.expires_in_ms ?? 0) > 9 * DAY && (status.expires_in_ms ?? 0) <= 10 * DAY);
+        assert.deepEqual(inspected, [{ seedHex: SEED, serverUrl: SERVER_URL, accountId: "0xacct" }]);
+    });
+
+    it("calls a revoked or expired delegate inactive instead of failing, and refuses a static key", async () => {
+        const rejecting = new MemoryBridge({
+            delegates: {
+                open: async () => ({ seedHex: SEED, agentObjectId: "a", delegateClass: "juror" as const, allowedActionIds: [] }),
+            },
+            verifier: {
+                inspect: async () => {
+                    throw new BridgeError("the delegate is revoked, expired, inactive or not registered", 403, "delegate_rejected");
+                },
+            } as never,
+            delegateDefaults: { serverUrl: SERVER_URL, namespace: "chat-app" },
+            requestTimeoutMs: 5_000,
+        });
+        const status = await rejecting.delegateStatus({ key_ref: "delegate:j", account_id: "0xacct" });
+        assert.equal(status.status, "inactive");
+        assert.match(status.reason ?? "", /revoked/);
+        const err = await rejecting
+            .delegateStatus({ key_ref: "agent-a", account_id: "0xacct" })
+            .catch((e: unknown) => e as BridgeError);
+        assert.equal((err as BridgeError).code, "invalid_request");
+    });
+
+    it("runs a crank as a keeper, needing only the keeper capability", async () => {
+        const { bridge, verified } = actBridge({
+            open: async () => ({
+                seedHex: SEED,
+                agentObjectId: "agent1",
+                delegateClass: "jury_keeper",
+                allowedActionIds: ["jury.finalize_round.v1"],
+            }),
+        });
+        await bridge.act(request({ action_id: "jury.finalize_round.v1", params: { caseId: "0xc" } }));
+        assert.equal((verified[0] as { needs: number }).needs, 524288);
+        assert.equal((verified[0] as { delegateClass: string }).delegateClass, "jury_keeper");
+    });
+
+    it("refuses a delegate of the wrong class for the action, in every direction", async () => {
+        const cases: Array<[string, "task_worker" | "juror" | "jury_keeper"]> = [
+            ["jury.commit_vote.v1", "task_worker"],
+            ["jury.commit_vote.v1", "jury_keeper"],
+            ["jury.select_jury.v1", "juror"],
+            ["jury.select_jury.v1", "task_worker"],
+            ["task.settle.v1", "juror"],
+            ["task.settle.v1", "jury_keeper"],
+        ];
+        for (const [action_id, delegateClass] of cases) {
+            const { bridge, clients } = actBridge({
+                open: async () => ({
+                    seedHex: SEED,
+                    agentObjectId: "agent1",
+                    delegateClass,
+                    allowedActionIds: [action_id],
+                }),
+            });
+            const err = await failure(bridge.act(request({ action_id })));
+            assert.equal(err.code, "delegate_wrong_class", `${delegateClass} → ${action_id}`);
+            assert.equal(clients.length, 0);
+        }
     });
 
     it("runs an allowed action after verifying the delegate under the task_worker class", async () => {

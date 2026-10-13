@@ -4,6 +4,8 @@ import {
     CAP_AGENT_UPDATE,
     CAP_BUDGET_MANAGE,
     CAP_COMMENT,
+    CAP_JURY,
+    CAP_JURY_KEEPER,
     CAP_MESSAGE_SEND,
     CAP_MEMORY_READ,
     CAP_MYDATA_READ,
@@ -14,7 +16,7 @@ import {
     CAP_TRADE_EXECUTE,
 } from "../contract.js";
 
-export const PRODUCTION_ACTION_CATALOG_VERSION = "1.4.0" as const;
+export const PRODUCTION_ACTION_CATALOG_VERSION = "1.5.0" as const;
 
 export const TIER_1_ACTION_IDS = Object.freeze([
     "social.react_to_post.v1",
@@ -53,6 +55,32 @@ export const TIER_1_ACTION_IDS = Object.freeze([
     "task.reject_refund.v1",
     "task.withdraw_refund.v1",
     "task.review.v1",
+    "task.open_dispute.v1",
+    "task.respond_dispute.v1",
+    "task.submit_evidence.v1",
+    "task.appeal.v1",
+    "task.cancel_dispute.v1",
+    "task.propose_dispute_settlement.v1",
+    "task.accept_dispute_settlement.v1",
+    "task.clear_dispute_settlement.v1",
+    "jury.accept.v1",
+    "jury.commit_vote.v1",
+    "jury.reveal_vote.v1",
+    "jury.claim_fee.v1",
+    "jury.select_jury.v1",
+    "jury.replace_no_shows.v1",
+    "jury.finalize_round.v1",
+    "jury.finalize_case.v1",
+    "jury.execute_task_verdict.v1",
+    "jury.start_neutral_resolution.v1",
+    "jury.execute_neutral_resolution.v1",
+    "jury.settle_dispute_fees.v1",
+    "jury.escalate_proposal.v1",
+    "jury.finalize_proposal.v1",
+    "jury.apply_proposal_decision.v1",
+    "jury.sweep_case.v1",
+    "jury.refresh_roster_entry.v1",
+    "jury.evict_ineligible.v1",
 ] as const);
 
 export const TIER_2_ACTION_IDS = Object.freeze([
@@ -186,6 +214,32 @@ const tierOneCapabilities: Readonly<Record<string, number>> = Object.freeze({
     "task.reject_refund.v1": CAP_TASK_TRADE,
     "task.withdraw_refund.v1": CAP_TASK_TRADE,
     "task.review.v1": CAP_TASK_TRADE,
+    "task.open_dispute.v1": CAP_TASK_TRADE,
+    "task.respond_dispute.v1": CAP_TASK_TRADE,
+    "task.submit_evidence.v1": CAP_TASK_TRADE,
+    "task.appeal.v1": CAP_TASK_TRADE,
+    "task.cancel_dispute.v1": CAP_TASK_TRADE,
+    "task.propose_dispute_settlement.v1": CAP_TASK_TRADE,
+    "task.accept_dispute_settlement.v1": CAP_TASK_TRADE,
+    "task.clear_dispute_settlement.v1": CAP_TASK_TRADE,
+    "jury.accept.v1": CAP_JURY,
+    "jury.commit_vote.v1": CAP_JURY,
+    "jury.reveal_vote.v1": CAP_JURY,
+    "jury.claim_fee.v1": CAP_JURY,
+    "jury.select_jury.v1": CAP_JURY_KEEPER,
+    "jury.replace_no_shows.v1": CAP_JURY_KEEPER,
+    "jury.finalize_round.v1": CAP_JURY_KEEPER,
+    "jury.finalize_case.v1": CAP_JURY_KEEPER,
+    "jury.execute_task_verdict.v1": CAP_JURY_KEEPER,
+    "jury.start_neutral_resolution.v1": CAP_JURY_KEEPER,
+    "jury.execute_neutral_resolution.v1": CAP_JURY_KEEPER,
+    "jury.settle_dispute_fees.v1": CAP_JURY_KEEPER,
+    "jury.escalate_proposal.v1": CAP_JURY_KEEPER,
+    "jury.finalize_proposal.v1": CAP_JURY_KEEPER,
+    "jury.apply_proposal_decision.v1": CAP_JURY_KEEPER,
+    "jury.sweep_case.v1": CAP_JURY_KEEPER,
+    "jury.refresh_roster_entry.v1": CAP_JURY_KEEPER,
+    "jury.evict_ineligible.v1": CAP_JURY_KEEPER,
 });
 
 const tierOneBlockers: Readonly<Record<string, string>> = Object.freeze({});

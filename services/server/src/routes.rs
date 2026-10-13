@@ -64,6 +64,12 @@ pub struct AgentContextSocialChain {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub task_config_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
+    pub jury_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub juror_roster_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ecosystem_treasury_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub messaging_package_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub messaging_version_id: String,
@@ -290,7 +296,7 @@ pub async fn agent_context(
     use crate::memory_contract::{
         has_cap, CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_AI_SPEND, CAP_COMMENT,
         CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MESSAGE_SEND, CAP_MYDATA_READ, CAP_POST_PUBLISH,
-        CAP_REACT, CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
+        CAP_JURY, CAP_JURY_KEEPER, CAP_REACT, CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
     };
 
     let mut actions = Vec::new();
@@ -355,6 +361,46 @@ pub async fn agent_context(
             "task.reject_refund.v1",
             "task.withdraw_refund.v1",
             "task.review.v1",
+        ]);
+        if jury_objects_configured(&state.config.social_chain) {
+            actions.extend([
+                "task.open_dispute.v1",
+                "task.respond_dispute.v1",
+                "task.submit_evidence.v1",
+                "task.appeal.v1",
+                "task.cancel_dispute.v1",
+                "task.propose_dispute_settlement.v1",
+                "task.accept_dispute_settlement.v1",
+                "task.clear_dispute_settlement.v1",
+            ]);
+        }
+    }
+    if has_cap(auth.capabilities, CAP_JURY) && jury_objects_configured(&state.config.social_chain) {
+        actions.extend([
+            "jury.accept.v1",
+            "jury.commit_vote.v1",
+            "jury.reveal_vote.v1",
+            "jury.claim_fee.v1",
+        ]);
+    }
+    if has_cap(auth.capabilities, CAP_JURY_KEEPER)
+        && jury_objects_configured(&state.config.social_chain)
+    {
+        actions.extend([
+            "jury.select_jury.v1",
+            "jury.replace_no_shows.v1",
+            "jury.finalize_round.v1",
+            "jury.finalize_case.v1",
+            "jury.execute_task_verdict.v1",
+            "jury.start_neutral_resolution.v1",
+            "jury.execute_neutral_resolution.v1",
+            "jury.settle_dispute_fees.v1",
+            "jury.escalate_proposal.v1",
+            "jury.finalize_proposal.v1",
+            "jury.apply_proposal_decision.v1",
+            "jury.sweep_case.v1",
+            "jury.refresh_roster_entry.v1",
+            "jury.evict_ineligible.v1",
         ]);
     }
     if has_cap(auth.capabilities, CAP_MESSAGE_SEND)
@@ -427,6 +473,9 @@ pub async fn agent_context(
             mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
             social_graph_id: state.config.social_chain.social_graph_id.clone(),
             task_config_id: state.config.social_chain.task_config_id.clone(),
+            jury_config_id: state.config.social_chain.jury_config_id.clone(),
+            juror_roster_id: state.config.social_chain.juror_roster_id.clone(),
+            ecosystem_treasury_id: state.config.social_chain.ecosystem_treasury_id.clone(),
             messaging_package_id: state.config.social_chain.messaging_package_id.clone(),
             messaging_version_id: state.config.social_chain.messaging_version_id.clone(),
             messaging_config_id: state.config.social_chain.messaging_config_id.clone(),
@@ -1707,6 +1756,9 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigRespon
             mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
             social_graph_id: state.config.social_chain.social_graph_id.clone(),
             task_config_id: state.config.social_chain.task_config_id.clone(),
+            jury_config_id: state.config.social_chain.jury_config_id.clone(),
+            juror_roster_id: state.config.social_chain.juror_roster_id.clone(),
+            ecosystem_treasury_id: state.config.social_chain.ecosystem_treasury_id.clone(),
             messaging_package_id: state.config.social_chain.messaging_package_id.clone(),
             messaging_version_id: state.config.social_chain.messaging_version_id.clone(),
             messaging_config_id: state.config.social_chain.messaging_config_id.clone(),
@@ -2479,6 +2531,7 @@ pub async fn gateway_inference_route(
         reservation_nonce: result.reservation_nonce,
         reserve_digest: result.reserve_digest,
         capture_digest: result.capture_digest,
+        provider_generation_id: result.provider_generation_id,
     }))
 }
 
@@ -2909,12 +2962,13 @@ pub async fn restore(
 // Registry-only chain action prepare / submit
 // ============================================================
 
-const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.4.0";
+const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.5.0";
 
 fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
     use crate::memory_contract::{
-        CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_COMMENT, CAP_MEMORY_READ,
-        CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT, CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
+        CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_COMMENT, CAP_JURY,
+        CAP_JURY_KEEPER, CAP_MEMORY_READ, CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT,
+        CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
     };
     match action {
         "social.create_post.v1"
@@ -2961,9 +3015,59 @@ fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
         | "task.accept_refund.v1"
         | "task.reject_refund.v1"
         | "task.withdraw_refund.v1"
-        | "task.review.v1" => Some((CAP_TASK_TRADE, "1B")),
+        | "task.review.v1"
+        | "task.open_dispute.v1"
+        | "task.respond_dispute.v1"
+        | "task.submit_evidence.v1"
+        | "task.appeal.v1"
+        | "task.cancel_dispute.v1"
+        | "task.propose_dispute_settlement.v1"
+        | "task.accept_dispute_settlement.v1"
+        | "task.clear_dispute_settlement.v1" => Some((CAP_TASK_TRADE, "1B")),
+        // A juror's own steps and the keeper cranks hold zero-spend capabilities of their own, so a
+        // jury delegate never carries the trade capability.
+        "jury.accept.v1"
+        | "jury.commit_vote.v1"
+        | "jury.reveal_vote.v1"
+        | "jury.claim_fee.v1"
+        => Some((CAP_JURY, "1B")),
+        "jury.select_jury.v1"
+        | "jury.replace_no_shows.v1"
+        | "jury.finalize_round.v1"
+        | "jury.finalize_case.v1"
+        | "jury.execute_task_verdict.v1"
+        | "jury.start_neutral_resolution.v1"
+        | "jury.execute_neutral_resolution.v1"
+        | "jury.settle_dispute_fees.v1"
+        | "jury.escalate_proposal.v1"
+        | "jury.finalize_proposal.v1"
+        | "jury.apply_proposal_decision.v1"
+        | "jury.sweep_case.v1"
+        | "jury.refresh_roster_entry.v1"
+        | "jury.evict_ineligible.v1"
+        => Some((CAP_JURY_KEEPER, "1B")),
         _ => None,
     }
+}
+
+/// The jury actions and the dispute steps that read the jury objects.
+fn is_jury_action(action: &str) -> bool {
+    action.starts_with("jury.")
+        || matches!(
+            action,
+            "task.open_dispute.v1"
+            | "task.respond_dispute.v1"
+            | "task.submit_evidence.v1"
+            | "task.appeal.v1"
+            | "task.cancel_dispute.v1"
+            | "task.propose_dispute_settlement.v1"
+            | "task.accept_dispute_settlement.v1"
+            | "task.clear_dispute_settlement.v1"
+        )
+}
+
+fn jury_objects_configured(chain: &crate::types::SocialChainConfig) -> bool {
+    !chain.jury_config_id.is_empty() && !chain.juror_roster_id.is_empty()
 }
 
 fn registered_action_package_id<'a>(state: &'a AppState, action: &str) -> Option<&'a str> {
@@ -3103,6 +3207,23 @@ fn assert_registered_action_policy(
     if action.starts_with("task.") && state.config.social_chain.task_config_id.is_empty() {
         return Err(AppError::Internal(
             "task market config object is not configured".into(),
+        ));
+    }
+    if is_jury_action(action) && !jury_objects_configured(&state.config.social_chain) {
+        return Err(AppError::Internal(
+            "jury config and roster objects are not configured".into(),
+        ));
+    }
+    // Global governance cranks need the ecosystem treasury; the platform variants (named by a
+    // `platformId`) take the platform instead.
+    if matches!(
+        action,
+        "jury.escalate_proposal.v1" | "jury.finalize_proposal.v1" | "jury.apply_proposal_decision.v1"
+    ) && state.config.social_chain.ecosystem_treasury_id.is_empty()
+        && parameters.is_some_and(|p| p.get("platformId").is_none())
+    {
+        return Err(AppError::Internal(
+            "ecosystem treasury object is not configured".into(),
         ));
     }
     if !has_cap(auth.capabilities, policy.0) {
@@ -3336,8 +3457,8 @@ async fn simulate_sponsored_transaction(
             .pointer("/effects/status/error")
             .and_then(|error| error.as_str())
             .unwrap_or_default();
-        return Err(if is_task_state_abort(detail) {
-            // The task moved on (already settled, deadline passed, someone else won the race).
+        return Err(if is_chain_state_abort(detail) {
+            // The case or task moved on (already settled, deadline passed, someone else won the race).
             // A 409 lets an unattended caller skip instead of retrying or alerting its owner.
             AppError::Conflict(format!(
                 "registered action simulation failed: {}",
@@ -3350,9 +3471,15 @@ async fn simulate_sponsored_transaction(
     Ok(result)
 }
 
-/// A dry run that aborted inside the task market module, as opposed to a malformed request.
-fn is_task_state_abort(detail: &str) -> bool {
-    detail.contains("MoveAbort") && detail.contains("agent_task")
+/// A dry run that aborted inside the task market, the jury, or the governance step a jury drives,
+/// as opposed to a malformed request. These are the aborts a lost race produces (the case moved on,
+/// another keeper ran the crank first, the deadline is not reached yet), so an unattended caller
+/// should skip them rather than retry or alert its owner.
+fn is_chain_state_abort(detail: &str) -> bool {
+    detail.contains("MoveAbort")
+        && ["agent_task", "jury", "governance"]
+            .iter()
+            .any(|module| detail.contains(&format!("Identifier(\"{module}\")")))
 }
 
 fn approval_response(row: &crate::action_approvals::ActionApprovalRow) -> ActionApprovalResponse {
@@ -4438,14 +4565,103 @@ mod more_tests {
     }
 
     #[test]
-    fn only_task_market_aborts_are_treated_as_chain_state() {
-        let abort = r#"MoveAbort(MoveLocation { module: ModuleId { address: 50c1, name: Identifier("agent_task") }, function: 5, instruction: 12, function_name: Some("accept_task") }, 3) in command 0"#;
-        assert!(is_task_state_abort(abort));
-        assert!(!is_task_state_abort(
-            r#"MoveAbort(MoveLocation { module: ModuleId { address: 50c1, name: Identifier("post") }, function: 1, instruction: 2, function_name: Some("create_post") }, 7) in command 0"#
-        ));
-        assert!(!is_task_state_abort("InsufficientGas"));
-        assert!(!is_task_state_abort(""));
+    fn only_task_jury_and_governance_aborts_are_treated_as_chain_state() {
+        let abort = |module: &str| {
+            format!(
+                r#"MoveAbort(MoveLocation {{ module: ModuleId {{ address: 50c1, name: Identifier("{module}") }}, function: 5, instruction: 12, function_name: Some("f") }}, 3) in command 0"#
+            )
+        };
+        for module in ["agent_task", "jury", "governance"] {
+            assert!(is_chain_state_abort(&abort(module)), "{module}");
+        }
+        assert!(!is_chain_state_abort(&abort("post")));
+        assert!(!is_chain_state_abort(&abort("platform")));
+        assert!(!is_chain_state_abort("InsufficientGas"));
+        assert!(!is_chain_state_abort(""));
+        // A module name mentioned outside an abort location is not a lost race.
+        assert!(!is_chain_state_abort("jury is not a MoveAbort"));
+    }
+
+    #[test]
+    fn task_dispute_actions_use_the_task_trade_capability() {
+        for action in [
+            "task.open_dispute.v1",
+            "task.respond_dispute.v1",
+            "task.submit_evidence.v1",
+            "task.appeal.v1",
+            "task.cancel_dispute.v1",
+            "task.propose_dispute_settlement.v1",
+            "task.accept_dispute_settlement.v1",
+            "task.clear_dispute_settlement.v1",
+        ] {
+            assert_eq!(
+                registered_action_policy(action),
+                Some((crate::memory_contract::CAP_TASK_TRADE, "1B")),
+                "{action}"
+            );
+            assert!(is_jury_action(action), "{action}");
+        }
+    }
+
+    #[test]
+    fn a_juror_and_a_keeper_each_hold_a_zero_spend_capability_of_their_own() {
+        for action in [
+            "jury.accept.v1",
+            "jury.commit_vote.v1",
+            "jury.reveal_vote.v1",
+            "jury.claim_fee.v1",
+        ] {
+            assert_eq!(
+                registered_action_policy(action),
+                Some((crate::memory_contract::CAP_JURY, "1B")),
+                "{action}"
+            );
+        }
+        for action in [
+            "jury.select_jury.v1",
+            "jury.replace_no_shows.v1",
+            "jury.finalize_round.v1",
+            "jury.finalize_case.v1",
+            "jury.execute_task_verdict.v1",
+            "jury.start_neutral_resolution.v1",
+            "jury.execute_neutral_resolution.v1",
+            "jury.settle_dispute_fees.v1",
+            "jury.escalate_proposal.v1",
+            "jury.finalize_proposal.v1",
+            "jury.apply_proposal_decision.v1",
+            "jury.sweep_case.v1",
+            "jury.refresh_roster_entry.v1",
+            "jury.evict_ineligible.v1",
+        ] {
+            assert_eq!(
+                registered_action_policy(action),
+                Some((crate::memory_contract::CAP_JURY_KEEPER, "1B")),
+                "{action}"
+            );
+        }
+        // The two jury capabilities are distinct bits and neither is the trade capability.
+        assert_ne!(
+            crate::memory_contract::CAP_JURY,
+            crate::memory_contract::CAP_JURY_KEEPER
+        );
+        assert_eq!(
+            crate::memory_contract::CAP_JURY & crate::memory_contract::CAP_TASK_TRADE,
+            0
+        );
+        assert!(registered_action_policy("jury.vote_for_me.v1").is_none());
+        assert!(!is_jury_action("task.create.v1"));
+    }
+
+    #[test]
+    fn jury_actions_need_both_jury_objects() {
+        let mut chain = crate::types::SocialChainConfig::from_env();
+        chain.jury_config_id = String::new();
+        chain.juror_roster_id = String::new();
+        assert!(!jury_objects_configured(&chain));
+        chain.jury_config_id = "0xf1".into();
+        assert!(!jury_objects_configured(&chain));
+        chain.juror_roster_id = "0xf2".into();
+        assert!(jury_objects_configured(&chain));
     }
 
     #[test]

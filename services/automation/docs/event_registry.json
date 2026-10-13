@@ -131,7 +131,33 @@
         "reviewed",
         "expired_offer_due",
         "refund_due",
-        "release_due"
+        "release_due",
+        "disputed",
+        "dispute_resolved",
+        "neutral_window_open"
+      ]
+    },
+    "jury": {
+      "version": 1,
+      "types": [
+        "duty_drafted",
+        "voting_started",
+        "duty_poll",
+        "fee_claimable",
+        "select_due",
+        "replace_due",
+        "round_finalize_due",
+        "case_finalize_due",
+        "execute_ready",
+        "neutral_start_due",
+        "neutral_due",
+        "fees_due",
+        "escalate_due",
+        "proposal_finalize_due",
+        "apply_ready",
+        "roster_refresh_due",
+        "evict_due",
+        "sweep_due"
       ]
     }
   }

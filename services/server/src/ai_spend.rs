@@ -76,6 +76,10 @@ pub struct GatewayInferenceResponse {
     pub reservation_nonce: Option<u64>,
     pub reserve_digest: Option<String>,
     pub capture_digest: Option<String>,
+    /// The provider's own id for this generation, so a juror's rationale can be tied to the exact
+    /// model run that produced it. Absent when the oracle does not report one.
+    #[serde(default)]
+    pub provider_generation_id: Option<String>,
 }
 
 fn oracle_post(client: &reqwest::Client, config: &Config, url: &str) -> reqwest::RequestBuilder {

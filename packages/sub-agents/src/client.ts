@@ -123,6 +123,9 @@ function assertAuthenticatedDeployment(
     for (const field of [
         "socialGraphId",
         "taskConfigId",
+        "juryConfigId",
+        "jurorRosterId",
+        "ecosystemTreasuryId",
         "messagingPackageId",
         "messagingVersionId",
         "messagingConfigId",

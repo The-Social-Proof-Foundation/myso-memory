@@ -63,6 +63,7 @@ export type {
     EmbedResult,
     AnalyzeResult,
     AnalyzedFact,
+    GatewayInferenceResult,
     HealthResult,
     RestoreResult,
 } from "./types.js";

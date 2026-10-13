@@ -123,6 +123,9 @@ function assertAuthenticatedDeployment(
     for (const field of [
         "socialGraphId",
         "taskConfigId",
+        "juryConfigId",
+        "jurorRosterId",
+        "ecosystemTreasuryId",
         "messagingPackageId",
         "messagingVersionId",
         "messagingConfigId",
@@ -695,6 +698,7 @@ export class SocialClient {
         };
         if (this.platformId) {
             headers["x-platform-id"] = this.platformId;
+            headers["x-platform-signature"] = bytesToHex(await ed.signAsync(new TextEncoder().encode(`mysocial-request-platform-v1|${this.platformId}|${message}`), this.privateKey));
         }
 
         const url = `${this.serverUrl}${path}`;

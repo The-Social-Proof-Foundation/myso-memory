@@ -329,6 +329,63 @@ jobs:
         working-directory: services/server
         run: cargo test --bins
 
+  automation-stack:
+    name: Automation / bridge, juror runner and engine
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the SDKs the bridge imports
+        run: |
+          pnpm build:sdk
+          pnpm --filter @socialproof/sub-agents build
+
+      - name: Sub-agents SDK (typecheck + tests)
+        run: |
+          pnpm --filter @socialproof/sub-agents typecheck
+          pnpm --filter @socialproof/sub-agents test
+
+      - name: Bridge (typecheck + tests)
+        run: |
+          pnpm typecheck:bridge
+          pnpm test:bridge
+
+      - name: Juror runner (typecheck + tests)
+        run: |
+          pnpm typecheck:jury
+          pnpm test:jury
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            services/automation/target
+          key: cargo-automation-${{ runner.os }}-${{ hashFiles('services/automation/Cargo.lock') }}
+          restore-keys: cargo-automation-${{ runner.os }}-
+
+      - name: Engine (cargo test)
+        run: pnpm test:automation
+
   move-contract:
     name: Move / Contract tests
     runs-on: ubuntu-latest

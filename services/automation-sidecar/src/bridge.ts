@@ -22,9 +22,12 @@ import { normalizeObjectId } from "./ids.js";
 import { DELEGATE_REF_PREFIX, type DelegateSource } from "./delegates.js";
 import type { AgentKeyStore, ResolvedAgentKey } from "./keys.js";
 import {
+    CAP_JURY,
+    CAP_JURY_KEEPER,
     CAP_TASK_TRADE,
     NEEDS_RECALL,
     NEEDS_REMEMBER,
+    type DelegateClass,
     type DelegateVerifier,
 } from "./verify.js";
 
@@ -89,10 +92,45 @@ export interface ProbeResponse {
     namespace: string;
 }
 
-/** Task market actions are the only chain actions the bridge will run for a delegate. */
+/** The delegate classes that act on chain. `memory` never does. */
+export type ChainDelegateClass = Exclude<DelegateClass, "memory">;
+
+/** Task market actions, run by a `task_worker`. */
 export const TASK_ACTION_IDS: ReadonlySet<string> = new Set(
     SOCIAL_ACTION_IDS.filter((id) => id.startsWith("task.")),
 );
+
+/** A juror's own steps, run by a `juror`. */
+export const JUROR_ACTION_IDS: ReadonlySet<string> = new Set(
+    ["jury.accept.v1", "jury.commit_vote.v1", "jury.reveal_vote.v1", "jury.claim_fee.v1"].filter(
+        (id) => (SOCIAL_ACTION_IDS as readonly string[]).includes(id),
+    ),
+);
+
+/** The permissionless jury cranks, run by a `jury_keeper`: every other jury action. */
+export const KEEPER_ACTION_IDS: ReadonlySet<string> = new Set(
+    SOCIAL_ACTION_IDS.filter((id) => id.startsWith("jury.") && !JUROR_ACTION_IDS.has(id)),
+);
+
+/** What each chain-acting class may run, and the one capability it needs to run it. */
+export const CHAIN_CLASS_ACTIONS: Readonly<Record<ChainDelegateClass, ReadonlySet<string>>> = Object.freeze({
+    task_worker: TASK_ACTION_IDS,
+    juror: JUROR_ACTION_IDS,
+    jury_keeper: KEEPER_ACTION_IDS,
+});
+export const CHAIN_CLASS_NEEDS: Readonly<Record<ChainDelegateClass, number>> = Object.freeze({
+    task_worker: CAP_TASK_TRADE,
+    juror: CAP_JURY,
+    jury_keeper: CAP_JURY_KEEPER,
+});
+
+/** The one class that may run an action, or `undefined` if no delegate class may. */
+export function classForAction(actionId: string): ChainDelegateClass | undefined {
+    for (const delegateClass of Object.keys(CHAIN_CLASS_ACTIONS) as ChainDelegateClass[]) {
+        if (CHAIN_CLASS_ACTIONS[delegateClass].has(actionId)) return delegateClass;
+    }
+    return undefined;
+}
 
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:/-]{8,128}$/;
 const MAX_ACTION_PARAMS_BYTES = 32 * 1024;
@@ -111,6 +149,20 @@ export interface ChainActResponse {
     status: "executed";
     action_id: string;
     digest: string;
+}
+
+export interface DelegateStatusRequest {
+    key_ref: string;
+    account_id: string;
+}
+
+export interface DelegateStatusResponse {
+    /** `inactive` once the delegate is revoked, deactivated or expired: nothing it signs will run. */
+    status: "active" | "inactive";
+    delegate_class: string;
+    expires_at_ms: number | null;
+    expires_in_ms: number | null;
+    reason?: string;
 }
 
 /** The slice of `SocialClient` the bridge uses, so tests need no network or chain. */
@@ -373,20 +425,68 @@ export class MemoryBridge {
     }
 
     /**
-     * Run one task market action as a `task_worker` delegate.
+     * Run one chain action as a delegate: a task market action as a `task_worker`, a juror's own
+     * step as a `juror`, or a permissionless jury crank as a `jury_keeper`.
      *
      * Four independent gates stand between a request and a signature, and any one failing is
-     * enough: the action must be a task action; the delegate must be a `task_worker` that was
-     * registered for that exact action; the chain must confirm it is active, unexpired,
-     * spend-capped and holds the task-trade capability and nothing beyond the class; and the
-     * relayer re-checks capability, approval-required caps and the action catalog when it
-     * prepares the transaction. Nothing is cached: revoking or expiring the delegate takes
-     * effect on the next call.
+     * enough: the action must belong to a delegate class; the delegate must be of exactly that
+     * class and registered for that exact action; the chain must confirm it is active,
+     * unexpired, spend-capped (to zero for a jury class) and holds the class capability and
+     * nothing beyond it; and the relayer re-checks capability, approval-required caps and the
+     * action catalog when it prepares the transaction. Nothing is cached: revoking or expiring
+     * the delegate takes effect on the next call.
      */
-    async act(req: ChainActRequest): Promise<ChainActResponse> {
-        if (!TASK_ACTION_IDS.has(req.action_id)) {
+    /**
+     * Whether a delegate can still act and when it stops being able to. Reads the delegate's own
+     * chain state through the same relayer check as `act`, signs nothing and changes nothing, so a
+     * monitor can ask as often as it likes and warn long before an expiry turns into failed jobs.
+     */
+    async delegateStatus(req: DelegateStatusRequest): Promise<DelegateStatusResponse> {
+        if (!req.key_ref.startsWith(DELEGATE_REF_PREFIX)) {
+            throw new BridgeError("only delegate:<name> keys have a status", 400, "invalid_request");
+        }
+        const { delegates, verifier, delegateDefaults } = this.opts;
+        if (!delegates || !verifier || !delegateDefaults?.serverUrl) {
             throw new BridgeError(
-                `${JSON.stringify(req.action_id)} is not a task market action`,
+                `unknown agent key ref ${JSON.stringify(req.key_ref)}`,
+                404,
+                "key_store:unknown_ref",
+            );
+        }
+        const opened = await delegates.open(req.account_id, req.key_ref.slice(DELEGATE_REF_PREFIX.length));
+        try {
+            const context = await verifier.inspect({
+                seedHex: opened.seedHex,
+                serverUrl: delegateDefaults.serverUrl,
+                accountId: req.account_id,
+            });
+            const now = Date.now();
+            return {
+                status: context.expiresAtMs !== null && context.expiresAtMs <= now ? "inactive" : "active",
+                delegate_class: opened.delegateClass,
+                expires_at_ms: context.expiresAtMs,
+                expires_in_ms: context.expiresAtMs === null ? null : context.expiresAtMs - now,
+            };
+        } catch (err) {
+            // A revoked, expired or deactivated delegate is a finding, not a failure of this call.
+            if (err instanceof BridgeError && err.code === "delegate_rejected") {
+                return {
+                    status: "inactive",
+                    delegate_class: opened.delegateClass,
+                    expires_at_ms: null,
+                    expires_in_ms: null,
+                    reason: err.message,
+                };
+            }
+            throw err;
+        }
+    }
+
+    async act(req: ChainActRequest): Promise<ChainActResponse> {
+        const requiredClass = classForAction(req.action_id);
+        if (!requiredClass) {
+            throw new BridgeError(
+                `${JSON.stringify(req.action_id)} is not an action a delegate may run`,
                 403,
                 "action_not_allowed",
             );
@@ -425,9 +525,9 @@ export class MemoryBridge {
             );
         }
         const opened = await delegates.open(req.account_id, req.key_ref.slice(DELEGATE_REF_PREFIX.length));
-        if (opened.delegateClass !== "task_worker") {
+        if (opened.delegateClass !== requiredClass) {
             throw new BridgeError(
-                "this delegate is not a task worker; register one with the task_worker class",
+                `this delegate is not a ${requiredClass}; register one with the ${requiredClass} class`,
                 403,
                 "delegate_wrong_class",
             );
@@ -444,8 +544,8 @@ export class MemoryBridge {
             serverUrl: delegateDefaults.serverUrl,
             accountId: req.account_id,
             agentObjectId: opened.agentObjectId,
-            needs: CAP_TASK_TRADE,
-            delegateClass: "task_worker",
+            needs: CHAIN_CLASS_NEEDS[requiredClass],
+            delegateClass: requiredClass,
         });
 
         const params = await this.withPaymentCoin(req.action_id, req.params as Record<string, unknown>, context);

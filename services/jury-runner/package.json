@@ -1,0 +1,26 @@
+{
+  "name": "@socialproof/jury-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The juror runner: answers the automation engine's jury webhooks, judges a case with an LLM, and replies with the commit, reveal or accept directive. node:http plus, only when billing a juror to AI credit, the memory SDK.",
+  "main": "./dist/main.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.8.6",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@socialproof/memory": "workspace:*"
+  }
+}

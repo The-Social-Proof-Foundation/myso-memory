@@ -5,6 +5,8 @@ import {
     CAP_AGENT_REVOKE,
     CAP_AGENT_UPDATE,
     CAP_COMMENT,
+    CAP_JURY,
+    CAP_JURY_KEEPER,
     CAP_MEMORY_READ,
     CAP_MESSAGE_SEND,
     CAP_POST_PUBLISH,
@@ -44,6 +46,9 @@ const CHAIN: SocialChainConfig = {
     messagingGroupManagerId: "0xc",
     messagingGroupLeaverId: "0xd",
     taskConfigId: "0xf",
+    juryConfigId: "0xf1",
+    jurorRosterId: "0xf2",
+    ecosystemTreasuryId: "0xf3",
 };
 
 class MockTx {
@@ -142,6 +147,32 @@ test("registry assigns capability and risk policy to every current action", () =
             ["task.reject_refund.v1", CAP_TASK_TRADE, "1B"],
             ["task.withdraw_refund.v1", CAP_TASK_TRADE, "1B"],
             ["task.review.v1", CAP_TASK_TRADE, "1B"],
+            ["task.open_dispute.v1", CAP_TASK_TRADE, "1B"],
+            ["task.respond_dispute.v1", CAP_TASK_TRADE, "1B"],
+            ["task.submit_evidence.v1", CAP_TASK_TRADE, "1B"],
+            ["task.appeal.v1", CAP_TASK_TRADE, "1B"],
+            ["task.cancel_dispute.v1", CAP_TASK_TRADE, "1B"],
+            ["task.propose_dispute_settlement.v1", CAP_TASK_TRADE, "1B"],
+            ["task.accept_dispute_settlement.v1", CAP_TASK_TRADE, "1B"],
+            ["task.clear_dispute_settlement.v1", CAP_TASK_TRADE, "1B"],
+            ["jury.accept.v1", CAP_JURY, "1B"],
+            ["jury.commit_vote.v1", CAP_JURY, "1B"],
+            ["jury.reveal_vote.v1", CAP_JURY, "1B"],
+            ["jury.claim_fee.v1", CAP_JURY, "1B"],
+            ["jury.select_jury.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.replace_no_shows.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.finalize_round.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.finalize_case.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.execute_task_verdict.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.start_neutral_resolution.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.execute_neutral_resolution.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.settle_dispute_fees.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.escalate_proposal.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.finalize_proposal.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.apply_proposal_decision.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.sweep_case.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.refresh_roster_entry.v1", CAP_JURY_KEEPER, "1B"],
+            ["jury.evict_ineligible.v1", CAP_JURY_KEEPER, "1B"],
         ],
     );
 });
@@ -415,7 +446,7 @@ test("request and preparation metadata pin idempotency, registry, package, and b
         { postId: "0xpost", reaction: "like" },
         "request-123",
     );
-    assert.equal(request.registryVersion, "1.4.0");
+    assert.equal(request.registryVersion, "1.5.0");
     assert.equal(request.idempotency.scope, "account-agent-action");
     assert.match(request.parameterHash, /^sha256:[a-f0-9]{64}$/);
 

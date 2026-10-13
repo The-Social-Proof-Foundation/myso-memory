@@ -9,9 +9,9 @@
  * response is then checked here against what a delegate is allowed to be:
  *
  *   - registered under the account the job belongs to, as the agent we stored;
- *   - capabilities within memory read/write (no social, trade, spend, register);
- *   - a spending limit set;
- *   - an expiry set, and in the future.
+ *   - capabilities within the delegate's class (no social, spend or register, ever);
+ *   - a spending limit set (and for a jury class, set to exactly zero);
+ *   - an expiry set, and in the future (and within 90 days for any chain-acting class).
  *
  * A delegate that fails any of these is refused even if the relayer would have
  * accepted it, so an over-scoped or never-expiring key is not usable by the
@@ -29,21 +29,40 @@ export const CAP_MEMORY_READ = 1;
 export const CAP_MEMORY_WRITE = 2;
 export const CAP_MYDATA_READ = 4;
 export const CAP_TASK_TRADE = 131072;
+/** Serve on a jury: accept, commit, reveal, claim. Spends nothing. */
+export const CAP_JURY = 262144;
+/** Run the permissionless jury cranks. Spends nothing. */
+export const CAP_JURY_KEEPER = 524288;
 /** The most a `memory` delegate may hold. Anything else on the key disqualifies it. */
 export const DELEGATE_ALLOWED_CAPS = CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_MYDATA_READ;
 
 /**
  * A delegate's class fixes the most capability it may hold. `task_worker` adds only the task
- * market; it can never carry posting, trading, spending or agent-management capability.
+ * market; `juror` adds only jury service and `jury_keeper` only the jury cranks. None can ever
+ * carry posting, trading, spending or agent-management capability.
  */
-export type DelegateClass = "memory" | "task_worker";
+export type DelegateClass = "memory" | "task_worker" | "juror" | "jury_keeper";
 export const DELEGATE_CLASS_CAPS: Readonly<Record<DelegateClass, number>> = Object.freeze({
     memory: DELEGATE_ALLOWED_CAPS,
     task_worker: DELEGATE_ALLOWED_CAPS | CAP_TASK_TRADE,
+    juror: DELEGATE_ALLOWED_CAPS | CAP_JURY,
+    jury_keeper: DELEGATE_ALLOWED_CAPS | CAP_JURY_KEEPER,
 });
 
+/** The classes that sign chain transactions; each must be short-lived. */
+export function actsOnChain(delegateClass: DelegateClass): boolean {
+    return delegateClass !== "memory";
+}
+
+/** Jury classes move no funds, so their spending limit must be exactly zero. */
+export function isZeroSpendClass(delegateClass: DelegateClass): boolean {
+    return delegateClass === "juror" || delegateClass === "jury_keeper";
+}
+
 /** A chain-acting delegate must expire within this window, so a leaked key has a short life. */
-export const MAX_TASK_WORKER_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
+export const MAX_CHAIN_DELEGATE_LIFETIME_MS = 90 * 24 * 60 * 60 * 1000;
+/** @deprecated Use {@link MAX_CHAIN_DELEGATE_LIFETIME_MS}; the rule now covers every chain class. */
+export const MAX_TASK_WORKER_LIFETIME_MS = MAX_CHAIN_DELEGATE_LIFETIME_MS;
 
 /** Recall and remember both decrypt through MYDATA, so both need it. */
 export const NEEDS_RECALL = CAP_MEMORY_READ | CAP_MYDATA_READ;
@@ -100,9 +119,12 @@ export function assertDelegateAllowed(
     }
     if ((ctx.capabilities & ~DELEGATE_CLASS_CAPS[delegateClass]) !== 0) {
         refuse(
-            delegateClass === "task_worker"
-                ? "the delegate holds capabilities beyond memory and the task market; register a narrower one"
-                : "the delegate holds capabilities beyond memory read/write; register a narrower one",
+            {
+                memory: "the delegate holds capabilities beyond memory read/write; register a narrower one",
+                task_worker: "the delegate holds capabilities beyond memory and the task market; register a narrower one",
+                juror: "the delegate holds capabilities beyond memory and jury service; register a narrower one",
+                jury_keeper: "the delegate holds capabilities beyond memory and the jury cranks; register a narrower one",
+            }[delegateClass],
             "delegate_overscoped",
         );
     }
@@ -112,15 +134,18 @@ export function assertDelegateAllowed(
     if (ctx.maxActionSpendMist === null) {
         refuse("the delegate has no spending limit", "delegate_no_spend_limit");
     }
+    if (isZeroSpendClass(delegateClass) && ctx.maxActionSpendMist !== 0) {
+        refuse("a jury delegate must have a spending limit of exactly zero", "delegate_spend_not_zero");
+    }
     if (ctx.expiresAtMs === null) {
         refuse("the delegate never expires; register one with an expiry", "delegate_no_expiry");
     }
     if (ctx.expiresAtMs <= nowMs) {
         refuse("the delegate has expired", "delegate_expired");
     }
-    if (delegateClass === "task_worker" && ctx.expiresAtMs - nowMs > MAX_TASK_WORKER_LIFETIME_MS) {
+    if (actsOnChain(delegateClass) && ctx.expiresAtMs - nowMs > MAX_CHAIN_DELEGATE_LIFETIME_MS) {
         refuse(
-            "a task worker must expire within 90 days; register one with a nearer expiry",
+            "a delegate that signs chain transactions must expire within 90 days; register one with a nearer expiry",
             "delegate_expiry_too_far",
         );
     }
@@ -139,6 +164,15 @@ export class DelegateVerifier {
         const ctx = await this.fetchContext(target);
         assertDelegateAllowed(ctx, target, this.now());
         return ctx;
+    }
+
+    /**
+     * What the chain says about a delegate, without judging it. For monitoring: an operator needs to
+     * see a delegate approaching its expiry before it stops working, which `verify` would only
+     * report once it was too late. A revoked or expired delegate still fails with `delegate_rejected`.
+     */
+    async inspect(target: Pick<VerifyTarget, "seedHex" | "serverUrl" | "accountId">): Promise<AgentContext> {
+        return this.fetchContext(target as VerifyTarget);
     }
 
     private async fetchContext(target: VerifyTarget): Promise<AgentContext> {

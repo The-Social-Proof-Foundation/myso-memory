@@ -204,6 +204,9 @@ pub struct SocialChainConfig {
     pub mydata_registry_id: String,
     pub social_graph_id: String,
     pub task_config_id: String,
+    pub jury_config_id: String,
+    pub juror_roster_id: String,
+    pub ecosystem_treasury_id: String,
     pub messaging_package_id: String,
     pub messaging_version_id: String,
     pub messaging_config_id: String,
@@ -224,6 +227,9 @@ impl SocialChainConfig {
             mydata_registry_id: std::env::var("MYDATA_REGISTRY_ID").unwrap_or_default(),
             social_graph_id: std::env::var("SOCIAL_GRAPH_ID").unwrap_or_default(),
             task_config_id: std::env::var("TASK_CONFIG_ID").unwrap_or_default(),
+            jury_config_id: std::env::var("JURY_CONFIG_ID").unwrap_or_default(),
+            juror_roster_id: std::env::var("JUROR_ROSTER_ID").unwrap_or_default(),
+            ecosystem_treasury_id: std::env::var("ECOSYSTEM_TREASURY_ID").unwrap_or_default(),
             messaging_package_id: std::env::var("MESSAGING_PACKAGE_ID").unwrap_or_default(),
             messaging_version_id: std::env::var("MESSAGING_VERSION_ID").unwrap_or_default(),
             messaging_config_id: std::env::var("MESSAGING_CONFIG_ID").unwrap_or_default(),
@@ -245,7 +251,7 @@ impl SocialChainConfig {
             && !self.mydata_registry_id.is_empty()
     }
 
-    pub fn env_pairs(&self) -> [(&'static str, &str); 15] {
+    pub fn env_pairs(&self) -> [(&'static str, &str); 18] {
         [
             ("USERNAME_REGISTRY_ID", &self.username_registry_id),
             ("PLATFORM_REGISTRY_ID", &self.platform_registry_id),
@@ -256,6 +262,9 @@ impl SocialChainConfig {
             ("MYDATA_REGISTRY_ID", &self.mydata_registry_id),
             ("SOCIAL_GRAPH_ID", &self.social_graph_id),
             ("TASK_CONFIG_ID", &self.task_config_id),
+            ("JURY_CONFIG_ID", &self.jury_config_id),
+            ("JUROR_ROSTER_ID", &self.juror_roster_id),
+            ("ECOSYSTEM_TREASURY_ID", &self.ecosystem_treasury_id),
             ("MESSAGING_PACKAGE_ID", &self.messaging_package_id),
             ("MESSAGING_VERSION_ID", &self.messaging_version_id),
             ("MESSAGING_CONFIG_ID", &self.messaging_config_id),
@@ -869,6 +878,8 @@ pub struct GatewayInferenceResponse {
     pub reservation_nonce: Option<u64>,
     pub reserve_digest: Option<String>,
     pub capture_digest: Option<String>,
+    /// The provider's id for this generation, when the oracle reports one.
+    pub provider_generation_id: Option<String>,
 }
 
 /// Recall memories + LLM chat — full AI-with-memory demo
@@ -995,6 +1006,12 @@ pub struct PublicSocialChainConfig {
     pub social_graph_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub task_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub jury_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub juror_roster_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub ecosystem_treasury_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub messaging_package_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]

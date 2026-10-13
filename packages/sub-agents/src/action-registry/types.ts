@@ -28,6 +28,28 @@ import type {
     ManagedAgentParams,
     TaskAcceptParams,
     TaskCancelOfferParams,
+    JuryAcceptParams,
+    JuryApplyDecisionParams,
+    JuryCaseParams,
+    JuryClaimFeeParams,
+    JuryCommitVoteParams,
+    JuryEscalateProposalParams,
+    JuryEvictParams,
+    JuryExecuteNeutralParams,
+    JuryFinalizeProposalParams,
+    JuryRefreshRosterParams,
+    JuryRevealVoteParams,
+    JurySettleFeesParams,
+    JuryStartNeutralParams,
+    JuryTaskVerdictParams,
+    TaskAcceptDisputeSettlementParams,
+    TaskCancelDisputeParams,
+    TaskClearDisputeSettlementParams,
+    TaskDisputeEvidenceParams,
+    TaskDisputeFeeParams,
+    TaskOpenDisputeParams,
+    TaskProposeDisputeSettlementParams,
+
     TaskCreateParams,
     TaskDeliverParams,
     TaskPermissionlessParams,
@@ -40,7 +62,7 @@ import type {
 } from "../types.js";
 import type { BuildTxContext } from "../ptb/post.js";
 
-export const SOCIAL_ACTION_REGISTRY_VERSION = "1.4.0" as const;
+export const SOCIAL_ACTION_REGISTRY_VERSION = "1.5.0" as const;
 
 export const SOCIAL_ACTION_IDS = Object.freeze([
     "social.react_to_post.v1",
@@ -91,6 +113,32 @@ export const SOCIAL_ACTION_IDS = Object.freeze([
     "task.reject_refund.v1",
     "task.withdraw_refund.v1",
     "task.review.v1",
+    "task.open_dispute.v1",
+    "task.respond_dispute.v1",
+    "task.submit_evidence.v1",
+    "task.appeal.v1",
+    "task.cancel_dispute.v1",
+    "task.propose_dispute_settlement.v1",
+    "task.accept_dispute_settlement.v1",
+    "task.clear_dispute_settlement.v1",
+    "jury.accept.v1",
+    "jury.commit_vote.v1",
+    "jury.reveal_vote.v1",
+    "jury.claim_fee.v1",
+    "jury.select_jury.v1",
+    "jury.replace_no_shows.v1",
+    "jury.finalize_round.v1",
+    "jury.finalize_case.v1",
+    "jury.execute_task_verdict.v1",
+    "jury.start_neutral_resolution.v1",
+    "jury.execute_neutral_resolution.v1",
+    "jury.settle_dispute_fees.v1",
+    "jury.escalate_proposal.v1",
+    "jury.finalize_proposal.v1",
+    "jury.apply_proposal_decision.v1",
+    "jury.sweep_case.v1",
+    "jury.refresh_roster_entry.v1",
+    "jury.evict_ineligible.v1",
 ] as const);
 
 export type SocialActionId = (typeof SOCIAL_ACTION_IDS)[number];
@@ -144,6 +192,32 @@ export interface SocialActionInputMap {
     "task.reject_refund.v1": TaskRefundProposalParams;
     "task.withdraw_refund.v1": TaskRefundProposalParams;
     "task.review.v1": TaskReviewParams;
+    "task.open_dispute.v1": TaskOpenDisputeParams;
+    "task.respond_dispute.v1": TaskDisputeFeeParams;
+    "task.submit_evidence.v1": TaskDisputeEvidenceParams;
+    "task.appeal.v1": TaskDisputeFeeParams;
+    "task.cancel_dispute.v1": TaskCancelDisputeParams;
+    "task.propose_dispute_settlement.v1": TaskProposeDisputeSettlementParams;
+    "task.accept_dispute_settlement.v1": TaskAcceptDisputeSettlementParams;
+    "task.clear_dispute_settlement.v1": TaskClearDisputeSettlementParams;
+    "jury.accept.v1": JuryAcceptParams;
+    "jury.commit_vote.v1": JuryCommitVoteParams;
+    "jury.reveal_vote.v1": JuryRevealVoteParams;
+    "jury.claim_fee.v1": JuryClaimFeeParams;
+    "jury.select_jury.v1": JuryCaseParams;
+    "jury.replace_no_shows.v1": JuryCaseParams;
+    "jury.finalize_round.v1": JuryCaseParams;
+    "jury.finalize_case.v1": JuryCaseParams;
+    "jury.execute_task_verdict.v1": JuryTaskVerdictParams;
+    "jury.start_neutral_resolution.v1": JuryStartNeutralParams;
+    "jury.execute_neutral_resolution.v1": JuryExecuteNeutralParams;
+    "jury.settle_dispute_fees.v1": JurySettleFeesParams;
+    "jury.escalate_proposal.v1": JuryEscalateProposalParams;
+    "jury.finalize_proposal.v1": JuryFinalizeProposalParams;
+    "jury.apply_proposal_decision.v1": JuryApplyDecisionParams;
+    "jury.sweep_case.v1": JuryCaseParams;
+    "jury.refresh_roster_entry.v1": JuryRefreshRosterParams;
+    "jury.evict_ineligible.v1": JuryEvictParams;
 }
 
 export type SocialActionInput<TId extends SocialActionId> =

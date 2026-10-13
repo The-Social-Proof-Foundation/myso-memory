@@ -46,7 +46,7 @@ async fn main() {
             memory_store()
         };
 
-    let bus = EventBus::new();
+    let bus = EventBus::with_capacity(config.event_bus_capacity);
     let run_ctx = Arc::new(handlers::build_run_context(store.clone(), &config));
 
     // AUTOMATION_ENABLED was previously parsed and never read, so the tick loop
@@ -54,7 +54,13 @@ async fn main() {
     // API — that is what makes it safe to keep a replica up for inspection while
     // draining work, or to dark-launch the service before enabling execution.
     if config.enabled {
-        spawn_event_consumer(bus.subscribe(), run_ctx.clone(), store.clone());
+        spawn_event_consumer(
+            bus.subscribe(),
+            bus.clone(),
+            run_ctx.clone(),
+            store.clone(),
+            config.event_concurrency,
+        );
         spawn_tick_loop(config.tick_interval_secs, run_ctx.clone(), store.clone());
         tracing::info!(
             tick_interval_secs = config.tick_interval_secs,
@@ -116,27 +122,48 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+/// Evaluates each event against the enabled jobs, up to `concurrency` at a time. Events used to be
+/// handled one by one, so a single slow webhook (a juror's runner can take its full 15 seconds)
+/// held every event behind it until the bus overflowed and dropped them. When every slot is busy the
+/// consumer waits for one, and the bus buffers meanwhile; anything it still has to drop is counted.
 fn spawn_event_consumer(
     mut rx: tokio::sync::broadcast::Receiver<myso_automation::PlatformEvent>,
+    bus: EventBus,
     run_ctx: Arc<myso_automation::executor::RunContext>,
     store: Arc<dyn myso_automation::AutomationStore>,
+    concurrency: usize,
 ) {
     tokio::spawn(async move {
+        let slots = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         loop {
             match rx.recv().await {
-                Ok(event) => match store.list_enabled_jobs().await {
-                    Ok(jobs) => {
-                        if let Err(e) = run_ctx.evaluate_event_for_jobs(&event, &jobs).await {
-                            tracing::warn!(
-                                source_event_id = %event.source_event_id,
-                                "event evaluation error: {e}"
-                            );
+                Ok(event) => {
+                    bus.record_consumed();
+                    let Ok(permit) = slots.clone().acquire_owned().await else { break };
+                    let run_ctx = run_ctx.clone();
+                    let store = store.clone();
+                    tokio::spawn(async move {
+                        match store.list_enabled_jobs().await {
+                            Ok(jobs) => {
+                                if let Err(e) = run_ctx.evaluate_event_for_jobs(&event, &jobs).await {
+                                    tracing::warn!(
+                                        source_event_id = %event.source_event_id,
+                                        "event evaluation error: {e}"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::warn!("cannot list jobs for event evaluation: {e}"),
                         }
-                    }
-                    Err(e) => tracing::warn!("cannot list jobs for event evaluation: {e}"),
-                },
+                        drop(permit);
+                    });
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("event bus lagged by {n} events");
+                    bus.record_lagged(n);
+                    tracing::warn!(
+                        dropped = n,
+                        "event bus lagged: events were dropped after being acknowledged; \
+                         raise AUTOMATION_EVENT_BUS_CAPACITY or AUTOMATION_EVENT_CONCURRENCY"
+                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }

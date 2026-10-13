@@ -124,7 +124,7 @@ test("registered action preparation is authenticated, idempotent, and locally si
             return new Response(
                 JSON.stringify({
                     registryAction: body.registryAction,
-                    registryVersion: "1.4.0",
+                    registryVersion: "1.5.0",
                     idempotencyKey: body.idempotencyKey,
                     bytes: Buffer.from(Uint8Array.from({ length: 48 }, (_, index) => index + 1)).toString("base64"),
                     digest,
@@ -192,7 +192,7 @@ test("Tier 3 delete uses personal-message approval and owner wallet transaction 
         if (path === "/api/chain/approvals/request") {
             const body = JSON.parse(String(init?.body));
             return new Response(JSON.stringify({
-                approvalId, registryAction: body.registryAction, registryVersion: "1.4.0",
+                approvalId, registryAction: body.registryAction, registryVersion: "1.5.0",
                 idempotencyKey: body.idempotencyKey, parameterHash: `sha256:${"3".repeat(64)}`,
                 approvalIntent: `mysocial-action-approval-v1|${approvalId}|binding`, status: "pending",
                 expiresAtMs: Date.now() + 600_000,
@@ -206,7 +206,7 @@ test("Tier 3 delete uses personal-message approval and owner wallet transaction 
             const body = JSON.parse(String(init?.body));
             assert.equal(body.approvalId, approvalId);
             return new Response(JSON.stringify({
-                registryAction: body.registryAction, registryVersion: "1.4.0",
+                registryAction: body.registryAction, registryVersion: "1.5.0",
                 idempotencyKey: body.idempotencyKey,
                 bytes: Buffer.from(new Uint8Array(48).fill(7)).toString("base64"),
                 digest, expiresAtMs: Date.now() + 300_000,
@@ -282,7 +282,7 @@ test("a task action runs through the same prepare, local signature and submit pa
         if (path === "/api/chain/actions/prepare") {
             prepared = JSON.parse(String(init?.body));
             return new Response(JSON.stringify({
-                registryAction: prepared.registryAction, registryVersion: "1.4.0",
+                registryAction: prepared.registryAction, registryVersion: "1.5.0",
                 idempotencyKey: prepared.idempotencyKey,
                 bytes: Buffer.from(new Uint8Array(48).fill(9)).toString("base64"),
                 digest, expiresAtMs: Date.now() + 300_000,

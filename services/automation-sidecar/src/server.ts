@@ -11,7 +11,8 @@
  *   POST /internal/memory/recall    → semantic recall as a resolved agent
  *   POST /internal/memory/remember  → store a memory as a resolved agent
  *   POST /internal/memory/probe     → memory relayer reachability for an agent
- *   POST /internal/chain/act        → run one task market action as a task_worker delegate
+ *   POST /internal/chain/act        → run one task market or jury action as a task_worker, juror or keeper delegate
+ *   POST /internal/chain/delegate-status → whether a delegate can still act, and when it expires
  *
  * Every `/internal/*` route requires `x-internal-sync-secret`, the same header
  * the automation engine and the messaging relayer already use.
@@ -206,6 +207,14 @@ export function createBridgeServer(deps: BridgeServerDeps): Server {
                 }
                 case "/internal/memory/probe": {
                     const result = await bridge.probe({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
+                case "/internal/chain/delegate-status": {
+                    const result = await bridge.delegateStatus({
                         key_ref: requireString(body, "key_ref"),
                         account_id: requireString(body, "account_id"),
                     });

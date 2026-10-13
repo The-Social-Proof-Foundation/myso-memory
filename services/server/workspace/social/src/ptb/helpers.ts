@@ -3,6 +3,13 @@ import type { SocialChainConfig } from "../types.js";
 export const MYSO_CLOCK =
     "0x0000000000000000000000000000000000000000000000000000000000000006";
 
+/**
+ * The shared `Random` object. Hard-coded, never a parameter: a draw must read the network's
+ * randomness and nothing a caller supplies.
+ */
+export const MYSO_RANDOM =
+    "0x0000000000000000000000000000000000000000000000000000000000000008";
+
 export function postModuleTarget(
     config: SocialChainConfig,
     fn: string,
