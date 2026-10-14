@@ -928,6 +928,9 @@ pub struct AskResponse {
     pub answer: String,
     pub memories_used: usize,
     pub memories: Vec<RecallResult>,
+    /// The reply hit the output limit and stops mid-thought; the caller may ask it to continue.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// POST /api/restore
