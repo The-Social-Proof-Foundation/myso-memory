@@ -2091,7 +2091,7 @@ mod tests {
 /// 2. Inject memories into LLM system prompt
 /// 3. Call LLM with user question + memory context
 /// 4. Return answer + memories used
-const ASK_PROFILE_MAX_CHARS: usize = 2_000;
+const ASK_PROFILE_MAX_CHARS: usize = 6_000;
 const ASK_HISTORY_MAX_TURNS: usize = 12;
 const ASK_HISTORY_TURN_MAX_CHARS: usize = 800;
 

@@ -709,8 +709,8 @@ export async function buildApproveKeyPolicyTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_policy`,
         arguments: [
-            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
         ],
@@ -745,8 +745,8 @@ export async function approveKeyPolicy(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_policy`,
         arguments: [
-            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
         ],
@@ -793,8 +793,8 @@ export async function buildApproveOrgKeyPolicyTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_org_key_policy`,
         arguments: [
-            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.object(opts.orgMemoryGroupId),
@@ -818,8 +818,8 @@ export async function approveOrgKeyPolicy(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_org_key_policy`,
         arguments: [
-            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.object(opts.orgMemoryGroupId),

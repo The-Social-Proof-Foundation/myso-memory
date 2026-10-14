@@ -19,15 +19,16 @@ export function addApproveKeyPolicyCall(
     }
     tx.moveCall({
         target: `${packageId}::memory::${orgCtx ? "approve_org_key_policy" : "approve_key_policy"}`,
-        // Argument order is the deployed memory ABI, not the mydata_approve convention:
-        //   approve_key_policy(config, id, account, clock)
-        //   approve_org_key_policy(config, id, account, organization, org_memory_group, clock)
-        // The key server reads the encryption id from slot 1 for these two hooks, so the
-        // config MUST stay first. Mirrors `buildApproveKeyPolicyTxBytes` /
+        // The key id is the FIRST argument, the MyData key-server convention the deployed
+        // memory ABI now follows:
+        //   approve_key_policy(id, config, account, clock)
+        //   approve_org_key_policy(id, config, account, organization, org_memory_group, clock)
+        // The key server reads the id from slot 0 and checks config/account/organization as
+        // object inputs. Mirrors `buildApproveKeyPolicyTxBytes` /
         // `buildApproveOrgKeyPolicyTxBytes` in `@socialproof/memory/account`.
         arguments: [
-            tx.object(memoryConfigId),
             tx.pure("vector<u8>", idBytes),
+            tx.object(memoryConfigId),
             tx.object(accountId),
             ...(orgCtx ? [tx.object(orgCtx.organizationId), tx.object(orgCtx.orgMemoryGroupId)] : []),
             tx.object("0x6"),

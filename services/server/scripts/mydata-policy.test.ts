@@ -8,6 +8,24 @@ test("key approval refuses a missing MemoryConfig rather than building an invali
     assert.throws(() => addApproveKeyPolicyCall(new Transaction(), "0x50c1", "", [1], "0x1", null), /MEMORY_CONFIG_ID/);
 });
 
+function argumentKinds(orgCtx: { organizationId: string; orgMemoryGroupId: string } | null) {
+    const tx = new Transaction();
+    addApproveKeyPolicyCall(tx, "0x50c1", "0x" + "ab".repeat(32), [1, 2, 3], "0x" + "cd".repeat(32), orgCtx);
+    const data = tx.getData();
+    const command = data.commands[0].MoveCall!;
+    return command.arguments.map((arg: any) => (arg.Input === undefined ? "result" : data.inputs[arg.Input].$kind));
+}
+
+test("owner approval puts the key id first, as the key server requires", () => {
+    // id, config, account, clock
+    assert.deepEqual(argumentKinds(null), ["Pure", "UnresolvedObject", "UnresolvedObject", "UnresolvedObject"]);
+});
+
+test("organization approval puts the key id first, then config, account, org, group, clock", () => {
+    const kinds = argumentKinds({ organizationId: "0x" + "ee".repeat(32), orgMemoryGroupId: "0x" + "ff".repeat(32) });
+    assert.deepEqual(kinds, ["Pure", ...Array(5).fill("UnresolvedObject")]);
+});
+
 // Opt-in live ABI check: transaction-kind building resolves shared objects and
 // argument types against the running fullnode, without signing or submitting.
 const configId = process.env.TEST_MEMORY_CONFIG_ID;

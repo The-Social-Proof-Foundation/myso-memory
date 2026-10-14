@@ -5,12 +5,14 @@ use sqlx::{Row,types::Json as SqlJson};
 use std::{collections::HashMap,sync::Arc};
 use crate::{types::AppState,owner_auth::*};
 
+/// Every `memory::CAP_*` bit, through `CAP_JURY_KEEPER` (1 << 19). Widen when a new capability bit lands.
+const CAPABILITY_MASK_MAX:u64=(1<<20)-1;
 pub(crate) fn valid_intent(v:&Value)->Result<()> {
     let keys=["label","capabilities","delegatableCaps","expiresAtMs","parentAgentId","budget"];
     let o=v.as_object().ok_or_else(bad)?;
     if o.len()!=keys.len()||o.keys().any(|k|!keys.contains(&k.as_str())){return Err(bad());}
     if !v["label"].as_str().is_some_and(|s|!s.is_empty()&&s.len()<=256){return Err(bad());}
-    for k in ["capabilities","delegatableCaps"]{if !v[k].as_u64().is_some_and(|n|n<=131071){return Err(bad());}}
+    for k in ["capabilities","delegatableCaps"]{if !v[k].as_u64().is_some_and(|n|n<=CAPABILITY_MASK_MAX){return Err(bad());}}
     if !v["expiresAtMs"].is_null()&&!v["expiresAtMs"].as_u64().is_some_and(|n|n<=9007199254740991){return Err(bad());}
     if !v["parentAgentId"].is_null(){address(str_field(v,"parentAgentId")?)?;}
     if !v["budget"].is_null(){
