@@ -26,15 +26,16 @@ Sub-agents with on-chain capabilities from `social_contracts::memory` request re
 | `task.review.v1` | 1B | `agent_task::review_seller` / `review_buyer_agent` / `review_buyer_principal` | `CAP_TASK_TRADE`; the builder picks the entry from `raterRole` and `buyerAgentId` |
 | `task.open_dispute.v1`, `respond_dispute`, `submit_evidence`, `appeal`, `cancel_dispute`, `propose_dispute_settlement`, `accept_dispute_settlement`, `clear_dispute_settlement` | 1B | `agent_task::*_dispute*` / `appeal_dispute` | `CAP_TASK_TRADE`; opening or matching a dispute pays the case fee from the agent's per-action spend cap; needs the jury objects too |
 | `jury.accept.v1`, `jury.commit_vote.v1`, `jury.reveal_vote.v1`, `jury.claim_fee.v1` | 1B | `jury::accept_assignment` / `commit_vote` / `reveal_vote` / `claim_juror_fee` | `CAP_JURY` (262144); a juror agent's own steps, zero spend (the fee is paid to the juror's payout address) |
-| `jury.select_jury.v1` | 1B | `jury::select_jury` | `CAP_JURY_KEEPER` (524288); permissionless crank; reads the shared `Random` object (`0x8`, fixed by the SDK, never a parameter) |
-| `jury.replace_no_shows.v1`, `finalize_round`, `finalize_case`, `sweep_case` | 1B | `jury::*` | `CAP_JURY_KEEPER`; permissionless cranks |
-| `jury.execute_task_verdict.v1`, `start_neutral_resolution`, `execute_neutral_resolution`, `settle_dispute_fees` | 1B | `agent_task::*` | `CAP_JURY_KEEPER`; carry out a finished dispute |
-| `jury.escalate_proposal.v1`, `finalize_proposal`, `apply_proposal_decision` | 1B | `governance::*` / `platform::*` | `CAP_JURY_KEEPER`; the builder picks the global or platform entry from `platformId` |
-| `jury.refresh_roster_entry.v1`, `jury.evict_ineligible.v1` | 1B | `jury::*` | `CAP_JURY_KEEPER`; roster upkeep |
+| `jury.select_jury.v1` | 1B | `jury::select_jury` | no capability; permissionless crank; reads the shared `Random` object (`0x8`, fixed by the SDK, never a parameter) |
+| `jury.replace_no_shows.v1`, `finalize_round`, `finalize_case`, `sweep_case` | 1B | `jury::*` | no capability; permissionless cranks |
+| `jury.execute_task_verdict.v1`, `start_neutral_resolution`, `execute_neutral_resolution`, `settle_dispute_fees` | 1B | `agent_task::*` | no capability; carry out a finished dispute |
+| `jury.escalate_proposal.v1`, `finalize_proposal`, `apply_proposal_decision` | 1B | `governance::*` / `platform::*` | no capability; the builder picks the global or platform entry from `platformId`; escalate also passes the roster |
+| `jury.sweep_vote_refunds.v1` | 1B | `governance::sweep_vote_refunds` / `platform::sweep_platform_vote_refunds` | no capability; returns unclaimed vote refunds after 365 days or once all are claimed |
+| `jury.refresh_roster_entry.v1`, `jury.evict_ineligible.v1` | 1B | `jury::*` | no capability; roster upkeep |
 
 Jury actions need `JURY_CONFIG_ID` (and the roster id) on the relayer, discovered automatically with
-`SOCIAL_CHAIN_AUTO_DISCOVERY`; without them the SDK refuses jury actions. A juror and a keeper delegate
-hold only their own jury capability and no spending allowance. Expected races (a crank someone else ran,
+`SOCIAL_CHAIN_AUTO_DISCOVERY`; without them the SDK refuses jury actions. A juror delegate
+holds only its jury capability and no spending allowance; the cranks need no capability at all. Expected races (a crank someone else ran,
 a window that closed) abort inside the jury or governance modules and are answered with `409`, which
 automation records as a skip.
 

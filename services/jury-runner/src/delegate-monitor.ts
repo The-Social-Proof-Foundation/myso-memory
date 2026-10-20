@@ -1,5 +1,5 @@
 /**
- * Watches the delegates a runner depends on. A juror or keeper delegate lives at most 90 days and
+ * Watches the delegates a runner depends on. A juror delegate lives at most 90 days and
  * then silently stops: its jobs fail, cranks go unrun and seats go unfilled, and nothing says why.
  * This asks the bridge, on a timer, how long each one has left, publishes that as a gauge and logs
  * a warning once one is inside the warning window, so a rotation happens before the expiry.

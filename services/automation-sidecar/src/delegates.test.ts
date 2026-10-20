@@ -80,17 +80,17 @@ describe("EngineDelegateSource", () => {
         assert.deepEqual(opened.allowedActionIds, ["task.accept.v1", "task.deliver.v1"]);
     });
 
-    it("reads a juror's and a keeper's class", async () => {
-        for (const [delegate_class, id] of [
-            ["juror", "jury.commit_vote.v1"],
-            ["jury_keeper", "jury.finalize_round.v1"],
-        ] as const) {
+    it("reads a juror's class and refuses the retired keeper class", async () => {
+        for (const [delegate_class, id] of [["juror", "jury.commit_vote.v1"]] as const) {
             const extra = { delegate_class, allowed_action_ids: [id] };
             const { source } = sourceWith(() => Response.json(row(randomBytes(32), "0xacct", "n", "0xagent", "k1", extra)));
             const opened = await source.open("0xacct", "n");
             assert.equal(opened.delegateClass, delegate_class);
             assert.deepEqual(opened.allowedActionIds, [id]);
         }
+        const extra = { delegate_class: "jury_keeper", allowed_action_ids: ["jury.finalize_round.v1"] };
+        const { source } = sourceWith(() => Response.json(row(randomBytes(32), "0xacct", "n", "0xagent", "k1", extra)));
+        await assert.rejects(source.open("0xacct", "n"), /unknown class/);
     });
 
     it("refuses a row with an unknown class or a malformed action list", async () => {

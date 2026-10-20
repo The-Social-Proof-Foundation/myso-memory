@@ -12,7 +12,6 @@ import {
     CAP_MEMORY_READ,
     CAP_MEMORY_WRITE,
     CAP_JURY,
-    CAP_JURY_KEEPER,
     CAP_MYDATA_READ,
     CAP_TASK_TRADE,
     DelegateVerifier,
@@ -264,13 +263,11 @@ describe("task_worker delegates", () => {
 describe("jury delegates", () => {
     const MEMORY = CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_MYDATA_READ;
     const JUROR = { ...TARGET, needs: CAP_JURY, delegateClass: "juror" as const };
-    const KEEPER = { ...TARGET, needs: CAP_JURY_KEEPER, delegateClass: "jury_keeper" as const };
     const free = (caps: number, extra: Partial<AgentContext> = {}) =>
         ctx({ capabilities: caps, maxActionSpendMist: 0, ...extra });
 
     it("allows memory plus its own jury capability, capped at zero and expiring", () => {
         assert.equal(refusal(free(MEMORY | CAP_JURY), JUROR), "allowed");
-        assert.equal(refusal(free(MEMORY | CAP_JURY_KEEPER), KEEPER), "allowed");
     });
 
     it("refuses a jury delegate that can spend anything at all", () => {
@@ -279,37 +276,29 @@ describe("jury delegates", () => {
                 refusal(free(MEMORY | CAP_JURY, { maxActionSpendMist: spend }), JUROR),
                 "delegate_spend_not_zero",
             );
-            assert.equal(
-                refusal(free(MEMORY | CAP_JURY_KEEPER, { maxActionSpendMist: spend }), KEEPER),
-                "delegate_spend_not_zero",
-            );
         }
         assert.equal(refusal(free(MEMORY | CAP_JURY, { maxActionSpendMist: null }), JUROR), "delegate_no_spend_limit");
     });
 
-    it("keeps a juror and a keeper apart: neither may hold the other's capability", () => {
-        assert.equal(refusal(free(MEMORY | CAP_JURY | CAP_JURY_KEEPER), JUROR), "delegate_overscoped");
-        assert.equal(refusal(free(MEMORY | CAP_JURY | CAP_JURY_KEEPER), KEEPER), "delegate_overscoped");
+    it("refuses a juror holding the retired keeper bit", () => {
+        assert.equal(refusal(free(MEMORY | CAP_JURY | 524288), JUROR), "delegate_overscoped");
     });
 
     it("never lets a jury delegate carry the task market or anything that spends", () => {
         // trade execute, AI spend, post, message send, register agent, social graph, task trade.
         for (const extra of [256, 16384, 16, 64, 8192, 65536, CAP_TASK_TRADE]) {
             assert.equal(refusal(free(MEMORY | CAP_JURY | extra), JUROR), "delegate_overscoped", `${extra}`);
-            assert.equal(refusal(free(MEMORY | CAP_JURY_KEEPER | extra), KEEPER), "delegate_overscoped", `${extra}`);
         }
     });
 
     it("requires the capability the class exists for", () => {
         assert.equal(refusal(free(MEMORY), JUROR), "delegate_missing_capability");
-        assert.equal(refusal(free(MEMORY), KEEPER), "delegate_missing_capability");
     });
 
     it("limits every chain-acting class to a 90 day life", () => {
         assert.equal(MAX_TASK_WORKER_LIFETIME_MS, MAX_CHAIN_DELEGATE_LIFETIME_MS);
         for (const [caps, target] of [
             [MEMORY | CAP_JURY, JUROR],
-            [MEMORY | CAP_JURY_KEEPER, KEEPER],
         ] as const) {
             assert.equal(
                 refusal(free(caps, { expiresAtMs: NOW + MAX_CHAIN_DELEGATE_LIFETIME_MS }), target),

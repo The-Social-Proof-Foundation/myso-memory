@@ -11,7 +11,7 @@
  *   POST /internal/memory/recall    → semantic recall as a resolved agent
  *   POST /internal/memory/remember  → store a memory as a resolved agent
  *   POST /internal/memory/probe     → memory relayer reachability for an agent
- *   POST /internal/chain/act        → run one task market or jury action as a task_worker, juror or keeper delegate
+ *   POST /internal/chain/act        → run one task market or jury action as a task_worker or juror delegate, or a crank with the operator key
  *   POST /internal/chain/delegate-status → whether a delegate can still act, and when it expires
  *
  * Every `/internal/*` route requires `x-internal-sync-secret`, the same header
@@ -111,7 +111,7 @@ function optionalPositiveInt(body: Record<string, unknown>, field: string): numb
 
 export interface BridgeServerDeps {
     config: SidecarConfig;
-    bridge: Pick<MemoryBridge, "recall" | "remember" | "probe" | "act">;
+    bridge: Pick<MemoryBridge, "recall" | "remember" | "probe" | "act" | "delegateStatus">;
     /** Static dev keys, absent in production. Used by /health for a count. */
     store?: Pick<AgentKeyStore, "size">;
     /** Public MyData keys for browsers to encrypt delegate seeds to. Never private halves. */
@@ -290,6 +290,7 @@ async function main(): Promise<void> {
         delegates,
         verifier: delegates ? new DelegateVerifier({ timeoutMs: config.requestTimeoutMs }) : undefined,
         delegateDefaults: { serverUrl: config.defaultServerUrl, namespace: config.defaultNamespace },
+        crankSigner: config.crankSigner,
         requestTimeoutMs: config.requestTimeoutMs,
         eventsUrl: config.eventsUrl,
         eventsSecret: config.eventsSecret ?? config.internalSyncSecret,

@@ -51,8 +51,8 @@ end to end on Railway. Fixes that unblock that test are in scope; new capabiliti
 > unproven stack: ship them behind `AUTOMATION_ENABLED`, and add the §14 scenario to the §12
 > checklist before relying on them.
 >
-> **A second exception: the AI Jury** (§15). The `jury` event family, the `juror` and `jury_keeper`
-> delegate classes and the `jury.*` actions follow the same pattern and ship dark.
+> **A second exception: the AI Jury** (§15). The `jury` event family, the `juror`
+> delegate class, the crank operator key and the `jury.*` actions follow the same pattern and ship dark.
 
 ---
 
@@ -959,25 +959,29 @@ parsing. `pnpm test:bridge` covers the bridge gates. Neither needs a running cha
 ## 15. AI Jury automation
 
 The AI Jury (`social_contracts::jury`) settles task disputes and, where a registry turns it on,
-breaks governance stalemates. Juror agents and a first-party keeper act through this engine so no
-case waits on a human. This is the second declared exception to the freeze above; it adds only:
+breaks governance stalemates. Juror agents and the platform's default crank operator act through
+this engine so no case waits on a human. This is the second declared exception to the freeze above; it adds only:
 
 - the `jury` event family, and the dispute event types in the `task` family (`disputed`,
   `dispute_resolved`, `neutral_window_open`);
-- the `juror` and `jury_keeper` delegate classes (`CAP_JURY` 262144, `CAP_JURY_KEEPER` 524288);
-- the `jury.*` registered actions (4 for a juror, 14 for a keeper) and the dispute actions;
+- the `juror` delegate class (`CAP_JURY` 262144);
+- the crank operator key (`operator:jury`): the bridge's `JURY_CRANK_SIGNER_KEY`, usable only by jobs of
+  the account `JURY_CRANK_OPERATOR_ID` and only for the cranks;
+- the `jury.*` registered actions (4 for a juror, 15 cranks) and the dispute actions;
 - the proxy and bridge mapping from delegate class to allowed actions and event family;
 - the relayer's 409 classification for jury and governance races, and registry 1.5.0.
 
-Nothing else is unfrozen. Both classes are **zero-spend** and expire within 90 days; the bridge
-checks both for every chain-acting class and re-verifies the delegate on-chain before each
-signature. Jury jobs use an empty `ActionPolicy`: the delegate's class and action list are the
-bound.
+Nothing else is unfrozen. A `juror` delegate is **zero-spend** and expires within 90 days; the
+bridge checks both and re-verifies the delegate on-chain before each signature. The cranks are
+permissionless on chain and need no capability, so they run on the operator's own wallet rather
+than a delegate. Jury jobs use an empty `ActionPolicy`: the delegate's class and action list, or
+the crank list, are the bound.
 
 ### Dark launch
 
-- The social server forwards no jury event unless `JURY_AUTOMATION_ENABLED=true`. Keeper events
-  are addressed to the accounts in `JURY_KEEPER_ACCOUNT_IDS` (comma separated), one event each.
+- The social server forwards no jury event unless `JURY_AUTOMATION_ENABLED=true`. Crank events
+  are addressed to `JURY_CRANK_OPERATOR_ID`, one event per crank. Unset, the cranks are only on the
+  public `GET /jury/cranks` feed, for anyone to run.
 - The relayer only advertises `jury.*` actions when `JURY_CONFIG_ID` (and the roster id) are set,
   or discovered with `SOCIAL_CHAIN_AUTO_DISCOVERY`.
 - Registries opt in per step (`set_registry_jury_policy`); with no policy governance is unchanged.
@@ -987,10 +991,12 @@ bound.
 | family | types |
 |---|---|
 | `jury` (to a juror) | `duty_drafted`, `voting_started`, `duty_poll`, `fee_claimable` |
-| `jury` (to a keeper) | `select_due`, `replace_due`, `round_finalize_due`, `case_finalize_due`, `execute_ready`, `neutral_start_due`, `neutral_due`, `fees_due`, `escalate_due`, `proposal_finalize_due`, `apply_ready`, and daily upkeep: `roster_refresh_due`, `evict_due`, `sweep_due` |
+| `jury` (to a voter) | `vote_refund_claimable`: a proposal the jury could not hear was refunded; sent once |
+| `jury` (to the operator) | `select_due`, `replace_due`, `round_finalize_due`, `case_finalize_due`, `execute_ready`, `neutral_start_due`, `neutral_due`, `fees_due`, `escalate_due`, `proposal_finalize_due`, `apply_ready`, and daily upkeep: `roster_refresh_due`, `evict_due`, `sweep_due`, `vote_refund_sweep_due` |
 
-Juror events carry the juror's `account_id` and `agent_id`. Keeper events carry the keeper's
-`account_id` and no agent, so a keeper job's trigger has no agent filter. A crank event is
+Juror events carry the juror's `account_id` and `agent_id`. Crank events carry the operator's
+`account_id` and no agent, so a crank job's trigger has no agent filter. An `escalate_due` the jury
+could not seat backs off for six hours before it is sent again. A crank event is
 re-sent hourly until someone runs it; a crank someone else already ran is an expected chain abort,
 which the relayer maps to 409 and the engine records as skipped. `duty_poll` repeats every five
 minutes while a juror has an accept, commit or reveal outstanding.
@@ -1014,15 +1020,19 @@ reminder starts the judgment and gets no directive, and a later one returns the 
 reveal. The runner is key-less; the bridge signs as the delegate. The runner's webhook secret is
 the job's `secret`, and the runner's host goes in the job's `allowed_hosts`.
 
-### How a keeper runs
+### How the cranks run
 
-One `registered_action` job per crank, with parameters taken from the event
-(`{{event.payload.case_id}}`, `task_id`, `buyer_account_id`, `seller_account_id`,
-`platform_object_id`, `registry_id`, `proposal_id`, `stage`). The chat-app's Automation panel
-builds each template.
+The operator's account creates one `registered_action` job per crank with key ref `operator:jury`,
+with parameters taken from the event (`{{event.payload.case_id}}`, `task_id`, `buyer_account_id`,
+`seller_account_id`, `platform_object_id`, `registry_id`, `proposal_id`, `stage`). The proxy only
+accepts `operator:jury` from `JURY_CRANK_OPERATOR_ID`; the bridge signs with `JURY_CRANK_SIGNER_KEY`.
+
+Anyone else can run the cranks too: point `services/jury-runner` (`RECONCILER_ENABLED=true`) at
+the public feed and at a bridge holding their own `JURY_CRANK_SIGNER_KEY`. A crank already run by
+someone else is a 409.
 
 ### Before relying on it in production
 
 Add a jury scenario to the §12 checklist: a drafted `juror` delegate accepts, the runner returns a
-commit and then a reveal, and a `jury_keeper` job advances a case. Record the result in
+commit and then a reveal, and an `operator:jury` crank job advances a case. Record the result in
 `docs/jury-freeze-exception.md`. See that file for the full gate.

@@ -37,7 +37,7 @@ export interface RunnerConfig {
     metricsToken: string | null;
     /** Watches delegates for expiry; `null` unless `MONITOR_DELEGATES` names some. */
     delegateMonitor: DelegateMonitorConfig | null;
-    /** The keeper recovery loop; `null` unless `RECONCILER_ENABLED` is set. */
+    /** The crank recovery loop; `null` unless `RECONCILER_ENABLED` is set. */
     reconciler: ReconcilerConfig | null;
     production: boolean;
 }
@@ -139,13 +139,10 @@ function loadDelegateMonitor(env: Record<string, string | undefined>, production
 function loadReconciler(env: Record<string, string | undefined>, production: boolean): ReconcilerConfig {
     const bridgeUrl = required(env, "BRIDGE_URL").replace(/\/+$/, "");
     if (production && !bridgeUrl.startsWith("https://")) throw new ConfigError("BRIDGE_URL must be https in production");
-    const keeperKeyRef = required(env, "KEEPER_KEY_REF");
-    if (!keeperKeyRef.startsWith("delegate:")) throw new ConfigError("KEEPER_KEY_REF must look like delegate:<name>");
     return {
         bridgeUrl,
         bridgeSecret: required(env, "BRIDGE_SECRET"),
-        keeperKeyRef,
-        keeperAccountId: required(env, "KEEPER_ACCOUNT_ID"),
+        operatorAccountId: required(env, "JURY_CRANK_OPERATOR_ID"),
         intervalMs: positiveInt(env, "RECONCILER_INTERVAL_MS", 60_000),
         graceMs: positiveInt(env, "RECONCILER_GRACE_MS", 15 * 60_000),
         batch: positiveInt(env, "RECONCILER_BATCH", 20),

@@ -31,6 +31,7 @@ import type {
     JuryAcceptParams,
     JuryApplyDecisionParams,
     JuryCaseParams,
+    JurySweepVoteRefundsParams,
     JuryClaimFeeParams,
     JuryCommitVoteParams,
     JuryEscalateProposalParams,
@@ -137,6 +138,7 @@ export const SOCIAL_ACTION_IDS = Object.freeze([
     "jury.finalize_proposal.v1",
     "jury.apply_proposal_decision.v1",
     "jury.sweep_case.v1",
+    "jury.sweep_vote_refunds.v1",
     "jury.refresh_roster_entry.v1",
     "jury.evict_ineligible.v1",
 ] as const);
@@ -216,6 +218,7 @@ export interface SocialActionInputMap {
     "jury.finalize_proposal.v1": JuryFinalizeProposalParams;
     "jury.apply_proposal_decision.v1": JuryApplyDecisionParams;
     "jury.sweep_case.v1": JuryCaseParams;
+    "jury.sweep_vote_refunds.v1": JurySweepVoteRefundsParams;
     "jury.refresh_roster_entry.v1": JuryRefreshRosterParams;
     "jury.evict_ineligible.v1": JuryEvictParams;
 }

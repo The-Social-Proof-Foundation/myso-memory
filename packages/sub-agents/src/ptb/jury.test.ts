@@ -227,15 +227,23 @@ test("governance cranks pick the global or the platform entrypoint", () => {
     const global = single("jury.escalate_proposal.v1", { registryId: "0xreg", proposalId: "0xprop", stage: 2 });
     assert.equal(global.target, "0x50c1::governance::escalate_to_jury");
     assert.deepEqual(global.arguments, [
-        obj("0xreg"), obj("0xprop"), obj("0xf1"), obj("0xf3"), pure("u8", 2), obj(CLOCK),
+        obj("0xreg"), obj("0xprop"), obj("0xf1"), obj("0xf2"), obj("0xf3"), pure("u8", 2), obj(CLOCK),
     ]);
     const platform = single("jury.escalate_proposal.v1", {
         registryId: "0xreg", proposalId: "0xprop", stage: 1, platformId: "0xplat",
     });
     assert.equal(platform.target, "0x50c1::platform::escalate_platform_proposal_to_jury");
     assert.deepEqual(platform.arguments, [
-        obj("0xplat"), obj("0xreg"), obj("0xprop"), obj("0xf1"), pure("u8", 1), obj(CLOCK),
+        obj("0xplat"), obj("0xreg"), obj("0xprop"), obj("0xf1"), obj("0xf2"), pure("u8", 1), obj(CLOCK),
     ]);
+    const sweep = single("jury.sweep_vote_refunds.v1", { registryId: "0xreg", proposalId: "0xprop" });
+    assert.equal(sweep.target, "0x50c1::governance::sweep_vote_refunds");
+    assert.deepEqual(sweep.arguments, [obj("0xreg"), obj("0xprop"), obj("0xf3"), obj(CLOCK)]);
+    const platformSweep = single("jury.sweep_vote_refunds.v1", {
+        registryId: "0xreg", proposalId: "0xprop", platformId: "0xplat",
+    });
+    assert.equal(platformSweep.target, "0x50c1::platform::sweep_platform_vote_refunds");
+    assert.deepEqual(platformSweep.arguments, [obj("0xplat"), obj("0xreg"), obj("0xprop"), obj(CLOCK)]);
     assert.throws(() => build("jury.escalate_proposal.v1", { registryId: "0xreg", proposalId: "0xprop", stage: 3 }));
 
     assert.equal(single("jury.finalize_proposal.v1", { registryId: "0xreg", proposalId: "0xprop" }).target,

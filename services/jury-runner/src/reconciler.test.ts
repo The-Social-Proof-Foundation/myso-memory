@@ -21,8 +21,7 @@ const crank = (over: Partial<CrankView>): CrankView => ({
 const config: ReconcilerConfig = {
     bridgeUrl: "http://bridge.test",
     bridgeSecret: "bridge-secret",
-    keeperKeyRef: "delegate:keeper",
-    keeperAccountId: "0xkeeper",
+    operatorAccountId: "0xoperator",
     intervalMs: 60_000,
     graceMs: 900_000,
     batch: 20,
@@ -120,12 +119,12 @@ describe("Reconciler", () => {
         return { reconciler, acts };
     }
 
-    it("runs an old crank as the keeper through the bridge", async () => {
+    it("runs an old crank with the operator key through the bridge", async () => {
         const { reconciler, acts } = harness([crank({ dueMs: 1_000 })], () => 200);
         assert.deepEqual(await reconciler.tick(), { ran: 1, conflicts: 0, failed: 0, skipped: 0 });
         assert.equal(acts[0]?.headers["x-internal-sync-secret"], "bridge-secret");
-        assert.equal(acts[0]?.body.key_ref, "delegate:keeper");
-        assert.equal(acts[0]?.body.account_id, "0xkeeper");
+        assert.equal(acts[0]?.body.key_ref, "operator:jury");
+        assert.equal(acts[0]?.body.account_id, "0xoperator");
         assert.equal(acts[0]?.body.action_id, "jury.select_jury.v1");
     });
 
@@ -158,17 +157,16 @@ describe("reconciler config", () => {
         assert.equal(loadConfig(base).reconciler, null);
     });
 
-    it("needs the bridge, a keeper delegate and its account", () => {
+    it("needs the bridge and the crank operator's account", () => {
         assert.throws(() => loadConfig({ ...base, RECONCILER_ENABLED: "true" }), /BRIDGE_URL/);
         const env = {
             ...base,
             RECONCILER_ENABLED: "true",
             BRIDGE_URL: "http://bridge.test/",
             BRIDGE_SECRET: "s",
-            KEEPER_ACCOUNT_ID: "0xkeeper",
         };
-        assert.throws(() => loadConfig({ ...env, KEEPER_KEY_REF: "keeper" }), /delegate:/);
-        const loaded = loadConfig({ ...env, KEEPER_KEY_REF: "delegate:keeper" }).reconciler;
+        assert.throws(() => loadConfig(env), /JURY_CRANK_OPERATOR_ID/);
+        const loaded = loadConfig({ ...env, JURY_CRANK_OPERATOR_ID: "0xoperator" }).reconciler;
         assert.equal(loaded?.bridgeUrl, "http://bridge.test");
         assert.equal(loaded?.graceMs, 900_000);
     });

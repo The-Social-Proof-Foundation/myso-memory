@@ -41,7 +41,10 @@ const fakeBridge = {
         calls.push({ op: "act", args });
         return { status: "executed" as const, action_id: args.action_id, digest: "DIGEST1" };
     },
-} satisfies Pick<MemoryBridge, "recall" | "remember" | "probe" | "act">;
+    async delegateStatus() {
+        return { status: "active" as const, delegate_class: "juror" as const, expires_at_ms: null, expires_in_ms: null };
+    },
+} satisfies Pick<MemoryBridge, "recall" | "remember" | "probe" | "act" | "delegateStatus">;
 
 const config: SidecarConfig = {
     host: "127.0.0.1",

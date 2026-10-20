@@ -4,7 +4,7 @@ import {
     CAP_AGENT_UPDATE,
     CAP_COMMENT,
     CAP_JURY,
-    CAP_JURY_KEEPER,
+    CAP_NONE,
     CAP_MEMORY_READ,
     CAP_MESSAGE_SEND,
     CAP_POST_PUBLISH,
@@ -90,6 +90,7 @@ import {
     buildJurySettleFeesTx,
     buildJuryStartNeutralTx,
     buildJurySweepCaseTx,
+    buildJurySweepVoteRefundsTx,
     buildTaskAcceptDisputeSettlementTx,
     buildTaskAppealDisputeTx,
     buildTaskCancelDisputeTx,
@@ -1106,8 +1107,8 @@ const juryClaimFee = simpleAction(
     { ...CASE_ID_PROPERTY, agentId: NON_EMPTY_STRING }, buildJuryClaimFeeTx,
 );
 
-// Keeper cranks: permissionless on chain; CAP_JURY_KEEPER only says who may drive them through
-// the sponsored-gas path.
+// Cranks: permissionless on chain. Anyone's agent may drive them through the sponsored-gas path;
+// the platform's default operator does, and any other operator can.
 function juryCase<
     TId extends
         | "jury.select_jury.v1"
@@ -1120,7 +1121,7 @@ function juryCase<
     legacy: SocialActionDescriptor<TId>["legacyAction"],
     build: (context: BuildTxContext, input: any) => any,
 ): SocialActionDescriptor<TId> {
-    return simpleAction(id, legacy, CAP_JURY_KEEPER, ["caseId"], CASE_ID_PROPERTY, build);
+    return simpleAction(id, legacy, CAP_NONE, ["caseId"], CASE_ID_PROPERTY, build);
 }
 
 const jurySelect = juryCase("jury.select_jury.v1", "jury_select", buildJurySelectTx);
@@ -1130,51 +1131,57 @@ const juryFinalizeCase = juryCase("jury.finalize_case.v1", "jury_finalize_case",
 const jurySweepCase = juryCase("jury.sweep_case.v1", "jury_sweep_case", buildJurySweepCaseTx);
 
 const juryExecuteTaskVerdict = simpleAction(
-    "jury.execute_task_verdict.v1", "jury_execute_task_verdict", CAP_JURY_KEEPER,
+    "jury.execute_task_verdict.v1", "jury_execute_task_verdict", CAP_NONE,
     ["taskId", "caseId", "buyerAccountId", "sellerAccountId"],
     { ...TASK_ID_PROPERTY, ...CASE_ID_PROPERTY, buyerAccountId: NON_EMPTY_STRING, sellerAccountId: NON_EMPTY_STRING, ...PLATFORM_OBJECT },
     buildJuryExecuteTaskVerdictTx,
 );
 const juryStartNeutral = simpleAction(
-    "jury.start_neutral_resolution.v1", "jury_start_neutral_resolution", CAP_JURY_KEEPER,
+    "jury.start_neutral_resolution.v1", "jury_start_neutral_resolution", CAP_NONE,
     ["taskId", "caseId"], { ...TASK_ID_PROPERTY, ...CASE_ID_PROPERTY }, buildJuryStartNeutralTx,
 );
 const juryExecuteNeutral = simpleAction(
-    "jury.execute_neutral_resolution.v1", "jury_execute_neutral_resolution", CAP_JURY_KEEPER,
+    "jury.execute_neutral_resolution.v1", "jury_execute_neutral_resolution", CAP_NONE,
     ["taskId", "buyerAccountId", "sellerAccountId"],
     { ...TASK_ID_PROPERTY, buyerAccountId: NON_EMPTY_STRING, sellerAccountId: NON_EMPTY_STRING, ...PLATFORM_OBJECT },
     buildJuryExecuteNeutralTx,
 );
 const jurySettleFees = simpleAction(
-    "jury.settle_dispute_fees.v1", "jury_settle_dispute_fees", CAP_JURY_KEEPER,
+    "jury.settle_dispute_fees.v1", "jury_settle_dispute_fees", CAP_NONE,
     ["taskId", "caseId"], { ...TASK_ID_PROPERTY, ...CASE_ID_PROPERTY, closeCaseFirst: OPTIONAL_BOOLEAN },
     buildJurySettleFeesTx,
 );
 const juryEscalateProposal = simpleAction(
-    "jury.escalate_proposal.v1", "jury_escalate_proposal", CAP_JURY_KEEPER,
+    "jury.escalate_proposal.v1", "jury_escalate_proposal", CAP_NONE,
     ["registryId", "proposalId", "stage"],
     { registryId: NON_EMPTY_STRING, proposalId: NON_EMPTY_STRING, stage: JURY_STAGE, platformId: NON_EMPTY_STRING },
     buildJuryEscalateProposalTx,
 );
+const jurySweepVoteRefunds = simpleAction(
+    "jury.sweep_vote_refunds.v1", "jury_sweep_vote_refunds", CAP_NONE,
+    ["registryId", "proposalId"],
+    { registryId: NON_EMPTY_STRING, proposalId: NON_EMPTY_STRING, platformId: NON_EMPTY_STRING },
+    buildJurySweepVoteRefundsTx,
+);
 const juryFinalizeProposal = simpleAction(
-    "jury.finalize_proposal.v1", "jury_finalize_proposal", CAP_JURY_KEEPER,
+    "jury.finalize_proposal.v1", "jury_finalize_proposal", CAP_NONE,
     ["registryId", "proposalId"],
     { registryId: NON_EMPTY_STRING, proposalId: NON_EMPTY_STRING, platformId: NON_EMPTY_STRING },
     buildJuryFinalizeProposalTx,
 );
 const juryApplyDecision = simpleAction(
-    "jury.apply_proposal_decision.v1", "jury_apply_proposal_decision", CAP_JURY_KEEPER,
+    "jury.apply_proposal_decision.v1", "jury_apply_proposal_decision", CAP_NONE,
     ["registryId", "proposalId", "caseId"],
     { registryId: NON_EMPTY_STRING, proposalId: NON_EMPTY_STRING, ...CASE_ID_PROPERTY, platformId: NON_EMPTY_STRING },
     buildJuryApplyDecisionTx,
 );
 const juryRefreshRoster = simpleAction(
-    "jury.refresh_roster_entry.v1", "jury_refresh_roster_entry", CAP_JURY_KEEPER,
+    "jury.refresh_roster_entry.v1", "jury_refresh_roster_entry", CAP_NONE,
     ["accountId", "agentId"], { accountId: NON_EMPTY_STRING, agentId: NON_EMPTY_STRING },
     buildJuryRefreshRosterTx,
 );
 const juryEvict = simpleAction(
-    "jury.evict_ineligible.v1", "jury_evict_ineligible", CAP_JURY_KEEPER,
+    "jury.evict_ineligible.v1", "jury_evict_ineligible", CAP_NONE,
     ["agentId"], { agentId: NON_EMPTY_STRING }, buildJuryEvictTx,
 );
 
@@ -1251,6 +1258,7 @@ export const SOCIAL_ACTION_REGISTRY: SocialActionRegistry = Object.freeze({
     "jury.finalize_proposal.v1": juryFinalizeProposal,
     "jury.apply_proposal_decision.v1": juryApplyDecision,
     "jury.sweep_case.v1": jurySweepCase,
+    "jury.sweep_vote_refunds.v1": jurySweepVoteRefunds,
     "jury.refresh_roster_entry.v1": juryRefreshRoster,
     "jury.evict_ineligible.v1": juryEvict,
 });

@@ -47,7 +47,7 @@ interface EncryptedRow {
 
 function parseDelegateClass(value: unknown): DelegateClass {
     if (value === undefined || value === "memory") return "memory";
-    if (value === "task_worker" || value === "juror" || value === "jury_keeper") return value;
+    if (value === "task_worker" || value === "juror") return value;
     throw new BridgeError("the stored delegate has an unknown class", 409, "delegate_unreadable");
 }
 

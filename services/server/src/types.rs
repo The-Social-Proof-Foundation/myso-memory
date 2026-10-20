@@ -175,6 +175,9 @@ pub struct Config {
     /// Hosts `webhook` automation jobs may call (`AUTOMATION_WEBHOOK_ALLOWED_HOSTS`, comma
     /// separated). Empty means any host the job itself allowlists.
     pub automation_webhook_allowed_hosts: Vec<String>,
+    /// The platform's default jury crank operator (`JURY_CRANK_OPERATOR_ID`): the one account whose
+    /// jobs may sign cranks with the bridge's `operator:jury` key. Unset, no account may.
+    pub jury_crank_operator_id: Option<String>,
     /// GraphQL endpoint used to discover local shared-object IDs after regenesis.
     pub social_chain_graphql_url: Option<String>,
     /// Enables type-based discovery for missing social/messaging object IDs.
@@ -424,6 +427,10 @@ impl Config {
                 .map(|host| host.trim().to_ascii_lowercase())
                 .filter(|host| !host.is_empty())
                 .collect(),
+            jury_crank_operator_id: std::env::var("JURY_CRANK_OPERATOR_ID")
+                .ok()
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty()),
             social_chain_graphql_url: std::env::var("SOCIAL_CHAIN_GRAPHQL_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())

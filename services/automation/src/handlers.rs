@@ -250,7 +250,7 @@ pub struct PutDelegateRequest {
     pub agent_object_id: String,
     pub mydata_key_id: String,
     pub encrypted_key: String,
-    /// `memory` (default), `task_worker`, `juror` or `jury_keeper`.
+    /// `memory` (default), `task_worker` or `juror`.
     #[serde(default = "default_delegate_class")]
     pub delegate_class: String,
     /// Required for every class but `memory`, which must leave it empty.
@@ -265,7 +265,6 @@ fn default_delegate_class() -> String {
 pub const DELEGATE_CLASS_MEMORY: &str = "memory";
 pub const DELEGATE_CLASS_TASK_WORKER: &str = "task_worker";
 pub const DELEGATE_CLASS_JUROR: &str = "juror";
-pub const DELEGATE_CLASS_JURY_KEEPER: &str = "jury_keeper";
 const MAX_DELEGATE_ACTIONS: usize = 16;
 
 /// A juror's own steps. Must match `JUROR_ACTION_IDS` in the bridge and the relayer's policy.
@@ -276,35 +275,17 @@ pub const JUROR_ACTION_IDS: &[&str] = &[
     "jury.claim_fee.v1",
 ];
 
-/// The permissionless jury cranks. Must match `KEEPER_ACTION_IDS` in the bridge.
-pub const KEEPER_ACTION_IDS: &[&str] = &[
-    "jury.select_jury.v1",
-    "jury.replace_no_shows.v1",
-    "jury.finalize_round.v1",
-    "jury.finalize_case.v1",
-    "jury.execute_task_verdict.v1",
-    "jury.start_neutral_resolution.v1",
-    "jury.execute_neutral_resolution.v1",
-    "jury.settle_dispute_fees.v1",
-    "jury.escalate_proposal.v1",
-    "jury.finalize_proposal.v1",
-    "jury.apply_proposal_decision.v1",
-    "jury.sweep_case.v1",
-    "jury.refresh_roster_entry.v1",
-    "jury.evict_ineligible.v1",
-];
-
 /// The event family a class's jobs may subscribe to.
 pub fn delegate_event_family(class: &str) -> Option<&'static str> {
     match class {
         DELEGATE_CLASS_TASK_WORKER => Some("task"),
-        DELEGATE_CLASS_JUROR | DELEGATE_CLASS_JURY_KEEPER => Some("jury"),
+        DELEGATE_CLASS_JUROR => Some("jury"),
         _ => None,
     }
 }
 
 /// Whether a delegate of `class` may be allowed to run `id`: a task worker any task market action, a
-/// juror only its own four steps, a keeper only the cranks.
+/// juror only its own four steps. The cranks run on the operator's key, never a delegate's.
 pub fn class_may_run(class: &str, id: &str) -> bool {
     if !crate::registered_action::valid_action_id(id) {
         return false;
@@ -312,7 +293,6 @@ pub fn class_may_run(class: &str, id: &str) -> bool {
     match class {
         DELEGATE_CLASS_TASK_WORKER => id.starts_with("task."),
         DELEGATE_CLASS_JUROR => JUROR_ACTION_IDS.contains(&id),
-        DELEGATE_CLASS_JURY_KEEPER => KEEPER_ACTION_IDS.contains(&id),
         _ => false,
     }
 }
@@ -325,10 +305,10 @@ pub fn validate_delegate_class(class: &str, allowed_action_ids: &[String]) -> Re
             if allowed_action_ids.is_empty() {
                 Ok(())
             } else {
-                Err("a memory delegate cannot run chain actions; use the task_worker, juror or jury_keeper class".into())
+                Err("a memory delegate cannot run chain actions; use the task_worker or juror class".into())
             }
         }
-        DELEGATE_CLASS_TASK_WORKER | DELEGATE_CLASS_JUROR | DELEGATE_CLASS_JURY_KEEPER => {
+        DELEGATE_CLASS_TASK_WORKER | DELEGATE_CLASS_JUROR => {
             if allowed_action_ids.is_empty() || allowed_action_ids.len() > MAX_DELEGATE_ACTIONS {
                 return Err(format!(
                     "a {class} delegate needs 1 to {MAX_DELEGATE_ACTIONS} allowed_action_ids"
@@ -639,16 +619,15 @@ mod tests {
     }
 
     #[test]
-    fn a_juror_and_a_keeper_may_only_be_allowed_their_own_actions() {
+    fn a_juror_may_only_be_allowed_its_own_actions() {
         let ids = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert!(validate_delegate_class("juror", &ids(&["jury.accept.v1", "jury.commit_vote.v1"])).is_ok());
         assert!(validate_delegate_class("juror", &ids(JUROR_ACTION_IDS)).is_ok());
-        assert!(validate_delegate_class("jury_keeper", &ids(&["jury.select_jury.v1"])).is_ok());
-        assert!(validate_delegate_class("jury_keeper", &ids(&KEEPER_ACTION_IDS[..16.min(KEEPER_ACTION_IDS.len())])).is_ok());
 
-        // Never each other's, never a task action, never an unknown or malformed one.
+        // Never a crank, never a task action, never an unknown or malformed one, and the old keeper
+        // class is gone.
         assert!(validate_delegate_class("juror", &ids(&["jury.select_jury.v1"])).is_err());
-        assert!(validate_delegate_class("jury_keeper", &ids(&["jury.reveal_vote.v1"])).is_err());
+        assert!(validate_delegate_class("jury_keeper", &ids(&["jury.select_jury.v1"])).is_err());
         assert!(validate_delegate_class("juror", &ids(&["task.accept.v1"])).is_err());
         assert!(validate_delegate_class("task_worker", &ids(&["jury.accept.v1"])).is_err());
         assert!(validate_delegate_class("juror", &ids(&["jury.vote_for_me.v1"])).is_err());
@@ -658,19 +637,16 @@ mod tests {
     }
 
     #[test]
-    fn the_two_jury_action_lists_do_not_overlap_and_a_keeper_fits_one_delegate() {
-        assert!(JUROR_ACTION_IDS.iter().all(|id| !KEEPER_ACTION_IDS.contains(id)));
+    fn the_juror_action_list_is_four_jury_steps() {
         assert_eq!(JUROR_ACTION_IDS.len(), 4);
-        assert_eq!(KEEPER_ACTION_IDS.len(), 14);
-        assert!(KEEPER_ACTION_IDS.len() <= MAX_DELEGATE_ACTIONS);
-        assert!(JUROR_ACTION_IDS.iter().chain(KEEPER_ACTION_IDS).all(|id| id.starts_with("jury.")));
+        assert!(JUROR_ACTION_IDS.iter().all(|id| id.starts_with("jury.")));
     }
 
     #[test]
     fn each_class_subscribes_to_one_event_family() {
         assert_eq!(delegate_event_family("task_worker"), Some("task"));
         assert_eq!(delegate_event_family("juror"), Some("jury"));
-        assert_eq!(delegate_event_family("jury_keeper"), Some("jury"));
+        assert_eq!(delegate_event_family("jury_keeper"), None);
         assert_eq!(delegate_event_family("memory"), None);
         assert_eq!(delegate_event_family("root"), None);
     }

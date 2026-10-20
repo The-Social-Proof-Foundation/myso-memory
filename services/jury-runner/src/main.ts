@@ -122,7 +122,7 @@ if (config.reconciler) {
             });
     }, config.reconciler.intervalMs);
     timer.unref();
-    log("keeper reconciler on", { intervalMs: config.reconciler.intervalMs, graceMs: config.reconciler.graceMs });
+    log("crank reconciler on", { intervalMs: config.reconciler.intervalMs, graceMs: config.reconciler.graceMs });
 }
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

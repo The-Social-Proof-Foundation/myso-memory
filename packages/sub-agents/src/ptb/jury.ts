@@ -2,6 +2,7 @@ import type {
     JuryAcceptParams,
     JuryApplyDecisionParams,
     JuryCaseParams,
+    JurySweepVoteRefundsParams,
     JuryClaimFeeParams,
     JuryCommitVoteParams,
     JuryEscalateProposalParams,
@@ -383,6 +384,7 @@ export function buildJuryEscalateProposalTx(ctx: BuildTxContext, params: JuryEsc
             tx.object(params.registryId),
             tx.object(params.proposalId),
             tx.object(juryConfigId(ctx.chain)),
+            tx.object(rosterId(ctx.chain)),
             tx.pure("u8", params.stage),
             clock(ctx, tx),
         ]);
@@ -391,8 +393,27 @@ export function buildJuryEscalateProposalTx(ctx: BuildTxContext, params: JuryEsc
         tx.object(params.registryId),
         tx.object(params.proposalId),
         tx.object(juryConfigId(ctx.chain)),
+        tx.object(rosterId(ctx.chain)),
         tx.object(treasuryId(ctx.chain)),
         tx.pure("u8", params.stage),
+        clock(ctx, tx),
+    ]);
+}
+
+/** Send unclaimed vote refunds to the treasury once the claim window closed or all were claimed. */
+export function buildJurySweepVoteRefundsTx(ctx: BuildTxContext, params: JurySweepVoteRefundsParams): any {
+    if (params.platformId) {
+        return call(ctx, "platform", "sweep_platform_vote_refunds", (tx) => [
+            tx.object(params.platformId),
+            tx.object(params.registryId),
+            tx.object(params.proposalId),
+            clock(ctx, tx),
+        ]);
+    }
+    return call(ctx, "governance", "sweep_vote_refunds", (tx) => [
+        tx.object(params.registryId),
+        tx.object(params.proposalId),
+        tx.object(treasuryId(ctx.chain)),
         clock(ctx, tx),
     ]);
 }

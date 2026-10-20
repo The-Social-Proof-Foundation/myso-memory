@@ -23,7 +23,6 @@ import { DELEGATE_REF_PREFIX, type DelegateSource } from "./delegates.js";
 import type { AgentKeyStore, ResolvedAgentKey } from "./keys.js";
 import {
     CAP_JURY,
-    CAP_JURY_KEEPER,
     CAP_TASK_TRADE,
     NEEDS_RECALL,
     NEEDS_REMEMBER,
@@ -107,21 +106,25 @@ export const JUROR_ACTION_IDS: ReadonlySet<string> = new Set(
     ),
 );
 
-/** The permissionless jury cranks, run by a `jury_keeper`: every other jury action. */
-export const KEEPER_ACTION_IDS: ReadonlySet<string> = new Set(
+/**
+ * The permissionless jury cranks: every other jury action. No delegate runs them; they sign with
+ * the operator's crank key ({@link OPERATOR_KEY_REF}).
+ */
+export const CRANK_ACTION_IDS: ReadonlySet<string> = new Set(
     SOCIAL_ACTION_IDS.filter((id) => id.startsWith("jury.") && !JUROR_ACTION_IDS.has(id)),
 );
+
+/** The key ref a crank job names to sign with {@link MemoryBridgeOptions.crankSigner}. */
+export const OPERATOR_KEY_REF = "operator:jury";
 
 /** What each chain-acting class may run, and the one capability it needs to run it. */
 export const CHAIN_CLASS_ACTIONS: Readonly<Record<ChainDelegateClass, ReadonlySet<string>>> = Object.freeze({
     task_worker: TASK_ACTION_IDS,
     juror: JUROR_ACTION_IDS,
-    jury_keeper: KEEPER_ACTION_IDS,
 });
 export const CHAIN_CLASS_NEEDS: Readonly<Record<ChainDelegateClass, number>> = Object.freeze({
     task_worker: CAP_TASK_TRADE,
     juror: CAP_JURY,
-    jury_keeper: CAP_JURY_KEEPER,
 });
 
 /** The one class that may run an action, or `undefined` if no delegate class may. */
@@ -195,9 +198,15 @@ export interface MemoryBridgeOptions {
     /** Encrypted, capability-scoped delegate keys (the production path). */
     delegates?: DelegateSource;
     /** Checks the delegate against the chain, via the relayer, on every request. */
-    verifier?: Pick<DelegateVerifier, "verify">;
+    verifier?: Pick<DelegateVerifier, "verify" | "inspect">;
     /** Relayer origin and namespace for delegates, which carry neither. */
     delegateDefaults?: { serverUrl?: string; namespace: string };
+    /**
+     * The crank operator's wallet (`JURY_CRANK_SIGNER_KEY`), a sub-agent seed of the account
+     * `JURY_CRANK_OPERATOR_ID`. The cranks are permissionless on chain, so it needs no capability;
+     * it signs only {@link CRANK_ACTION_IDS} and only for that account.
+     */
+    crankSigner?: { seedHex: string; accountId: string };
     requestTimeoutMs: number;
     eventsUrl?: string;
     /** Secret for the event sink. Falls back to the bridge's own shared secret. */
@@ -425,8 +434,8 @@ export class MemoryBridge {
     }
 
     /**
-     * Run one chain action as a delegate: a task market action as a `task_worker`, a juror's own
-     * step as a `juror`, or a permissionless jury crank as a `jury_keeper`.
+     * Run one chain action: a task market action as a `task_worker` delegate, a juror's own step
+     * as a `juror` delegate, or a permissionless jury crank with the operator's crank key.
      *
      * Four independent gates stand between a request and a signature, and any one failing is
      * enough: the action must belong to a delegate class; the delegate must be of exactly that
@@ -483,14 +492,6 @@ export class MemoryBridge {
     }
 
     async act(req: ChainActRequest): Promise<ChainActResponse> {
-        const requiredClass = classForAction(req.action_id);
-        if (!requiredClass) {
-            throw new BridgeError(
-                `${JSON.stringify(req.action_id)} is not an action a delegate may run`,
-                403,
-                "action_not_allowed",
-            );
-        }
         if (typeof req.idempotency_key !== "string" || !IDEMPOTENCY_KEY.test(req.idempotency_key)) {
             throw new BridgeError(
                 "idempotency_key must be 8-128 URL-safe characters",
@@ -506,6 +507,15 @@ export class MemoryBridge {
                 `params exceed ${MAX_ACTION_PARAMS_BYTES} bytes`,
                 413,
                 "payload_too_large",
+            );
+        }
+        if (req.key_ref === OPERATOR_KEY_REF) return this.crank(req);
+        const requiredClass = classForAction(req.action_id);
+        if (!requiredClass) {
+            throw new BridgeError(
+                `${JSON.stringify(req.action_id)} is not an action a delegate may run`,
+                403,
+                "action_not_allowed",
             );
         }
         if (!req.key_ref.startsWith(DELEGATE_REF_PREFIX)) {
@@ -556,6 +566,42 @@ export class MemoryBridge {
         });
         try {
             const result = await client.executeAction(req.action_id, params, {
+                idempotencyKey: req.idempotency_key,
+            });
+            return { status: "executed", action_id: req.action_id, digest: result.digest };
+        } catch (err) {
+            throw wrapChainError(err, req.action_id);
+        }
+    }
+
+    /** A crank on the operator's key: no delegate, no capability, only the operator's own account. */
+    private async crank(req: ChainActRequest): Promise<ChainActResponse> {
+        if (!CRANK_ACTION_IDS.has(req.action_id)) {
+            throw new BridgeError(
+                `${JSON.stringify(req.action_id)} is not a jury crank`,
+                403,
+                "action_not_allowed",
+            );
+        }
+        const signer = this.opts.crankSigner;
+        const serverUrl = this.opts.delegateDefaults?.serverUrl;
+        if (!signer || !serverUrl) {
+            throw new BridgeError(
+                `unknown agent key ref ${JSON.stringify(req.key_ref)}`,
+                404,
+                "key_store:unknown_ref",
+            );
+        }
+        if (normalizeObjectId(req.account_id) !== normalizeObjectId(signer.accountId)) {
+            throw new BridgeError(
+                "the crank key signs only for the crank operator's account",
+                403,
+                "delegate_wrong_account",
+            );
+        }
+        const client = this.createChainClient({ seedHex: signer.seedHex, accountId: signer.accountId, serverUrl });
+        try {
+            const result = await client.executeAction(req.action_id, req.params as Record<string, unknown>, {
                 idempotencyKey: req.idempotency_key,
             });
             return { status: "executed", action_id: req.action_id, digest: result.digest };

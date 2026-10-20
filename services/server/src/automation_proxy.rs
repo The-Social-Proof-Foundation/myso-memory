@@ -319,7 +319,11 @@ pub async fn create_job(
 
     let mut trigger_set = body.trigger_set;
     if is_chain_action(&body.action) {
-        let delegate = find_delegate(&engine, &auth.account_id, &body.target_agent_key_ref).await?;
+        let delegate = if body.target_agent_key_ref == OPERATOR_KEY_REF {
+            operator_signer(&auth.account_id, state.config.jury_crank_operator_id.as_deref())?
+        } else {
+            find_delegate(&engine, &auth.account_id, &body.target_agent_key_ref).await?
+        };
         validate_chain_job(
             &body.action,
             &mut trigger_set,
@@ -393,7 +397,7 @@ pub struct PutDelegateBody {
     pub mydata_key_id: String,
     /// The encrypted envelope (base64url). Opaque to this service.
     pub encrypted_key: String,
-    /// `memory` (default), `task_worker`, `juror` or `jury_keeper`.
+    /// `memory` (default), `task_worker` or `juror`.
     pub delegate_class: Option<String>,
     /// The actions a chain-acting delegate may run. Must be empty or absent for `memory`.
     pub allowed_action_ids: Option<Vec<String>>,
@@ -439,8 +443,8 @@ const JUROR_ACTION_IDS: &[&str] = &[
     "jury.claim_fee.v1",
 ];
 
-/// The permissionless jury cranks. Must match the engine's and the bridge's lists.
-const KEEPER_ACTION_IDS: &[&str] = &[
+/// The permissionless jury cranks. Must match `CRANK_ACTION_IDS` in the bridge.
+const CRANK_ACTION_IDS: &[&str] = &[
     "jury.select_jury.v1",
     "jury.replace_no_shows.v1",
     "jury.finalize_round.v1",
@@ -453,15 +457,22 @@ const KEEPER_ACTION_IDS: &[&str] = &[
     "jury.finalize_proposal.v1",
     "jury.apply_proposal_decision.v1",
     "jury.sweep_case.v1",
+    "jury.sweep_vote_refunds.v1",
     "jury.refresh_roster_entry.v1",
     "jury.evict_ineligible.v1",
 ];
+
+/// The key ref of the bridge's crank signer. Only the configured crank operator's jobs may use it.
+const OPERATOR_KEY_REF: &str = "operator:jury";
+
+/// Not a delegate class anyone can register: the stand-in for jobs that sign with the operator key.
+const OPERATOR_CLASS: &str = "jury_operator";
 
 /// The event family a chain-acting class's jobs may subscribe to.
 fn class_event_family(class: &str) -> Option<&'static str> {
     match class {
         "task_worker" => Some("task"),
-        "juror" | "jury_keeper" => Some("jury"),
+        "juror" | OPERATOR_CLASS => Some("jury"),
         _ => None,
     }
 }
@@ -471,7 +482,7 @@ fn class_may_run(class: &str, id: &str) -> bool {
     match class {
         "task_worker" => is_action_id_in(id, "task"),
         "juror" => is_action_id_in(id, "jury") && JUROR_ACTION_IDS.contains(&id),
-        "jury_keeper" => is_action_id_in(id, "jury") && KEEPER_ACTION_IDS.contains(&id),
+        OPERATOR_CLASS => is_action_id_in(id, "jury") && CRANK_ACTION_IDS.contains(&id),
         _ => false,
     }
 }
@@ -483,9 +494,9 @@ fn validate_delegate_class(class: &str, allowed_action_ids: &[String]) -> Result
     match class {
         "memory" if allowed_action_ids.is_empty() => Ok(()),
         "memory" => invalid(
-            "a memory delegate cannot run chain actions; use the task_worker, juror or jury_keeper class",
+            "a memory delegate cannot run chain actions; use the task_worker or juror class",
         ),
-        "task_worker" | "juror" | "jury_keeper" => {
+        "task_worker" | "juror" => {
             if allowed_action_ids.is_empty() || allowed_action_ids.len() > 16 {
                 return invalid("a chain-acting delegate needs 1 to 16 allowed_action_ids");
             }
@@ -518,6 +529,23 @@ struct DelegateInfo {
     agent_object_id: String,
     class: String,
     allowed_action_ids: Vec<String>,
+}
+
+/// A crank job signs with the bridge's operator key, so only the configured operator may schedule
+/// one, and it may run the cranks and nothing else.
+fn operator_signer(account_id: &str, operator_id: Option<&str>) -> Result<DelegateInfo, ProxyError> {
+    let is_operator = operator_id
+        .is_some_and(|operator| canonical_object_id(operator) == canonical_object_id(account_id));
+    if !is_operator {
+        return Err(ProxyError::InvalidRequest(
+            "only the jury crank operator may use the operator:jury key".into(),
+        ));
+    }
+    Ok(DelegateInfo {
+        agent_object_id: String::new(),
+        class: OPERATOR_CLASS.into(),
+        allowed_action_ids: CRANK_ACTION_IDS.iter().map(|id| (*id).to_string()).collect(),
+    })
 }
 
 fn is_chain_action(action: &Value) -> bool {
@@ -597,7 +625,7 @@ fn validate_chain_job(
 ) -> Result<(), ProxyError> {
     let invalid = |message: String| Err(ProxyError::InvalidRequest(message));
     let Some(family) = class_event_family(&delegate.class) else {
-        return invalid("chain actions need a task_worker, juror or jury_keeper delegate".into());
+        return invalid("chain actions need a task_worker or juror delegate".into());
     };
     let config = action.get("config").cloned().unwrap_or(Value::Null);
     let permitted = |id: &str| delegate.allowed_action_ids.iter().any(|allowed| allowed == id);
@@ -651,8 +679,8 @@ fn validate_chain_job(
         };
         object.remove("organization_id");
         object.insert("account_id".into(), Value::String(canonical_object_id(account_id)));
-        if delegate.class == "jury_keeper" {
-            // A crank event belongs to the keeper's account, not to one agent, so an agent filter
+        if delegate.class == OPERATOR_CLASS {
+            // A crank event belongs to the operator's account, not to one agent, so an agent filter
             // would never match it.
             object.remove("agent_object_id");
         } else {
@@ -903,12 +931,15 @@ mod tests {
         }
     }
 
-    fn keeper() -> DelegateInfo {
-        DelegateInfo {
-            agent_object_id: "0xkeeper".into(),
-            class: "jury_keeper".into(),
-            allowed_action_ids: vec!["jury.finalize_round.v1".into(), "jury.select_jury.v1".into()],
-        }
+    fn operator() -> DelegateInfo {
+        operator_signer("0xmine", Some("0xMINE")).unwrap()
+    }
+
+    #[test]
+    fn only_the_configured_operator_may_sign_with_the_operator_key() {
+        assert!(operator_signer("0xmine", None).is_err());
+        assert!(operator_signer("0xmine", Some("0xsomeone-else")).is_err());
+        assert_eq!(operator().allowed_action_ids.len(), CRANK_ACTION_IDS.len());
     }
 
     fn jury_triggers(event_type: &str) -> Value {
@@ -937,9 +968,9 @@ mod tests {
     }
 
     #[test]
-    fn a_keepers_jobs_are_bound_to_its_account_only() {
+    fn an_operators_jobs_are_bound_to_its_account_only() {
         let mut triggers = jury_triggers("round_finalize_due");
-        validate_chain_job(&registered("jury.finalize_round.v1"), &mut triggers, "0xmine", &keeper(), &[]).unwrap();
+        validate_chain_job(&registered("jury.finalize_round.v1"), &mut triggers, "0xmine", &operator(), &[]).unwrap();
         let trigger = &triggers["triggers"][0];
         assert_eq!(trigger["account_id"], canonical_object_id("0xmine"));
         // Crank events name no agent, so the foreign agent filter must be removed, not replaced.
@@ -953,12 +984,12 @@ mod tests {
         };
         assert!(run("jury.accept.v1", &juror()).is_ok());
         assert!(run("jury.finalize_round.v1", &juror()).is_err());
-        assert!(run("jury.accept.v1", &keeper()).is_err());
+        assert!(run("jury.accept.v1", &operator()).is_err());
         assert!(run("task.settle.v1", &juror()).is_err());
-        assert!(run("task.settle.v1", &keeper()).is_err());
+        assert!(run("task.settle.v1", &operator()).is_err());
+        assert!(run("jury.sweep_vote_refunds.v1", &operator()).is_ok());
         // Allowed by the class but not registered for this delegate.
         assert!(run("jury.claim_fee.v1", &juror()).is_err());
-        assert!(run("jury.sweep_case.v1", &keeper()).is_err());
     }
 
     #[test]
@@ -974,23 +1005,24 @@ mod tests {
         assert!(on_family("task", &juror(), "jury.accept.v1").is_err());
         assert!(on_family("task", &worker(), "task.accept.v1").is_ok());
         assert!(on_family("jury", &worker(), "task.accept.v1").is_err());
-        assert!(on_family("jury", &keeper(), "jury.select_jury.v1").is_ok());
-        assert!(on_family("memory", &keeper(), "jury.select_jury.v1").is_err());
+        assert!(on_family("jury", &operator(), "jury.select_jury.v1").is_ok());
+        assert!(on_family("memory", &operator(), "jury.select_jury.v1").is_err());
     }
 
     #[test]
     fn jury_classes_are_validated_before_they_reach_the_engine() {
         let ids = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert!(validate_delegate_class("juror", &ids(&["jury.accept.v1", "jury.reveal_vote.v1"])).is_ok());
-        assert!(validate_delegate_class("jury_keeper", &ids(KEEPER_ACTION_IDS)).is_ok());
         assert!(validate_delegate_class("juror", &ids(&["jury.select_jury.v1"])).is_err());
-        assert!(validate_delegate_class("jury_keeper", &ids(&["jury.accept.v1"])).is_err());
+        // Nobody registers a crank delegate: the keeper class is gone and the operator class is internal.
+        assert!(validate_delegate_class("jury_keeper", &ids(CRANK_ACTION_IDS)).is_err());
+        assert!(validate_delegate_class(OPERATOR_CLASS, &ids(CRANK_ACTION_IDS)).is_err());
         assert!(validate_delegate_class("juror", &ids(&["task.accept.v1"])).is_err());
         assert!(validate_delegate_class("task_worker", &ids(&["jury.accept.v1"])).is_err());
         assert!(validate_delegate_class("juror", &[]).is_err());
         assert_eq!(JUROR_ACTION_IDS.len(), 4);
-        assert_eq!(KEEPER_ACTION_IDS.len(), 14);
-        assert!(JUROR_ACTION_IDS.iter().all(|id| !KEEPER_ACTION_IDS.contains(id)));
+        assert_eq!(CRANK_ACTION_IDS.len(), 15);
+        assert!(JUROR_ACTION_IDS.iter().all(|id| !CRANK_ACTION_IDS.contains(id)));
     }
 
     #[test]

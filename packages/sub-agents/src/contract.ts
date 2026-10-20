@@ -18,8 +18,8 @@ export const CAP_SOCIAL_GRAPH = 65536;
 export const CAP_TASK_TRADE = 131072;
 /** Mirrors `memory::CAP_JURY`: serve on a jury (accept, commit, reveal, claim). Spends nothing. */
 export const CAP_JURY = 262144;
-/** Mirrors `memory::CAP_JURY_KEEPER`: run the permissionless jury cranks. Spends nothing. */
-export const CAP_JURY_KEEPER = 524288;
+/** The jury cranks are permissionless on chain, so driving one needs no capability. */
+export const CAP_NONE = 0;
 
 /** Mirrors `post::POST_ACCESS_*`. */
 export const POST_ACCESS_PUBLIC = 1;

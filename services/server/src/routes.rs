@@ -296,7 +296,7 @@ pub async fn agent_context(
     use crate::memory_contract::{
         has_cap, CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_AI_SPEND, CAP_COMMENT,
         CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MESSAGE_SEND, CAP_MYDATA_READ, CAP_POST_PUBLISH,
-        CAP_JURY, CAP_JURY_KEEPER, CAP_REACT, CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
+        CAP_JURY, CAP_REACT, CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
     };
 
     let mut actions = Vec::new();
@@ -383,9 +383,8 @@ pub async fn agent_context(
             "jury.claim_fee.v1",
         ]);
     }
-    if has_cap(auth.capabilities, CAP_JURY_KEEPER)
-        && jury_objects_configured(&state.config.social_chain)
-    {
+    // The cranks are permissionless on chain, so any agent may drive them.
+    if jury_objects_configured(&state.config.social_chain) {
         actions.extend([
             "jury.select_jury.v1",
             "jury.replace_no_shows.v1",
@@ -399,6 +398,7 @@ pub async fn agent_context(
             "jury.finalize_proposal.v1",
             "jury.apply_proposal_decision.v1",
             "jury.sweep_case.v1",
+            "jury.sweep_vote_refunds.v1",
             "jury.refresh_roster_entry.v1",
             "jury.evict_ineligible.v1",
         ]);
@@ -2964,7 +2964,7 @@ const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.5.0";
 fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
     use crate::memory_contract::{
         CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_COMMENT, CAP_JURY,
-        CAP_JURY_KEEPER, CAP_MEMORY_READ, CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT,
+        CAP_MEMORY_READ, CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT,
         CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
     };
     match action {
@@ -3021,8 +3021,8 @@ fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
         | "task.propose_dispute_settlement.v1"
         | "task.accept_dispute_settlement.v1"
         | "task.clear_dispute_settlement.v1" => Some((CAP_TASK_TRADE, "1B")),
-        // A juror's own steps and the keeper cranks hold zero-spend capabilities of their own, so a
-        // jury delegate never carries the trade capability.
+        // A juror's own steps hold a zero-spend capability of their own, so a jury delegate never
+        // carries the trade capability. The cranks are permissionless on chain and need none.
         "jury.accept.v1"
         | "jury.commit_vote.v1"
         | "jury.reveal_vote.v1"
@@ -3040,9 +3040,10 @@ fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
         | "jury.finalize_proposal.v1"
         | "jury.apply_proposal_decision.v1"
         | "jury.sweep_case.v1"
+        | "jury.sweep_vote_refunds.v1"
         | "jury.refresh_roster_entry.v1"
         | "jury.evict_ineligible.v1"
-        => Some((CAP_JURY_KEEPER, "1B")),
+        => Some((0, "1B")),
         _ => None,
     }
 }
@@ -4601,7 +4602,7 @@ mod more_tests {
     }
 
     #[test]
-    fn a_juror_and_a_keeper_each_hold_a_zero_spend_capability_of_their_own() {
+    fn a_juror_holds_a_zero_spend_capability_and_the_cranks_need_none() {
         for action in [
             "jury.accept.v1",
             "jury.commit_vote.v1",
@@ -4627,20 +4628,12 @@ mod more_tests {
             "jury.finalize_proposal.v1",
             "jury.apply_proposal_decision.v1",
             "jury.sweep_case.v1",
+            "jury.sweep_vote_refunds.v1",
             "jury.refresh_roster_entry.v1",
             "jury.evict_ineligible.v1",
         ] {
-            assert_eq!(
-                registered_action_policy(action),
-                Some((crate::memory_contract::CAP_JURY_KEEPER, "1B")),
-                "{action}"
-            );
+            assert_eq!(registered_action_policy(action), Some((0, "1B")), "{action}");
         }
-        // The two jury capabilities are distinct bits and neither is the trade capability.
-        assert_ne!(
-            crate::memory_contract::CAP_JURY,
-            crate::memory_contract::CAP_JURY_KEEPER
-        );
         assert_eq!(
             crate::memory_contract::CAP_JURY & crate::memory_contract::CAP_TASK_TRADE,
             0

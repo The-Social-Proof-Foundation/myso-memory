@@ -457,6 +457,14 @@ export interface JurySettleFeesParams {
     closeCaseFirst?: boolean;
 }
 
+/** Send what voters did not claim on a refunded proposal to the treasury. */
+export interface JurySweepVoteRefundsParams {
+    registryId: string;
+    proposalId: string;
+    /** Set for a platform registry; its share goes to the platform's governance treasury. */
+    platformId?: string;
+}
+
 export interface JuryEscalateProposalParams {
     registryId: string;
     proposalId: string;
@@ -584,5 +592,6 @@ export type SocialExecuteAction =
     | "jury_finalize_proposal"
     | "jury_apply_proposal_decision"
     | "jury_sweep_case"
+    | "jury_sweep_vote_refunds"
     | "jury_refresh_roster_entry"
     | "jury_evict_ineligible";

@@ -8,6 +8,8 @@
  * memory read/write proxy for every agent key it holds.
  */
 
+import { normalizeSeed } from "./keys.js";
+
 /** Where agent keys are resolved from. */
 export interface AgentKeySource {
     /** Directory + filename of the JSON key file. */
@@ -78,6 +80,11 @@ export interface SidecarConfig {
     engineUrl?: string;
     /** `id:base64url` MyData private key. Present means delegates are enabled. */
     myDataPrivateKeys?: string;
+    /**
+     * The jury crank operator's wallet: `JURY_CRANK_SIGNER_KEY` (a sub-agent seed) and the account
+     * it belongs to, `JURY_CRANK_OPERATOR_ID`. Absent, this bridge runs no cranks.
+     */
+    crankSigner?: { seedHex: string; accountId: string };
 }
 
 /** Value shipped in `.env.example`; public, so never valid in production. */
@@ -237,5 +244,18 @@ export function loadConfig(
         allowStaticKeys: !production,
         engineUrl,
         myDataPrivateKeys,
+        crankSigner: readCrankSigner(env),
     };
+}
+
+function readCrankSigner(env: Env): SidecarConfig["crankSigner"] {
+    const key = readString(env, "JURY_CRANK_SIGNER_KEY");
+    const accountId = readString(env, "JURY_CRANK_OPERATOR_ID");
+    if (!key && !accountId) return undefined;
+    if (!key || !accountId) {
+        throw new Error(
+            "Refusing to start: JURY_CRANK_SIGNER_KEY and JURY_CRANK_OPERATOR_ID are set together or not at all.",
+        );
+    }
+    return { seedHex: normalizeSeed(key, "JURY_CRANK_SIGNER_KEY"), accountId };
 }

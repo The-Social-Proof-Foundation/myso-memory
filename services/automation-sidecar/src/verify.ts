@@ -31,22 +31,19 @@ export const CAP_MYDATA_READ = 4;
 export const CAP_TASK_TRADE = 131072;
 /** Serve on a jury: accept, commit, reveal, claim. Spends nothing. */
 export const CAP_JURY = 262144;
-/** Run the permissionless jury cranks. Spends nothing. */
-export const CAP_JURY_KEEPER = 524288;
 /** The most a `memory` delegate may hold. Anything else on the key disqualifies it. */
 export const DELEGATE_ALLOWED_CAPS = CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_MYDATA_READ;
 
 /**
  * A delegate's class fixes the most capability it may hold. `task_worker` adds only the task
- * market; `juror` adds only jury service and `jury_keeper` only the jury cranks. None can ever
+ * market; `juror` adds only jury service. None can ever
  * carry posting, trading, spending or agent-management capability.
  */
-export type DelegateClass = "memory" | "task_worker" | "juror" | "jury_keeper";
+export type DelegateClass = "memory" | "task_worker" | "juror";
 export const DELEGATE_CLASS_CAPS: Readonly<Record<DelegateClass, number>> = Object.freeze({
     memory: DELEGATE_ALLOWED_CAPS,
     task_worker: DELEGATE_ALLOWED_CAPS | CAP_TASK_TRADE,
     juror: DELEGATE_ALLOWED_CAPS | CAP_JURY,
-    jury_keeper: DELEGATE_ALLOWED_CAPS | CAP_JURY_KEEPER,
 });
 
 /** The classes that sign chain transactions; each must be short-lived. */
@@ -54,9 +51,9 @@ export function actsOnChain(delegateClass: DelegateClass): boolean {
     return delegateClass !== "memory";
 }
 
-/** Jury classes move no funds, so their spending limit must be exactly zero. */
+/** A juror moves no funds, so its spending limit must be exactly zero. */
 export function isZeroSpendClass(delegateClass: DelegateClass): boolean {
-    return delegateClass === "juror" || delegateClass === "jury_keeper";
+    return delegateClass === "juror";
 }
 
 /** A chain-acting delegate must expire within this window, so a leaked key has a short life. */
@@ -123,7 +120,6 @@ export function assertDelegateAllowed(
                 memory: "the delegate holds capabilities beyond memory read/write; register a narrower one",
                 task_worker: "the delegate holds capabilities beyond memory and the task market; register a narrower one",
                 juror: "the delegate holds capabilities beyond memory and jury service; register a narrower one",
-                jury_keeper: "the delegate holds capabilities beyond memory and the jury cranks; register a narrower one",
             }[delegateClass],
             "delegate_overscoped",
         );

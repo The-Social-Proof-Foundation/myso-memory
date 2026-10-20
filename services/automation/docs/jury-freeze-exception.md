@@ -17,18 +17,19 @@ first, so it needs its own explicit exception rather than riding on §14.
 ## Proposed README §15 wording
 
 > **§15 AI Jury automation (second declared exception).** The AI Jury (plan: `jury.move`) needs
-> juror agents and a first-party keeper to act through the engine. The following are added and
+> juror agents and the platform's default crank operator to act through the engine. The following are added and
 > nothing else is unfrozen:
 >
 > - the `jury` event family (and the dispute event types added to the `task` family);
-> - the `juror` and `jury_keeper` delegate classes, with `CAP_JURY` / `CAP_JURY_KEEPER`;
+> - the `juror` delegate class, with `CAP_JURY`, and the `operator:jury` crank key
+>   (`JURY_CRANK_SIGNER_KEY`, only for `JURY_CRANK_OPERATOR_ID`, only the permissionless cranks);
 > - the `jury.*` registered actions and the dispute actions added to `task_worker`;
 > - the proxy and bridge allow-list changes that make the class → action → family mapping
 >   data-driven instead of `task`-only, and the relayer's registry bump to 1.5.0 together with
 >   the SDK and the `workspace/social` mirror;
 > - the relayer's 409 classification for expected jury races.
 >
-> Both new classes are **zero-spend** and expire within 90 days; the bridge enforces both for every
+> The `juror` class is **zero-spend** and expires within 90 days; the bridge enforces both for every
 > chain-acting class. Jury jobs run with an empty `ActionPolicy` and rely on the delegate's class and
 > allow-list. The feature ships dark: the social server forwards no jury event unless
 > `JURY_AUTOMATION_ENABLED=true`, and the relayer only advertises `jury.*` actions when
@@ -44,14 +45,14 @@ first, so it needs its own explicit exception rather than riding on §14.
    `registered_action` job reacting to a `task` event, an idempotent retry, and a 409 skip.
 3. **Add the jury scenario** once the jury ships: a drafted `juror` delegate accepts, the runner
    webhook returns a commit directive within the poll-by-event pattern, the reveal lands, and a
-   `jury_keeper` job advances a case.
+   `operator:jury` crank job advances a case.
 4. Record the result (date, commit SHAs of engine/bridge/relayer/runner, who ran it) in this file.
 
 Gate result: **not recorded.**
 
 ## Known stale items to fix with the exception
 
-- §13 still describes delegates as memory-only (L813, L822); it must cover `task_worker`, `juror`
-  and `jury_keeper`.
+- §13 still describes delegates as memory-only (L813, L822); it must cover `task_worker` and
+  `juror`.
 - §11 says "15-family registry" (L460); `docs/event_registry.json` lists 17 families.
 - `scripts/smoke.ts` / `scripts/live-check.ts` contain no task or jury flow.

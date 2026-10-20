@@ -1,25 +1,28 @@
 /**
- * The keeper reconciler: a recovery path for when the automation engine misses an event.
+ * The crank reconciler: a recovery path for when the automation engine misses an event, and the way
+ * a third party runs the cranks on its own.
  *
- * It reads what the chain says is crankable (`GET /jury/cranks`) and runs it through the bridge as a
- * jury keeper delegate. The runner holds no key: the bridge signs, after re-verifying the delegate
- * on chain, exactly as it does for the engine. It only acts on cranks that have been due for a
+ * It reads what the chain says is crankable (`GET /jury/cranks`, a public feed) and runs it through
+ * the bridge with the operator's crank key (`operator:jury`). The runner holds no key: the bridge
+ * signs with the wallet in its `JURY_CRANK_SIGNER_KEY`. Every crank is permissionless on chain, so
+ * any operator can run this against its own bridge. It only acts on cranks that have been due for a
  * while, so the engine gets the first try, and a crank someone else already ran is an expected
  * conflict, not a failure.
  *
- * Off by default. It is a safety net, not the primary keeper.
+ * Off by default. It is a safety net, not the primary path.
  */
 
 import { createHash } from "node:crypto";
+
+/** The bridge's crank signer. */
+export const OPERATOR_KEY_REF = "operator:jury";
 
 export interface ReconcilerConfig {
     bridgeUrl: string;
     /** The bridge's `x-internal-sync-secret`. */
     bridgeSecret: string;
-    /** `delegate:<name>` of a `jury_keeper` delegate. */
-    keeperKeyRef: string;
-    /** The keeper's MemoryAccount id. */
-    keeperAccountId: string;
+    /** The crank operator's MemoryAccount id: the bridge's `JURY_CRANK_OPERATOR_ID`. */
+    operatorAccountId: string;
     intervalMs: number;
     /** A crank must have been due this long before the reconciler takes it. */
     graceMs: number;
@@ -95,6 +98,8 @@ export function actionForCrank(crank: CrankView): CrankAction | null {
             return pick("jury.evict_ineligible.v1", { agentId: crank.subjectId });
         case "sweep_due":
             return pick("jury.sweep_case.v1", { caseId });
+        case "vote_refund_sweep_due":
+            return pick("jury.sweep_vote_refunds.v1", proposal);
         default:
             return null;
     }
@@ -152,8 +157,8 @@ export class Reconciler {
                 method: "POST",
                 headers: { "content-type": "application/json", "x-internal-sync-secret": config.bridgeSecret },
                 body: JSON.stringify({
-                    key_ref: config.keeperKeyRef,
-                    account_id: config.keeperAccountId,
+                    key_ref: OPERATOR_KEY_REF,
+                    account_id: config.operatorAccountId,
                     action_id: action.actionId,
                     params: action.params,
                     idempotency_key: idempotencyKey(crank, nowMs),
