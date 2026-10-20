@@ -5,6 +5,38 @@ export interface OrgDecryptContext {
     orgMemoryGroupId: string;
 }
 
+export interface EncryptedKeyBinding {
+    packageId: string;
+    services: [string, number][];
+    threshold: number;
+}
+
+function normalizeId(id: string): string {
+    return "0x" + id.replace(/^0x/i, "").toLowerCase().padStart(64, "0");
+}
+
+/**
+ * Explain why fetched keys cannot open a blob. MyData caches keys under the session key's
+ * package and the key server id, and decrypt looks them up under the blob's own package and
+ * services, so either mismatch surfaces later as an opaque "Not enough shares".
+ */
+export function describeKeyMismatch(
+    encrypted: EncryptedKeyBinding,
+    sessionPackageId: string,
+    keyServerIds: string[],
+): string | null {
+    if (normalizeId(encrypted.packageId) !== normalizeId(sessionPackageId)) {
+        return `blob was encrypted for package ${normalizeId(encrypted.packageId)} but the session key is for ${normalizeId(sessionPackageId)}`;
+    }
+    const configured = new Set(keyServerIds.map(normalizeId));
+    const reachable = encrypted.services.filter(([id]) => configured.has(normalizeId(id))).length;
+    if (reachable < encrypted.threshold) {
+        const blobServers = [...new Set(encrypted.services.map(([id]) => normalizeId(id)))].join(", ");
+        return `blob needs ${encrypted.threshold} share(s) from key server(s) ${blobServers}; configured key server(s) ${[...configured].join(", ") || "none"} supply ${reachable}`;
+    }
+    return null;
+}
+
 /** Build against the current memory Move ABI; TxContext is supplied by the VM. */
 export function addApproveKeyPolicyCall(
     tx: Transaction,

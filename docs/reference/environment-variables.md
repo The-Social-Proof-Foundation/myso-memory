@@ -39,7 +39,7 @@ These are not all enforced at boot, but most real deployments need them.
 | `SOCIAL_CHAIN_GRAPHQL_URL` | local GraphQL on localnet | GraphQL endpoint for startup discovery; non-local HTTP endpoints are rejected |
 | `FILE_STORAGE_PUBLISHER_URL` | File Storage mainnet publisher | Override upload endpoint |
 | `SOCIAL_SERVER_URL` | `http://127.0.0.1:9126` | Social API base URL for sub-agent lookup |
-| `INTERNAL_SYNC_SECRET` | none | Required shared secret for organization summary and control-plane reads; must match social-server |
+| `INTERNAL_SYNC_SECRET` | none | Optional shared secret for this deployment's private social-server dashboard snapshot (`/api/organizations/:id/control`). Not used for memory authorization: org membership and `OrgMemoryReader`/`OrgMemoryWriter` grants are verified directly on chain through `MYSO_RPC_URL` |
 | `USERNAME_REGISTRY_ID` | none | Username registry used by registered social actions |
 | `PLATFORM_REGISTRY_ID` | none | Platform registry used by registered social actions |
 | `PLATFORM_OBJECT_ID` | none | Platform object and default agent action scope |

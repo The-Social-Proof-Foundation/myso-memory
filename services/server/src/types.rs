@@ -19,8 +19,6 @@ pub struct AppState {
     pub redis: redis::aio::MultiplexedConnection,
     /// In-memory token bucket fallback for when Redis is unavailable
     pub fallback_rate_limit: tokio::sync::Mutex<crate::rate_limit::InMemoryFallback>,
-    /// Canonical org metadata cache (fetched from social-server; never derived).
-    pub org_summaries: crate::org_summary::OrgSummaryCache,
     /// Present when `MEMORY_BLOB_BACKEND=r2`. Recall of `r2:` blob ids uses this.
     pub r2: Option<crate::blob_store::R2BlobStore>,
 }

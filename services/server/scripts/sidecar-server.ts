@@ -20,7 +20,7 @@ import { Transaction } from "@socialproof/myso/transactions";
 import { MyDataClient, SessionKey, EncryptedObject } from "@socialproof/mydata";
 import { resolveKeyServers } from "./mydata-key-servers.js";
 import { FileStorageClient } from "@socialproof/file-storage";
-import { addApproveKeyPolicyCall, type OrgDecryptContext } from "./mydata-policy.js";
+import { addApproveKeyPolicyCall, describeKeyMismatch, type OrgDecryptContext } from "./mydata-policy.js";
 
 // ============================================================
 // Shared clients (initialized once at boot — the whole point!)
@@ -99,6 +99,7 @@ const DEFAULT_FILE_STORAGE_EPOCHS = FILE_STORAGE_NETWORK === "testnet" ? 50 : 3;
  * is still coming up is retried on the next request rather than poisoned for the process.
  */
 let mydataClientPromise: Promise<MyDataClient> | null = null;
+let activeKeyServerIds: string[] = [];
 
 function getMydataClient(): Promise<MyDataClient> {
     if (mydataClientPromise) return mydataClientPromise;
@@ -134,6 +135,7 @@ function getMydataClient(): Promise<MyDataClient> {
                         : ""),
             );
         }
+        activeKeyServerIds = resolved.ids;
         return new MyDataClient({
             mysoClient: mysoClient as any,
             serverConfigs: resolved.ids.map((id) => ({ objectId: id, weight: 1 })),
@@ -650,6 +652,13 @@ app.post("/mydata/decrypt", async (req, res) => {
         const parsed = EncryptedObject.parse(encryptedData);
         const fullId = parsed.id;
 
+        const client = await getMydataClient();
+        const mismatch = describeKeyMismatch(parsed, sessionKey.getPackageId(), activeKeyServerIds);
+        if (mismatch) {
+            console.warn(`[mydata/decrypt] key mismatch: ${mismatch}`);
+            return res.status(409).json({ error: `key mismatch: ${mismatch}` });
+        }
+
         // Convert hex ID to byte array for PTB
         const idBytes = Array.from(
             Uint8Array.from(fullId.match(/.{1,2}/g)!.map((b: string) => parseInt(b, 16)))
@@ -660,10 +669,16 @@ app.post("/mydata/decrypt", async (req, res) => {
         // the owner-suffix approve_key_policy path.
         const tx = new Transaction();
         addApproveKeyPolicyCall(tx, packageId, process.env.MEMORY_CONFIG_ID || "", idBytes, accountId, orgCtx);
-        const txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
+        let txBytes: Uint8Array;
+        try {
+            txBytes = await tx.build({ client: mysoClient as any, onlyTransactionKind: true });
+        } catch (err: any) {
+            console.warn(`[mydata/decrypt] key policy inputs unresolved: ${err.message}`);
+            return res.status(409).json({ error: `key policy inputs unresolved: ${err.message}` });
+        }
 
         // Fetch keys from key servers
-        await (await getMydataClient()).fetchKeys({
+        await client.fetchKeys({
             ids: [fullId],
             txBytes,
             sessionKey,
@@ -671,7 +686,7 @@ app.post("/mydata/decrypt", async (req, res) => {
         });
 
         // Decrypt locally
-        const decrypted = await (await getMydataClient()).decrypt({
+        const decrypted = await client.decrypt({
             data: encryptedData,
             sessionKey,
             txBytes,

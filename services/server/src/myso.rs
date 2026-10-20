@@ -17,10 +17,6 @@ pub fn derived_address_from_public_key(public_key_bytes: &[u8; 32]) -> String {
 
 pub struct SubAgentVerifyResult {
     pub owner: String,
-    pub account_id: String,
-    pub agent_object_id: String,
-    pub derived_address: String,
-    pub capabilities: u64,
 }
 
 /// Verify a sub-agent against on-chain SubAgent + MemoryAccount objects.
@@ -92,13 +88,7 @@ pub async fn verify_sub_agent_onchain(
         )));
     }
 
-    Ok(SubAgentVerifyResult {
-        owner,
-        account_id: account_object_id.to_string(),
-        agent_object_id: agent_object_id.to_string(),
-        derived_address,
-        capabilities,
-    })
+    Ok(SubAgentVerifyResult { owner })
 }
 
 /// Fetch MemoryAccount owner address (for owner co-sign verification).
@@ -267,7 +257,7 @@ impl std::error::Error for OnchainVerifyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory_contract::{has_cap, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MYDATA_READ};
+    use crate::memory_contract::{has_cap, CAP_MEMORY_READ, CAP_MEMORY_WRITE};
 
     #[test]
     fn derived_address_is_deterministic() {
@@ -286,19 +276,34 @@ mod tests {
         assert!(!has_cap(CAP_MEMORY_READ, CAP_MEMORY_WRITE));
     }
 
-    #[test]
-    fn sub_agent_verify_result_fields_are_populated() {
-        let verified = SubAgentVerifyResult {
-            owner: "0xowner".into(),
-            account_id: "0xaccount".into(),
-            agent_object_id: "0xagent".into(),
-            derived_address: "0xderived".into(),
-            capabilities: CAP_MEMORY_READ | CAP_MYDATA_READ,
-        };
-        assert_eq!(verified.account_id, "0xaccount");
-        assert_eq!(verified.agent_object_id, "0xagent");
-        assert_eq!(verified.derived_address, "0xderived");
-        assert!(has_cap(verified.capabilities, CAP_MYDATA_READ));
+    #[tokio::test]
+    async fn canonical_agent_is_built_from_chain_alone() {
+        let chain = crate::org_chain::mock_chain::MockChain::default();
+        chain.put_object(
+            "0x9d18",
+            "0x00000000000000000000000000000000000000000000000000000000000050c1::memory::SubAgent",
+            serde_json::json!({
+                "memory_account_id": "0xacc0", "derived_address": "0xd399", "organization_id": "0xdea6",
+                "label": "Chat assistant", "role_tags": "0", "registered_by": "0x0e7e", "created_at": "17",
+                "active": true, "capabilities": "1048567", "delegatable_caps": "0", "identity_class": 1,
+                "register_scope": 3, "depth": 1, "expires_at": null, "platform_scope": null,
+                "parent_object_id": null,
+                "constraints": { "fields": { "approval_required_caps": "0", "max_action_spend": null } },
+            }),
+        );
+        let url = chain.serve().await;
+        let package = crate::memory_contract::normalize_object_id("0x50c1");
+        let agent = canonical_agent_by_object_id(&reqwest::Client::new(), &url, &package, "0x9d18")
+            .await
+            .unwrap();
+        assert_eq!(agent.account_id, "0xacc0");
+        assert_eq!(agent.organization_id.as_deref(), Some("0xdea6"));
+        assert_eq!(agent.capabilities, 1048567);
+        assert!(agent.active);
+        assert_eq!(agent.created_at_ms, 17);
+
+        let wrong_package = canonical_agent_by_object_id(&reqwest::Client::new(), &url, "0xbad", "0x9d18").await;
+        assert!(wrong_package.is_err());
     }
 }
 
@@ -314,10 +319,44 @@ pub(crate) async fn fetch_typed_object_fields(http: &reqwest::Client, rpc: &str,
     data.get("fields").and_then(|v| v.as_object()).cloned().ok_or_else(|| OnchainVerifyError::RpcError("Object fields missing".into()))
 }
 
-/// Resolve every policy field from chain; indexed rows provide discovery, never authority.
-pub(crate) async fn authoritative_agent(http: &reqwest::Client, rpc: &str, package: &str, mut row: crate::social::SocialSubAgent) -> Result<crate::social::SocialSubAgent, OnchainVerifyError> {
+/// Build the complete agent row from the on-chain `SubAgent` alone; indexers provide
+/// discovery, never authority.
+pub(crate) async fn canonical_agent_by_object_id(http: &reqwest::Client, rpc: &str, package: &str, agent_object_id: &str) -> Result<crate::social::SocialSubAgent, OnchainVerifyError> {
     use serde_json::Value;
-    let f = fetch_typed_object_fields(http,rpc,&row.agent_object_id,package,"SubAgent").await?;
+    let f = fetch_typed_object_fields(http, rpc, agent_object_id, package, "SubAgent").await?;
+    let fail = || OnchainVerifyError::RpcError("Incomplete canonical agent".into());
+    let text = |key: &str| f.get(key).and_then(Value::as_str).map(String::from).ok_or_else(fail);
+    let number = |key: &str| f.get(key).and_then(parse_u64_json).and_then(|n| i64::try_from(n).ok()).ok_or_else(fail);
+    let created_at_ms = number("created_at")?;
+    let row = crate::social::SocialSubAgent {
+        agent_object_id: agent_object_id.to_string(),
+        derived_address: text("derived_address")?,
+        account_id: text("memory_account_id")?,
+        label: text("label")?,
+        identity_class: 0,
+        role_tags: number("role_tags")?,
+        capabilities: 0,
+        delegatable_caps: 0,
+        register_scope: 0,
+        approval_required_caps: 0,
+        max_action_spend: None,
+        platform_scope: None,
+        parent_object_id: None,
+        depth: 0,
+        registered_by: text("registered_by")?,
+        expires_at_ms: None,
+        active: false,
+        created_at_ms,
+        deactivated_at_ms: None,
+        revoked_at_ms: None,
+        updated_at_ms: created_at_ms,
+        organization_id: None,
+    };
+    apply_canonical_agent_fields(row, &f)
+}
+
+fn apply_canonical_agent_fields(mut row: crate::social::SocialSubAgent, f: &serde_json::Map<String, serde_json::Value>) -> Result<crate::social::SocialSubAgent, OnchainVerifyError> {
+    use serde_json::Value;
     let fail = || OnchainVerifyError::RpcError("Incomplete canonical agent policy".into());
     let number = |v: Option<&Value>| -> Result<u64, OnchainVerifyError> { v.and_then(|v|v.as_u64().or_else(||v.as_str()?.parse().ok())).ok_or_else(fail) };
     let string = |key: &str| -> Result<String,OnchainVerifyError> {f.get(key).and_then(Value::as_str).map(String::from).ok_or_else(fail)};

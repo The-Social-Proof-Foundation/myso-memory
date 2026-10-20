@@ -67,20 +67,6 @@ pub async fn fetch_sub_agent_by_derived_address(
     get_json(http_client, &url).await
 }
 
-/// Fetch a sub-agent by on-chain object id.
-pub async fn fetch_sub_agent_by_object_id(
-    http_client: &reqwest::Client,
-    base_url: &str,
-    agent_object_id: &str,
-) -> Result<SocialSubAgent, SocialApiError> {
-    let url = format!(
-        "{}/sub-agents/by-object/{}",
-        base_url.trim_end_matches('/'),
-        agent_object_id
-    );
-    get_json(http_client, &url).await
-}
-
 async fn get_json(
     http_client: &reqwest::Client,
     url: &str,

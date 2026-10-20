@@ -21,8 +21,8 @@ mod memory_contract;
 mod mydata;
 mod myso;
 mod observability;
+mod org_chain;
 mod org_perms;
-mod org_summary;
 mod policy;
 mod ranker;
 mod rate_limit;
@@ -230,7 +230,6 @@ async fn main() {
         key_pool,
         redis,
         fallback_rate_limit: tokio::sync::Mutex::new(crate::rate_limit::InMemoryFallback::default()),
-        org_summaries: crate::org_summary::OrgSummaryCache::new(),
         r2,
     });
 

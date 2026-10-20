@@ -242,17 +242,17 @@ pub async fn organization_control(
     Extension(auth): Extension<AuthInfo>,
     Path(organization_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let summary = crate::org_summary::fetch_org_summary(
+    let principal_owner = crate::org_chain::org_principal_owner(
         &state.http_client,
-        &state.org_summaries,
-        &state.config.social_server_url,
-        state.config.internal_sync_secret.as_deref(),
+        &state.config.myso_rpc_url,
+        &state.config.package_id,
         &organization_id,
     )
-    .await?
-    .ok_or_else(|| AppError::BadRequest("organization is not indexed".into()))?;
+    .await
+    .map_err(|err| AppError::Internal(err.to_string()))?
+    .ok_or_else(|| AppError::BadRequest("organization does not exist on chain".into()))?;
     let principal_owns =
-        crate::memory_contract::addresses_equal(&summary.principal_owner, &auth.owner);
+        crate::memory_contract::addresses_equal(&principal_owner, &auth.owner);
     let agent_belongs = auth
         .organization_id
         .as_deref()
@@ -572,32 +572,14 @@ fn chat_model_id(api_base: &str, model: &str) -> Result<String, AppError> {
     Ok(openai_compatible_model_id(api_base, model))
 }
 
-/// Look up `org_memory_group_id` for an org via social-server (canonical source).
-///
-/// Returns `None` when the org is unknown, its group id has not been indexed
-/// yet, or the lookup fails; callers degrade to the legacy owner-identity
-/// decrypt path in that case so recall stays best-effort.
-pub(crate) async fn resolve_org_memory_group_id(
-    state: &Arc<AppState>,
+/// Canonical `org_memory_group_id` for an org whose reader grant was verified on chain.
+/// Key release is still enforced by `approve_org_key_policy` on the key servers.
+pub(crate) fn resolve_org_memory_group_id(
+    state: &AppState,
     organization_id: Option<&str>,
 ) -> Option<String> {
     let org_id = organization_id.filter(|id| !id.is_empty())?;
-    match crate::org_summary::fetch_org_summary(
-        &state.http_client,
-        &state.org_summaries,
-        &state.config.social_server_url,
-        state.config.internal_sync_secret.as_deref(),
-        org_id,
-    )
-    .await
-    {
-        Ok(Some(summary)) => summary.org_memory_group_id,
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!(error = %err, org = %org_id, "org summary lookup failed");
-            None
-        }
-    }
+    crate::org_chain::org_memory_group_id(&state.config.package_id, org_id)
 }
 
 /// Truncate a string to at most `max_bytes` bytes without splitting a UTF-8
@@ -961,7 +943,7 @@ pub async fn recall(
     let db = &state.db;
     let recall_organization_id = search_scope.organization_id.clone();
     let recall_org_memory_group_id =
-        resolve_org_memory_group_id(&state, recall_organization_id.as_deref()).await;
+        resolve_org_memory_group_id(&state, recall_organization_id.as_deref());
     let tasks: Vec<_> =
         hits_to_fetch
             .iter()
@@ -2259,7 +2241,7 @@ pub async fn ask(
     let db = &state.db;
     let ask_organization_id = search_scope.organization_id.clone();
     let ask_org_memory_group_id =
-        resolve_org_memory_group_id(&state, ask_organization_id.as_deref()).await;
+        resolve_org_memory_group_id(&state, ask_organization_id.as_deref());
     let tasks: Vec<_> =
         hits_to_fetch
             .iter()
@@ -2686,14 +2668,13 @@ pub async fn restore(
         })
         .collect();
 
-    // Prefetch org_memory_group_id for every org referenced by restored blobs so
-    // the decrypt tasks can rely on the cache and never re-derive locally.
+    // Resolve org_memory_group_id once per org referenced by restored blobs.
     let mut restore_org_group_ids: std::collections::HashMap<String, Option<String>> =
         std::collections::HashMap::new();
     for (_, (_, org_id)) in blob_visibility.iter() {
         if let Some(org_id) = org_id.as_deref() {
             if !restore_org_group_ids.contains_key(org_id) {
-                let group_id = resolve_org_memory_group_id(&state, Some(org_id)).await;
+                let group_id = resolve_org_memory_group_id(&state, Some(org_id));
                 restore_org_group_ids.insert(org_id.to_string(), group_id);
             }
         }

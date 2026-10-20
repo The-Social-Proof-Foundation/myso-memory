@@ -50,36 +50,17 @@ pub async fn spawn_memory_access_request(
     let Some(org_id) = auth.organization_id.clone() else {
         return Ok(false);
     };
-
-    // Look up the org owner + memory group id via the canonical social-server
-    // endpoint (Wave 0 rule: never re-derive locally).
-    let summary = match crate::org_summary::fetch_org_summary(
-        &state.http_client,
-        &state.org_summaries,
-        &state.config.social_server_url,
-        state.config.internal_sync_secret.as_deref(),
-        &org_id,
-    )
-    .await?
-    {
-        Some(s) => s,
-        None => {
-            tracing::warn!(org = %org_id, "memory access request skipped: org summary not found");
-            return Ok(false);
-        }
-    };
-    let Some(group_id) = summary.org_memory_group_id else {
-        tracing::warn!(
-            org = %org_id,
-            "memory access request skipped: org_memory_group_id not indexed yet"
-        );
+    // The org belongs to the agent's MemoryAccount on chain, so its principal owner is
+    // the account owner and the group id is the org's canonical derived share group.
+    let Some(group_id) = crate::org_chain::org_memory_group_id(&state.config.package_id, &org_id)
+    else {
         return Ok(false);
     };
 
     let body = MemoryAccessRequestBody {
-        recipient_address: summary.principal_owner,
-        organization_id: summary.organization_id,
-        account_id: summary.account_id,
+        recipient_address: auth.owner.clone(),
+        organization_id: org_id,
+        account_id: auth.account_id.clone(),
         org_memory_group_id: group_id,
         member_address: auth.derived_address.clone(),
         permissions_mask: requested_mask,

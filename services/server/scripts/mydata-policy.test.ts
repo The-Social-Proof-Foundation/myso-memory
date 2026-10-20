@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Transaction } from "@socialproof/myso/transactions";
 import { MySoJsonRpcClient } from "@socialproof/myso/jsonRpc";
-import { addApproveKeyPolicyCall } from "./mydata-policy.js";
+import { addApproveKeyPolicyCall, describeKeyMismatch } from "./mydata-policy.js";
 
 test("key approval refuses a missing MemoryConfig rather than building an invalid call", () => {
     assert.throws(() => addApproveKeyPolicyCall(new Transaction(), "0x50c1", "", [1], "0x1", null), /MEMORY_CONFIG_ID/);
@@ -53,4 +53,21 @@ test("organization approval resolves against the deployed Move ABI", {
     const bytes = await tx.build({ client, onlyTransactionKind: true });
     assert.ok(bytes.byteLength > 0);
     assert.equal(tx.getData().commands[0].MoveCall!.arguments.length, 6);
+});
+
+const SERVER = "0x" + "aa".repeat(32);
+const PACKAGE = "0x" + "50c1".padStart(64, "0");
+
+test("key mismatch is null when package and key servers line up", () => {
+    assert.equal(describeKeyMismatch({ packageId: "0x50c1", services: [[SERVER, 0]], threshold: 1 }, PACKAGE, [SERVER]), null);
+});
+
+test("key mismatch names the package when the session key targets another one", () => {
+    const msg = describeKeyMismatch({ packageId: PACKAGE, services: [[SERVER, 0]], threshold: 1 }, "0xda7a", [SERVER]);
+    assert.match(msg ?? "", /encrypted for package .*50c1 but the session key is for .*da7a/);
+});
+
+test("key mismatch names the blob's key servers when none are configured", () => {
+    const msg = describeKeyMismatch({ packageId: PACKAGE, services: [[SERVER, 0]], threshold: 1 }, PACKAGE, ["0x" + "bb".repeat(32)]);
+    assert.match(msg ?? "", new RegExp(`needs 1 share\\(s\\) from key server\\(s\\) ${SERVER}`));
 });

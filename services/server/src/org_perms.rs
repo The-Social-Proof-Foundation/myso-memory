@@ -1,103 +1,69 @@
-//! Org memory permission resolution (OrgMemoryReader / OrgMemoryWriter).
+//! Org memory permission policy (OrgMemoryReader / OrgMemoryWriter).
 //!
-//! Grants live on-chain in the org's `PermissionedGroup<MemorySharePackage>` and are
-//! indexed by the social server. The relayer resolves them lazily (only handlers that
-//! need org scope call this) with a short Redis TTL cache — revocation latency is
-//! bounded by the TTL. Failure policy is decided by callers: org writes fail closed,
-//! org reads degrade to private + account tiers.
+//! Grants are verified against current chain state on every call (see `org_chain`); the
+//! social indexer is never consulted. Org writes fail closed when chain state cannot be
+//! verified; org reads degrade to private + account tiers.
 
 use std::sync::Arc;
 
-use redis::AsyncCommands;
-use serde::Deserialize;
-
+pub use crate::org_chain::OrgMemoryPerms;
+use crate::org_chain::{ChainUnavailable, OrgMember};
 use crate::types::{AppError, AppState, AuthInfo};
 
-/// Cache TTL — also the maximum revocation latency for org-shared recall.
-const ORG_PERMS_CACHE_TTL_SECS: u64 = 30;
-
 /// Mirror of memory.move `ORG_PERM_*` bits.
-pub const ORG_PERM_MEMORY_READ: i64 = 1;
 pub const ORG_PERM_MEMORY_WRITE: i64 = 2;
-
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, Deserialize)]
-pub struct OrgMemoryPerms {
-    pub reader: bool,
-    pub writer: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct OrgMemoryPermissionRow {
-    permission_kind: i64,
-    active: bool,
-}
 
 /// Resolve the authenticated agent's org memory permissions for its own organization.
 /// Returns `Ok(None)` when the agent has no organization.
 pub async fn resolve_org_memory_perms(
     state: &Arc<AppState>,
     auth: &AuthInfo,
-) -> Result<Option<OrgMemoryPerms>, AppError> {
+) -> Result<Option<OrgMemoryPerms>, ChainUnavailable> {
     let Some(org_id) = auth.organization_id.as_deref() else {
         return Ok(None);
     };
+    crate::org_chain::resolve_org_memory_perms(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        &state.config.package_id,
+        OrgMember {
+            organization_id: org_id,
+            account_id: &auth.account_id,
+            owner: &auth.owner,
+            member: &auth.derived_address,
+        },
+    )
+    .await
+    .map(Some)
+}
 
-    let cache_key = format!("orgperm:{}:{}", org_id, auth.derived_address);
-    {
-        let mut redis = state.redis.clone();
-        let cached: Option<String> = redis.get(&cache_key).await.unwrap_or(None);
-        if let Some(raw) = cached {
-            if let Ok(perms) = serde_json::from_str::<OrgMemoryPerms>(&raw) {
-                return Ok(Some(perms));
-            }
+/// Write gate: only a verified `OrgMemoryWriter` grant passes. Unverifiable chain state is
+/// an error, never an implicit grant.
+fn require_writer(lookup: Result<Option<OrgMemoryPerms>, ChainUnavailable>) -> Result<bool, AppError> {
+    match lookup {
+        Ok(perms) => Ok(perms.is_some_and(|p| p.writer)),
+        Err(err) => Err(AppError::Internal(format!(
+            "org memory permission could not be verified on chain: {err}"
+        ))),
+    }
+}
+
+/// Read gate: returns the org id to include when a verified `OrgMemoryReader` grant exists,
+/// plus whether the lookup degraded.
+fn reader_scope(
+    organization_id: &str,
+    lookup: Result<Option<OrgMemoryPerms>, ChainUnavailable>,
+) -> (Option<String>, bool) {
+    match lookup {
+        Ok(perms) => (
+            perms.filter(|p| p.reader).map(|_| organization_id.to_string()),
+            false,
+        ),
+        Err(err) => {
+            tracing::warn!(error = %err, "org perms lookup failed; degrading recall scope");
+            (None, true)
         }
     }
-
-    let url = format!(
-        "{}/internal/organizations/{}/memory-permissions?member={}&active_only=true",
-        state.config.social_server_url.trim_end_matches('/'),
-        org_id,
-        auth.derived_address,
-    );
-    let mut request = state.http_client.get(&url);
-    if let Some(secret) = state.config.internal_sync_secret.as_deref() {
-        request = request.header("x-internal-sync-secret", secret);
-    }
-    let resp = request
-        .send()
-        .await
-        .map_err(|e| AppError::Internal(format!("org perms fetch failed: {}", e)))?;
-    if !resp.status().is_success() {
-        return Err(AppError::Internal(format!(
-            "org perms fetch status {}",
-            resp.status()
-        )));
-    }
-    let rows: Vec<OrgMemoryPermissionRow> = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Internal(format!("org perms parse failed: {}", e)))?;
-
-    let mut perms = OrgMemoryPerms::default();
-    for row in rows.iter().filter(|r| r.active) {
-        if row.permission_kind == ORG_PERM_MEMORY_READ {
-            perms.reader = true;
-        }
-        if row.permission_kind == ORG_PERM_MEMORY_WRITE {
-            perms.writer = true;
-        }
-    }
-
-    {
-        let mut redis = state.redis.clone();
-        if let Ok(raw) = serde_json::to_string(&perms) {
-            let _: Result<(), redis::RedisError> = redis
-                .set_ex(&cache_key, raw, ORG_PERMS_CACHE_TTL_SECS)
-                .await;
-        }
-    }
-
-    Ok(Some(perms))
 }
 
 /// Authorize a write-path visibility request. Returns the visibility tier plus the
@@ -121,11 +87,7 @@ pub async fn authorize_write_visibility(
                     "org visibility requires an organization-bound sub-agent".into(),
                 ));
             };
-            // Fail closed: an unresolved grant must never allow an org-visible write.
-            let perms = resolve_org_memory_perms(state, auth)
-                .await?
-                .unwrap_or_default();
-            if !perms.writer {
+            if !require_writer(resolve_org_memory_perms(state, auth).await)? {
                 // Best-effort: notify the org admin via workflow inbox so they can
                 // grant `OrgMemoryWriter`. Producer failures never block the 403.
                 let requested_mask = ORG_PERM_MEMORY_WRITE;
@@ -167,25 +129,11 @@ pub async fn resolve_search_scope(
 ) -> (crate::types::SearchScope, bool) {
     use crate::types::{RequestedScope, SearchScope};
 
-    let mut degraded = false;
-    let org_grant = match requested {
-        RequestedScope::Private | RequestedScope::Account => None,
-        RequestedScope::Org | RequestedScope::All => {
-            if auth.organization_id.is_none() {
-                None
-            } else {
-                match resolve_org_memory_perms(state, auth).await {
-                    Ok(perms) => perms
-                        .filter(|p| p.reader)
-                        .map(|_| auth.organization_id.clone().expect("org id checked above")),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "org perms lookup failed; degrading recall scope");
-                        degraded = true;
-                        None
-                    }
-                }
-            }
+    let (org_grant, degraded) = match (requested, auth.organization_id.as_deref()) {
+        (RequestedScope::Org | RequestedScope::All, Some(org_id)) => {
+            reader_scope(org_id, resolve_org_memory_perms(state, auth).await)
         }
+        _ => (None, false),
     };
 
     let scope = match requested {
@@ -212,4 +160,41 @@ pub async fn resolve_search_scope(
         },
     };
     (scope, degraded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reader_scope, require_writer, ChainUnavailable, OrgMemoryPerms};
+
+    const BOTH: OrgMemoryPerms = OrgMemoryPerms { reader: true, writer: true };
+    const READER: OrgMemoryPerms = OrgMemoryPerms { reader: true, writer: false };
+
+    fn unavailable() -> ChainUnavailable {
+        ChainUnavailable("fullnode unreachable".into())
+    }
+
+    #[test]
+    fn write_needs_a_verified_writer_grant() {
+        assert!(require_writer(Ok(Some(BOTH))).unwrap());
+        assert!(!require_writer(Ok(Some(READER))).unwrap());
+        assert!(!require_writer(Ok(Some(OrgMemoryPerms::default()))).unwrap());
+        assert!(!require_writer(Ok(None)).unwrap());
+    }
+
+    #[test]
+    fn write_fails_closed_when_chain_state_is_unverifiable() {
+        assert!(require_writer(Err(unavailable())).is_err());
+    }
+
+    #[test]
+    fn read_includes_org_only_for_verified_readers() {
+        assert_eq!(reader_scope("0xorg", Ok(Some(READER))), (Some("0xorg".into()), false));
+        assert_eq!(reader_scope("0xorg", Ok(Some(OrgMemoryPerms::default()))), (None, false));
+        assert_eq!(reader_scope("0xorg", Ok(None)), (None, false));
+    }
+
+    #[test]
+    fn read_degrades_without_org_when_chain_state_is_unverifiable() {
+        assert_eq!(reader_scope("0xorg", Err(unavailable())), (None, true));
+    }
 }

@@ -14,12 +14,11 @@ use crate::memory_contract::{
     CAP_COMMENT, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MESSAGE_READ, CAP_MYDATA_READ,
     CAP_POST_PUBLISH, CAP_REACT, E_SUB_AGENT_APPROVAL_REQUIRED,
 };
-use crate::myso::{derived_address_from_public_key, verify_sub_agent_onchain};
-use crate::policy::{validate_agent_policy, PolicyError, RequestPolicyInput};
-use crate::social::{
-    fetch_sub_agent_by_derived_address, fetch_sub_agent_by_object_id,
-    SocialApiError, SocialSubAgent,
+use crate::myso::{
+    canonical_agent_by_object_id, derived_address_from_public_key, verify_sub_agent_onchain,
 };
+use crate::policy::{validate_agent_policy, PolicyError, RequestPolicyInput};
+use crate::social::{fetch_sub_agent_by_derived_address, SocialApiError, SocialSubAgent};
 use crate::types::{AppState, AuthInfo};
 
 /// Estimated gas for a sponsored File Storage upload (MIST). Conservative ceiling for max_action_spend checks.
@@ -440,102 +439,46 @@ async fn resolve_sub_agent(
     let derived_address = derived_address_from_public_key(pk_bytes);
 
     let account_id_hint = account_id_hint.map(|a| crate::memory_contract::normalize_object_id(&a));
-    let mut agent: Option<SocialSubAgent> = None;
-    let mut owner = String::new();
 
-    if let Ok(Some(cached)) = state.db.get_cached_sub_agent(public_key_hex).await {
-        match verify_sub_agent_onchain(
-            &state.http_client,
-            &state.config.myso_rpc_url,
-            &cached.account_id,
-            &cached.agent_object_id,
-            pk_bytes,
-            required_cap,
-        )
-        .await
-        {
-            Ok(verified) => {
-                match fetch_sub_agent_by_object_id(
-                    &state.http_client,
-                    &state.config.social_server_url,
-                    &cached.agent_object_id,
-                )
-                .await
-                {
-                    Ok(indexed)
-                        if indexed.account_id == cached.account_id
-                            && indexed.agent_object_id == cached.agent_object_id
-                            && indexed.derived_address == verified.derived_address
-                            && indexed.capabilities as u64 == verified.capabilities =>
-                    {
-                        owner = verified.owner;
-                        agent = Some(indexed);
-                    }
-                    Ok(_) => {
-                        let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
-                    }
-                    Err(e) => {
-                        tracing::debug!("cached sub-agent {} stale: {}", cached.agent_object_id, e);
-                    }
-                }
-            }
-            Err(e) => {
-                let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
-                return Err(ResolveError::Other(e.to_string()));
-            }
+    // Discovery only: whichever source names the agent, chain state below is authoritative.
+    let (account_id, agent_object_id) = match state.db.get_cached_sub_agent(public_key_hex).await {
+        Ok(Some(cached)) => (cached.account_id, cached.agent_object_id),
+        _ => discover_agent(state, &derived_address, account_id_hint.as_deref()).await?,
+    };
+
+    let owner = match verify_sub_agent_onchain(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        &account_id,
+        &agent_object_id,
+        pk_bytes,
+        required_cap,
+    )
+    .await
+    {
+        Ok(verified) => verified.owner,
+        Err(e) => {
+            let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
+            return Err(ResolveError::Other(e.to_string()));
         }
-    }
+    };
 
-    if agent.is_none() {
-        match fetch_sub_agent_by_derived_address(
-            &state.http_client,
-            &state.config.social_server_url,
-            &derived_address,
-        )
-        .await
-        {
-            Ok(indexed) => {
-                if let Some(ref hint) = account_id_hint {
-                    if !memory_contract::addresses_equal(hint, &indexed.account_id) {
-                        return Err(ResolveError::Other(
-                            "x-account-id does not match indexed sub-agent account".into(),
-                        ));
-                    }
-                }
-                let verified = verify_sub_agent_onchain(
-                    &state.http_client,
-                    &state.config.myso_rpc_url,
-                    &indexed.account_id,
-                    &indexed.agent_object_id,
-                    pk_bytes,
-                    required_cap,
-                )
-                .await
-                .map_err(|e| ResolveError::Other(e.to_string()))?;
-                if verified.account_id != indexed.account_id
-                    || verified.agent_object_id != indexed.agent_object_id
-                    || verified.derived_address != indexed.derived_address
-                    || verified.capabilities != indexed.capabilities as u64
-                {
-                    return Err(ResolveError::Other(
-                        "social index and on-chain sub-agent state diverged".into(),
-                    ));
-                }
-                owner = verified.owner;
-                agent = Some(indexed);
-            }
-            Err(SocialApiError::NotFound) => {
-                return Err(ResolveError::Other(format!(
-                    "sub-agent not found for derived address {}",
-                    derived_address
-                )));
-            }
-            Err(e) => return Err(ResolveError::Other(e.to_string())),
-        }
+    let agent = canonical_agent_by_object_id(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        &state.config.package_id,
+        &agent_object_id,
+    )
+    .await
+    .map_err(|e| ResolveError::Other(e.to_string()))?;
+    if !memory_contract::addresses_equal(&agent.account_id, &account_id)
+        || !memory_contract::addresses_equal(&agent.derived_address, &derived_address)
+    {
+        let _ = state.db.delete_cached_sub_agent(public_key_hex).await;
+        return Err(ResolveError::Other(
+            "on-chain sub-agent is not bound to the signing key".into(),
+        ));
     }
-
-    let agent = crate::myso::authoritative_agent(&state.http_client, &state.config.myso_rpc_url, &state.config.package_id, agent.expect("agent resolved"))
-        .await.map_err(|e| ResolveError::Other(e.to_string()))?;
     if account_id_hint.as_deref().is_some_and(|hint| !memory_contract::addresses_equal(hint, &agent.account_id)) {
         return Err(ResolveError::Other("x-account-id mismatch".into()));
     }
@@ -546,8 +489,7 @@ async fn resolve_sub_agent(
         if !seen.insert(id.clone()) || ancestors.len() >= memory_contract::MAX_AGENT_DEPTH as usize {
             return Err(ResolveError::Other("invalid ancestor chain".into()));
         }
-        let indexed = fetch_sub_agent_by_object_id(&state.http_client, &state.config.social_server_url, &id).await.map_err(|e|ResolveError::Other(e.to_string()))?;
-        let canonical = crate::myso::authoritative_agent(&state.http_client, &state.config.myso_rpc_url, &state.config.package_id, indexed).await.map_err(|e|ResolveError::Other(e.to_string()))?;
+        let canonical = canonical_agent_by_object_id(&state.http_client, &state.config.myso_rpc_url, &state.config.package_id, &id).await.map_err(|e|ResolveError::Other(e.to_string()))?;
         if !memory_contract::addresses_equal(&canonical.account_id,&agent.account_id) || canonical.organization_id != agent.organization_id {
             return Err(ResolveError::Other("ancestor identity mismatch".into()));
         }
@@ -572,6 +514,46 @@ async fn resolve_sub_agent(
         owner,
         owner_co_signed,
     })
+}
+
+/// Map a signing key's derived address to `(account_id, agent_object_id)`. The signed
+/// `x-account-id` is resolved through the on-chain `MemoryAccount.agents` registry; the
+/// social indexer is only a fallback for clients that omit it.
+async fn discover_agent(
+    state: &AppState,
+    derived_address: &str,
+    account_id_hint: Option<&str>,
+) -> Result<(String, String), ResolveError> {
+    if let Some(account_id) = account_id_hint {
+        return match crate::org_chain::agent_object_id_in_account(
+            &state.http_client,
+            &state.config.myso_rpc_url,
+            &state.config.package_id,
+            account_id,
+            derived_address,
+        )
+        .await
+        {
+            Ok(Some(agent_object_id)) => Ok((account_id.to_string(), agent_object_id)),
+            Ok(None) => Err(ResolveError::Other(format!(
+                "sub-agent {derived_address} is not registered in account {account_id}"
+            ))),
+            Err(e) => Err(ResolveError::Other(e.to_string())),
+        };
+    }
+    match fetch_sub_agent_by_derived_address(
+        &state.http_client,
+        &state.config.social_server_url,
+        derived_address,
+    )
+    .await
+    {
+        Ok(indexed) => Ok((indexed.account_id, indexed.agent_object_id)),
+        Err(SocialApiError::NotFound) => Err(ResolveError::Other(format!(
+            "sub-agent not found for derived address {derived_address}"
+        ))),
+        Err(e) => Err(ResolveError::Other(e.to_string())),
+    }
 }
 
 #[cfg(test)]

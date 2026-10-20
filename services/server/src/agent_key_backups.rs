@@ -457,7 +457,7 @@ mod integration {
         config.agent_key_require_tier=None;config.agent_key_unlock_per_minute=3;
         let redis=redis::Client::open(redis_url).unwrap().get_multiplexed_async_connection().await.unwrap();
         let state=Arc::new(AppState{db,config,http_client:reqwest::Client::new(),key_pool:crate::types::KeyPool::new(vec![]),redis,
-            fallback_rate_limit:tokio::sync::Mutex::new(crate::rate_limit::InMemoryFallback::default()),org_summaries:crate::org_summary::OrgSummaryCache::new(),r2:None});
+            fallback_rate_limit:tokio::sync::Mutex::new(crate::rate_limit::InMemoryFallback::default()),r2:None});
         // A run finishing inside the same minute must not consume this run's custody budget.
         let mut limiter=state.redis.clone();
         let _: i64=redis::cmd("DEL").arg(format!("keybackup:custody-rate:test-chain:{account}:{}",chrono::Utc::now().timestamp()/60)).query_async(&mut limiter).await.unwrap();
