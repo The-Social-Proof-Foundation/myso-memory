@@ -1,6 +1,6 @@
 ---
 title: "How Storage Works"
-description: "The lifecycle of a memory in Memory — from plaintext to encrypted blob on File Storage and searchable vector in the database."
+description: "The lifecycle of a memory in Memory — from plaintext to encrypted blob in private Cloudflare R2 and searchable vector in the database."
 ---
 
 When you call `memory.remember(...)`, your data goes through several steps before it's stored. Here's what happens.
@@ -12,15 +12,15 @@ sequenceDiagram
     participant App as Your App
     participant Relayer as Relayer
     participant MYDATA as MYDATA
-    participant File Storage as File Storage
+    participant R2 as Private Cloudflare R2
     participant DB as Indexed Database
 
     App->>Relayer: plaintext memory
     Relayer->>Relayer: generate vector embedding
     Relayer->>MYDATA: encrypt content
     MYDATA-->>Relayer: encrypted payload
-    Relayer->>File Storage: upload blob + namespace metadata
-    File Storage-->>Relayer: blob ID
+    Relayer->>R2: upload ciphertext + recovery metadata
+    R2-->>Relayer: blob ID
     Relayer->>DB: store vector + blob ID + owner + namespace
     Relayer-->>App: success
 ```
@@ -39,9 +39,9 @@ sequenceDiagram
   </Step>
 
   <Step>
-    ### Blob upload
+    ### R2 storage
 
-    The encrypted payload is uploaded to File Storage as a blob. Metadata including the namespace is attached so the blob can be discovered later during restore. File Storage stores it durably across a decentralized network — there's no single point of failure.
+    The encrypted payload is uploaded to a private Cloudflare R2 bucket. Object metadata records the authenticated agent, encryption package, and visibility scope so the service can rebuild the vector index after database loss. R2 stores ciphertext; plaintext remains outside the bucket.
   </Step>
 
   <Step>
@@ -58,15 +58,15 @@ sequenceDiagram
     participant App as Your App
     participant Relayer as Relayer
     participant DB as Indexed Database
-    participant File Storage as File Storage
+    participant R2 as Private Cloudflare R2
     participant MYDATA as MYDATA
 
     App->>Relayer: query ("What does this user prefer?")
     Relayer->>Relayer: generate query embedding
     Relayer->>DB: vector search (owner + namespace)
     DB-->>Relayer: matching blob IDs
-    Relayer->>File Storage: download encrypted blobs
-    File Storage-->>Relayer: encrypted payloads
+    Relayer->>R2: download encrypted blobs
+    R2-->>Relayer: encrypted payloads
     Relayer->>MYDATA: decrypt
     MYDATA-->>Relayer: plaintext results
     Relayer-->>App: matching memories
@@ -74,39 +74,38 @@ sequenceDiagram
 
 1. Your query is converted into a vector embedding
 2. The database is searched for the closest matching vectors using pgvector's cosine distance operator (`<=>`), scoped to your memory space (`owner + namespace`)
-3. Matching encrypted blobs are downloaded from File Storage concurrently
+3. Matching encrypted blobs are downloaded from private R2 concurrently
 4. Each blob is decrypted via MYDATA using the delegate key
 5. Plaintext results are returned to your app, sorted by distance (most relevant first)
 
 <Note>
-If a blob has expired on File Storage (returns 404), the relayer automatically deletes the stale vector entry from the database. This reactive cleanup keeps your recall results clean without manual intervention.
+If an R2 object is missing, the relayer automatically deletes the stale vector entry from the database. This reactive cleanup keeps your recall results clean without manual intervention.
 </Note>
 
 ## Restoring a memory space
 
-If the local database is lost or incomplete, the restore flow rebuilds it from File Storage — the permanent source of truth.
+If the local database is lost or incomplete, the restore flow lists the authenticated agent's encrypted objects from the private R2 bucket and rebuilds the vector index.
 
 ```mermaid
 sequenceDiagram
     participant App as Your App
     participant Relayer as Relayer
-    participant Chain as MySo Chain
-    participant File Storage as File Storage
+    participant R2 as Private Cloudflare R2
     participant DB as Indexed Database
 
     App->>Relayer: restore("my-namespace")
-    Relayer->>Chain: query blobs by owner + namespace
-    Chain-->>Relayer: blob IDs (on-chain metadata)
+    Relayer->>R2: list encrypted objects by owner prefix
+    R2-->>Relayer: blob IDs + scoped recovery metadata
     Relayer->>DB: check which blobs already exist locally
     DB-->>Relayer: existing blob IDs
-    Relayer->>File Storage: download missing blobs
-    File Storage-->>Relayer: encrypted payloads
+    Relayer->>R2: download missing blobs
+    R2-->>Relayer: encrypted payloads
     Relayer->>Relayer: MYDATA decrypt + re-embed
     Relayer->>DB: insert new vector entries
     Relayer-->>App: restored count
 ```
 
-1. The relayer queries on-chain File Storage blob objects owned by the user, filtered by namespace metadata
+1. The relayer lists objects under the authenticated owner's private R2 prefix and filters by the authenticated agent metadata
 2. It compares against the local database to find which blobs are already indexed
 3. Only missing blobs are downloaded, decrypted, re-embedded, and re-indexed
 4. The restore supports a configurable `limit` (default: 50) to control how many blobs are processed per call
@@ -117,7 +116,7 @@ Restore is incremental and idempotent — you can call it multiple times safely.
 
 | Layer | Stores | Purpose |
 |-------|--------|---------|
-| **File Storage** | Encrypted blobs | Durable, decentralized source of truth |
+| **Private Cloudflare R2** | Encrypted blobs and recovery metadata | Durable ciphertext source for the R2-backed relayer |
 | **PostgreSQL + pgvector** | Vector embeddings + metadata | Fast semantic search for recall |
 
-The database is rebuildable — if it's ever lost, the restore flow can rediscover blobs from File Storage by owner and namespace, then re-embed and re-index them. File Storage is the permanent record.
+The database is rebuildable from R2 objects created with recovery metadata. Legacy File Storage blob IDs are not supported in this R2-only relayer.

@@ -80,6 +80,7 @@ const PRODUCTION_ENV = {
     AUTOMATION_MYDATA_PRIVATE_KEYS: "k1:" + "A".repeat(43),
     AUTOMATION_ENGINE_URL: "http://engine.internal:8010",
     MEMORY_SERVER_URL: "http://memory.internal:8000",
+    AUTOMATION_WORK_MCP_URL: "https://agents.example/mcp",
 };
 
 describe("production custody rules", () => {
@@ -110,6 +111,7 @@ describe("production custody rules", () => {
             "AUTOMATION_MYDATA_PRIVATE_KEYS",
             "AUTOMATION_ENGINE_URL",
             "MEMORY_SERVER_URL",
+            "AUTOMATION_WORK_MCP_URL",
         ] as const) {
             const env: Record<string, string | undefined> = { ...PRODUCTION_ENV };
             delete env[missing];

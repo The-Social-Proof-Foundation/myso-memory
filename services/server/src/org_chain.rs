@@ -30,6 +30,12 @@ pub struct OrgMemoryPerms {
     pub writer: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphSellerAuthority {
+    OrganizationAdmin,
+    SellGraphDelegate,
+}
+
 /// The authenticated member whose org permissions are checked. Every field must come
 /// from on-chain verified identity (the agent's `SubAgent` and `MemoryAccount`).
 #[derive(Debug, Clone, Copy)]
@@ -162,6 +168,122 @@ pub async fn org_principal_owner(
         return Ok(None);
     };
     string_field(&org.fields, "principal_owner").map(Some)
+}
+
+/// Verify graph-selling authority against current canonical chain state. The
+/// organization principal owner is an admin. An explicitly delegated member
+/// must hold the existing `OrgAgentManager` permission in the org memory group;
+/// the publication record narrows that broad org permission to graph selling.
+pub async fn verify_graph_seller_authority(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    package_id: &str,
+    organization_id: &str,
+    seller_address: &str,
+) -> Result<Option<GraphSellerAuthority>, ChainUnavailable> {
+    let org_id = canonical_address(organization_id)
+        .ok_or_else(|| ChainUnavailable("organization id is not an address".into()))?;
+    let seller = canonical_address(seller_address)
+        .ok_or_else(|| ChainUnavailable("seller address is not an address".into()))?;
+    let Some(org) = get_object(http, rpc_url, &org_id)
+        .await?
+        .filter(|o| is_memory_type(&o.type_, package_id, "AgenticOrganization"))
+    else {
+        return Ok(None);
+    };
+    if !bool_field(&org.fields, "active")? {
+        return Ok(None);
+    }
+    let account_id = string_field(&org.fields, "memory_account_id")?;
+    let Some(account) = get_object(http, rpc_url, &account_id)
+        .await?
+        .filter(|o| is_memory_type(&o.type_, package_id, "MemoryAccount"))
+    else {
+        return Ok(None);
+    };
+    if !bool_field(&account.fields, "active")?
+        || !same_address(&string_field(&org.fields, "principal_owner")?, &string_field(&account.fields, "owner")?)
+        || org.fields.get("profile_id") != account.fields.get("profile_id")
+    {
+        return Ok(None);
+    }
+    let orgs_table = nested_uid(&account.fields, "organizations")?;
+    if get_dynamic_field(http, rpc_url, &orgs_table, "0x2::object::ID", &org_id)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    if same_address(&string_field(&org.fields, "principal_owner")?, &seller) {
+        return Ok(Some(GraphSellerAuthority::OrganizationAdmin));
+    }
+    let group_id = org_memory_group_id(package_id, &org_id)
+        .ok_or_else(|| ChainUnavailable("package id is not an address".into()))?;
+    let Some(group) = get_object(http, rpc_url, &group_id)
+        .await?
+        .filter(|o| o.type_ == memory_share_group_type(package_id))
+    else {
+        return Ok(None);
+    };
+    let permissions_table = nested_uid(&group.fields, "permissions")?;
+    let Some(grants) = get_dynamic_field(http, rpc_url, &permissions_table, "address", &seller).await? else {
+        return Ok(None);
+    };
+    let manager = permission_type_name(package_id, "OrgAgentManager");
+    let contents = grants.pointer("/fields/contents").and_then(Value::as_array)
+        .ok_or_else(|| ChainUnavailable("permission set has no contents".into()))?;
+    if contents.iter().filter_map(|entry| entry.pointer("/fields/name").and_then(Value::as_str)).any(|name| name == manager) {
+        Ok(Some(GraphSellerAuthority::SellGraphDelegate))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Verify a treasury signer against the current organization owner or the live
+/// ExtensionPermissionsAdmin grant on the organization's canonical memory group.
+/// The caller must separately bind the organization to the authenticated owner.
+pub async fn verify_org_treasury_admin(
+    http: &reqwest::Client,
+    rpc_url: &str,
+    package_id: &str,
+    organization_id: &str,
+    signer_address: &str,
+) -> Result<bool, ChainUnavailable> {
+    let org_id = canonical_address(organization_id)
+        .ok_or_else(|| ChainUnavailable("organization id is not an address".into()))?;
+    let signer = canonical_address(signer_address)
+        .ok_or_else(|| ChainUnavailable("treasury signer is not an address".into()))?;
+    let Some(org) = get_object(http, rpc_url, &org_id)
+        .await?
+        .filter(|object| is_memory_type(&object.type_, package_id, "AgenticOrganization"))
+    else {
+        return Ok(false);
+    };
+    if !bool_field(&org.fields, "active")? {
+        return Ok(false);
+    }
+    let principal_owner = canonical_address(&string_field(&org.fields, "principal_owner")?)
+        .ok_or_else(|| ChainUnavailable("organization owner is not an address".into()))?;
+    if principal_owner == signer {
+        return Ok(true);
+    }
+    let group_id = org_memory_group_id(package_id, &org_id)
+        .ok_or_else(|| ChainUnavailable("package id is not an address".into()))?;
+    let Some(group) = get_object(http, rpc_url, &group_id)
+        .await?
+        .filter(|object| object.type_ == memory_share_group_type(package_id))
+    else {
+        return Ok(false);
+    };
+    let permissions_table = nested_uid(&group.fields, "permissions")?;
+    let Some(grants) = get_dynamic_field(http, rpc_url, &permissions_table, "address", &signer).await? else {
+        return Ok(false);
+    };
+    let contents = grants.pointer("/fields/contents").and_then(Value::as_array)
+        .ok_or_else(|| ChainUnavailable("permission set has no contents".into()))?;
+    let admin = permission_type_name(package_id, "ExtensionPermissionsAdmin");
+    Ok(contents.iter().filter_map(|entry| entry.pointer("/fields/name").and_then(Value::as_str))
+        .any(|name| name == admin))
 }
 
 fn org_belongs_to_member(

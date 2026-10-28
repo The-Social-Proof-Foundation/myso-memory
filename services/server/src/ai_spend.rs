@@ -64,9 +64,11 @@ struct GatewayInferenceRequest<'a> {
     prompt: &'a str,
     max_tokens: u32,
     idempotency_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_amount_mist: Option<&'a str>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GatewayInferenceResponse {
     pub content: String,
     pub tokens_in: u64,
@@ -257,6 +259,41 @@ fn amount_mist_from_usage(_usage_kind: u8, tokens_in: u64, tokens_out: u64) -> u
 
 /// Run a bounded chat completion through the reservation-owning gateway. The
 /// gateway finalizes an on-chain MIST reservation before contacting OpenRouter.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InferenceToolCall { pub id: String, pub name: String, pub arguments: String }
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StructuredInferenceResponse {
+    #[serde(flatten)]
+    pub completion: GatewayInferenceResponse,
+    #[serde(default)]
+    pub tool_calls: Vec<InferenceToolCall>,
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+}
+// The legacy endpoint keeps its numeric response. The structured API preserves financial u64s exactly.
+impl serde::Serialize for StructuredInferenceResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(&self.completion).map_err(serde::ser::Error::custom)?;
+        value["amount_mist"] = serde_json::json!(self.completion.amount_mist.to_string());
+        value["reservation_nonce"] = serde_json::json!(self.completion.reservation_nonce.map(|v| v.to_string()));
+        value["tool_calls"] = serde_json::to_value(&self.tool_calls).map_err(serde::ser::Error::custom)?;
+        value["finish_reason"] = serde_json::json!(self.finish_reason);
+        value.serialize(serializer)
+    }
+}
+pub struct StructuredInferenceOptions<'a> {
+    pub messages: &'a serde_json::Value,
+    pub tools: Option<&'a serde_json::Value>,
+    pub tool_choice: Option<&'a serde_json::Value>,
+    pub max_amount_mist: Option<&'a str>,
+}
+pub async fn run_gateway_structured_inference(
+    state: &Arc<AppState>, auth: &AuthInfo, model_id: &str, max_tokens: u32,
+    idempotency_key: &str, structured: &StructuredInferenceOptions<'_>,
+) -> Result<StructuredInferenceResponse, AppError> {
+    gateway_inference_inner(state, auth, model_id, None, "Structured agent work", max_tokens, idempotency_key, Some(structured)).await
+}
+
 pub async fn run_gateway_inference(
     state: &Arc<AppState>,
     auth: &AuthInfo,
@@ -266,14 +303,20 @@ pub async fn run_gateway_inference(
     max_tokens: u32,
     idempotency_key: &str,
 ) -> Result<GatewayInferenceResponse, AppError> {
+    Ok(gateway_inference_inner(state, auth, model_id, system_prompt, prompt, max_tokens, idempotency_key, None).await?.completion)
+}
+
+async fn gateway_inference_inner(
+    state: &Arc<AppState>, auth: &AuthInfo, model_id: &str, system_prompt: Option<&str>,
+    prompt: &str, max_tokens: u32, idempotency_key: &str, structured: Option<&StructuredInferenceOptions<'_>>,
+) -> Result<StructuredInferenceResponse, AppError> {
     require_ai_spend_capability(auth)?;
     let balance = fetch_balance(&state.http_client, &state.config, &auth.owner).await?;
     let url = format!(
         "{}/v1/ai-credit/inference",
         state.config.ai_credit_oracle_url.trim_end_matches('/')
     );
-    let response = oracle_post(&state.http_client, &state.config, &url)
-        .json(&GatewayInferenceRequest {
+    let mut request = serde_json::to_value(GatewayInferenceRequest {
             owner: &auth.owner,
             balance_id: &balance.balance_id,
             memory_account_id: &balance.memory_account_id,
@@ -283,7 +326,17 @@ pub async fn run_gateway_inference(
             prompt,
             max_tokens,
             idempotency_key,
-        })
+            max_amount_mist: structured.and_then(|options| options.max_amount_mist),
+        }).map_err(|_| AppError::Internal("cannot serialize inference request".into()))?;
+
+    if let Some(options) = structured {
+        request["chat_messages"] = options.messages.clone();
+        if let Some(tools) = options.tools { request["tools"] = tools.clone(); }
+        if let Some(choice) = options.tool_choice { request["tool_choice"] = choice.clone(); }
+    }
+    let response = oracle_post(&state.http_client, &state.config, &url)
+        .timeout(std::time::Duration::from_secs(180))
+        .json(&request)
         .send()
         .await
         .map_err(|error| AppError::Internal(format!("AI gateway unavailable: {error}")))?;
@@ -294,19 +347,16 @@ pub async fn run_gateway_inference(
         ));
     }
     if response.status() == reqwest::StatusCode::CONFLICT {
-        return Err(AppError::Internal(
+        return Err(AppError::Conflict(
             "AI inference with this idempotency key is still reconciling".into(),
         ));
     }
     if !response.status().is_success() {
         let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        return Err(AppError::Internal(format!(
-            "AI gateway inference failed ({status}): {detail}"
-        )));
+        return Err(AppError::Internal(format!("AI gateway inference failed ({status}); reconcile this operation before retrying")));
     }
     response
-        .json::<GatewayInferenceResponse>()
+        .json::<StructuredInferenceResponse>()
         .await
         .map_err(|error| AppError::Internal(format!("parse AI gateway response: {error}")))
 }

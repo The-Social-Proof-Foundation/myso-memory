@@ -710,6 +710,7 @@ export async function buildApproveKeyPolicyTxBytes(
         target: `${opts.packageId}::memory::approve_key_policy`,
         arguments: [
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
         ],
@@ -726,6 +727,7 @@ export async function buildApproveKeyWritePolicyTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_write_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
@@ -744,6 +746,7 @@ export async function approveKeyPolicy(
         target: `${opts.packageId}::memory::approve_key_policy`,
         arguments: [
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
         ],
@@ -762,6 +765,7 @@ export async function approveKeyWritePolicy(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_key_write_policy`,
         arguments: [
+            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
             tx.object(opts.accountId),
             tx.object(MYSO_CLOCK),
@@ -789,8 +793,8 @@ export async function buildApproveOrgKeyPolicyTxBytes(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_org_key_policy`,
         arguments: [
-            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.object(opts.orgMemoryGroupId),
@@ -814,8 +818,8 @@ export async function approveOrgKeyPolicy(
     tx.moveCall({
         target: `${opts.packageId}::memory::approve_org_key_policy`,
         arguments: [
-            tx.object(opts.memoryConfigId),
             tx.pure("vector<u8>", idHexToBytes(opts.id)),
+            tx.object(opts.memoryConfigId),
             tx.object(opts.accountId),
             tx.object(opts.organizationId),
             tx.object(opts.orgMemoryGroupId),

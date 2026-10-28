@@ -12,12 +12,13 @@ import { CAP_JURY, CAP_NONE, CAP_TASK_TRADE } from "../contract.js";
 import { isSocialActionId } from "./registry.js";
 
 test("production catalog contains the exact unique organization-control release set", () => {
-    assert.equal(TIER_1_ACTION_IDS.length, 63);
-    assert.equal(TIER_2_ACTION_IDS.length, 20);
-    assert.equal(TIER_3_ACTION_IDS.length, 27);
-    assert.equal(PRODUCTION_ACTION_IDS.length, 110);
-    assert.equal(new Set(PRODUCTION_ACTION_IDS).size, 110);
-    assert.equal(PRODUCTION_ACTION_CATALOG.length, 110);
+    assert.equal(TIER_1_ACTION_IDS.length, 67);
+    assert.equal(TIER_2_ACTION_IDS.length, 15);
+    assert.equal(TIER_3_ACTION_IDS.length, 31);
+    assert.equal(PRODUCTION_ACTION_IDS.length, 113);
+    assert.equal(new Set(PRODUCTION_ACTION_IDS).size, 113);
+    assert.equal(PRODUCTION_ACTION_CATALOG.length, 113);
+    assert.equal(getProductionActionDescriptor("storage.purchase_capacity.v1"), undefined);
 });
 
 test("only implemented registry actions are reported as enabled", () => {
@@ -28,6 +29,15 @@ test("only implemented registry actions are reported as enabled", () => {
         enabled.map((action) => action.id),
         [
             ...TIER_1_ACTION_IDS,
+            "payments.tip_post.v1",
+            "payments.send_token.v1",
+            "subscription.subscribe_to_plan.v1",
+            "subscription.renew_subscription.v1",
+            "subscription.cancel_subscription.v1",
+            "subscription.enable_auto_renew.v1",
+            "subscription.disable_auto_renew.v1",
+            "access.share_mydata.v1",
+            "access.revoke_mydata_share.v1",
             "organization.create.v1",
             "organization.update_metadata.v1",
             "organization.update_category.v1",
@@ -38,6 +48,13 @@ test("only implemented registry actions are reported as enabled", () => {
             "organization.revoke_role.v1",
             "organization.create_invitation.v1",
             "agent.register_agent.v1",
+            "social.delete_post.v1",
+            "social.delete_comment.v1",
+            "poc.claim_creator_vault.v1",
+            "spot.claim_payout.v1",
+            "spot.place_bet.v1",
+            "spot.create_market.v1",
+            "governance.delegate_vote.v1",
         ],
     );
     assert.ok(enabled.every((action) => isSocialActionId(action.id)));

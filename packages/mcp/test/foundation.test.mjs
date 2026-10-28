@@ -130,7 +130,7 @@ test("registered Tier 1 actions build, sponsor, locally sign, and execute withou
             if (String(url).endsWith("/api/agent/context")) {
                 return new Response(JSON.stringify({
                     memoryAccountId: "0xabc",
-                    agentObjectId: "0xagent",
+                    agentObjectId: "0xa6e17",
                     derivedAddress: sender,
                     capabilities: 16 | 64 | 512 | 1024 | 65536,
                     approvalRequiredCapabilities: 0,
@@ -291,10 +291,6 @@ test("registered Tier 1 actions build, sponsor, locally sign, and execute withou
         assert.equal(request.init.headers["x-delegate-key"], undefined);
         assert.equal(request.init.headers["x-owner-delegate-key"], undefined);
     }
-    await assert.rejects(
-        () => gateway.deletePost("0xpost"),
-        (error) => error.code === "APPROVAL_FLOW_NOT_AVAILABLE",
-    );
     const catalog = await gateway.listActions();
     assert.equal(catalog.catalogVersion, "1.3.0");
     assert.equal(catalog.actions.length, 69);
@@ -344,7 +340,7 @@ test("approved organization submission does not require resending parameters", a
             if (path === "/api/agent/context") {
                 return new Response(JSON.stringify({
                     memoryAccountId: "0xabc",
-                    agentObjectId: "0xagent",
+                    agentObjectId: "0xa6e17",
                     derivedAddress: sender,
                     capabilities: 8192,
                     approvalRequiredCapabilities: 0,
@@ -390,6 +386,8 @@ test("MCP protocol advertises schemas and returns structured success and errors"
             "social_react_post",
             "social_react_comment",
             "social_create_repost",
+            "social_delete_post",
+            "social_delete_comment",
             "chain_get_action_status",
             "organization_create",
             "organization_get_control",
@@ -415,12 +413,6 @@ test("MCP protocol advertises schemas and returns structured success and errors"
         },
         async createRepost(input) {
             return { digest: "repost-digest", input };
-        },
-        async deletePost() {
-            throw new Error("not exposed in test catalog");
-        },
-        async deleteComment() {
-            throw new Error("not exposed in test catalog");
         },
         async getActionStatus(digest) {
             return { chain: { status: "finalized", digest }, indexer: { status: "unavailable" } };
@@ -464,6 +456,8 @@ test("MCP protocol advertises schemas and returns structured success and errors"
                 "memory_recall",
                 "memory_health",
                 "chain_list_actions",
+                "social_delete_post",
+                "social_delete_comment",
                 "organization_create",
                 "organization_get_control",
                 "agent_provision_signer",
@@ -517,6 +511,20 @@ test("MCP protocol advertises schemas and returns structured success and errors"
                 },
             },
         });
+
+        const postDelete = await client.callTool({
+            name: "social_delete_post",
+            arguments: { postId: "0xpost", idempotencyKey: "delete-post-0001" },
+        });
+        assert.equal(postDelete.structuredContent.data.input.registryAction, "social.delete_post.v1");
+        assert.deepEqual(postDelete.structuredContent.data.input.parameters, { postId: "0xpost" });
+
+        const commentDelete = await client.callTool({
+            name: "social_delete_comment",
+            arguments: { postId: "0xpost", commentId: "0xcomment", idempotencyKey: "delete-comment-0001" },
+        });
+        assert.equal(commentDelete.structuredContent.data.input.registryAction, "social.delete_comment.v1");
+        assert.deepEqual(commentDelete.structuredContent.data.input.parameters, { postId: "0xpost", commentId: "0xcomment" });
 
         const organization = await client.callTool({
             name: "organization_create",

@@ -13,6 +13,8 @@ export const CAP_TRADE_EXECUTE = 256;
 export const CAP_AGENT_REVOKE = 2048;
 export const CAP_AGENT_UPDATE = 4096;
 export const CAP_AGENT_REGISTER = 8192;
+/** Mirrors memory::CAP_AI_SPEND; this bit is independent of memory writes. */
+export const CAP_AI_SPEND = 16384;
 export const CAP_BUDGET_MANAGE = 32768;
 export const CAP_SOCIAL_GRAPH = 65536;
 export const CAP_TASK_TRADE = 131072;

@@ -28,14 +28,14 @@ For the full config surface, see [Configuration](/reference/configuration).
 
 ### `remember(text, namespace?): Promise<RememberResult>`
 
-Store one memory through the relayer. The relayer handles embedding, MYDATA encryption, File Storage upload, and vector indexing.
+Store one memory through the relayer. The relayer handles embedding, MYDATA encryption, private R2 storage, and vector indexing.
 
 **Returns:**
 
 ```ts
 {
   id: string;        // UUID for this entry
-  blob_id: string;   // File Storage blob ID
+  blob_id: string;   // Opaque private R2 blob ID
   owner: string;     // Owner MySo address
   namespace: string; // Namespace used
 }
@@ -52,7 +52,7 @@ Search for memories matching a natural language query, scoped to `owner + namesp
 ```ts
 {
   results: Array<{
-    blob_id: string;   // File Storage blob ID
+    blob_id: string;   // Opaque private R2 blob ID
     text: string;      // Decrypted plaintext
     distance: number;  // Cosine distance (lower = more similar)
   }>;
@@ -71,7 +71,7 @@ Extract memorable facts from text using an LLM, then store each fact as a separa
   facts: Array<{
     text: string;     // Extracted fact
     id: string;       // UUID
-    blob_id: string;  // File Storage blob ID
+    blob_id: string;  // Opaque private R2 blob ID
   }>;
   total: number;
   owner: string;
@@ -80,7 +80,7 @@ Extract memorable facts from text using an LLM, then store each fact as a separa
 
 ### `restore(namespace, limit?): Promise<RestoreResult>`
 
-Rebuild missing indexed entries for one namespace from File Storage. Incremental — only re-indexes blobs that aren't already in the local database.
+Rebuild missing indexed entries for one namespace from private R2. Incremental — only re-indexes blobs that aren't already in the local database.
 
 - `limit` defaults to `50`
 
@@ -112,8 +112,8 @@ These exist on the `Memory` class for advanced use cases:
 
 | Method | Description |
 |--------|-------------|
-| `rememberManual({ blobId, vector, namespace? })` | Register a pre-uploaded blob ID with a pre-computed vector |
-| `recallManual({ vector, limit?, namespace? })` | Search with a pre-computed query vector (returns blob IDs, no decryption) |
+| `rememberManual({ encryptedData, vector, namespace? })` | Store pre-encrypted bytes through the authenticated relayer with a pre-computed vector |
+| `recallManual({ vector, limit?, namespace? })` | Search with a pre-computed query vector and return authenticated encrypted payloads |
 | `embed(text)` | Generate an embedding vector for text (no storage) |
 
 ## `MemoryManual`
@@ -126,11 +126,11 @@ See [MemoryManual usage](/sdk/usage/memory-manual) for the full setup and flow d
 
 ### `rememberManual(text, namespace?): Promise<RememberManualResult>`
 
-Embed locally, MYDATA encrypt locally, send encrypted payload + vector to relayer for File Storage upload and vector registration.
+Embed locally, MYDATA encrypt locally, send encrypted payload + vector to the relayer for private R2 storage and vector registration.
 
 ### `recallManual(query, limit?, namespace?): Promise<RecallManualResult>`
 
-Embed locally, search via relayer, download from File Storage, MYDATA decrypt locally. Returns decrypted text results.
+Embed locally, search via relayer, retrieve encrypted payloads through the authenticated relayer, and MYDATA decrypt locally. Returns decrypted text results.
 
 ### `restore(namespace, limit?): Promise<RestoreResult>`
 

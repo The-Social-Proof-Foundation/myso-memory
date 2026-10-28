@@ -1,6 +1,6 @@
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
+    http::{StatusCode,HeaderValue,header::CACHE_CONTROL},
     middleware::Next,
     response::Response,
 };
@@ -10,9 +10,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use crate::memory_contract::{
-    self, capability_label, check_direct_execution_allowed, check_spend_limit, CAP_AI_SPEND,
+    self, capability_label, check_direct_execution_allowed, CAP_AI_SPEND,
     CAP_COMMENT, CAP_MEMORY_READ, CAP_MEMORY_WRITE, CAP_MESSAGE_READ, CAP_MYDATA_READ,
-    CAP_POST_PUBLISH, CAP_REACT, E_SUB_AGENT_APPROVAL_REQUIRED,
+    CAP_POST_PUBLISH, CAP_REACT, CAP_TASK_TRADE, E_SUB_AGENT_APPROVAL_REQUIRED,
 };
 use crate::myso::{
     canonical_agent_by_object_id, derived_address_from_public_key, verify_sub_agent_onchain,
@@ -20,9 +20,6 @@ use crate::myso::{
 use crate::policy::{validate_agent_policy, PolicyError, RequestPolicyInput};
 use crate::social::{fetch_sub_agent_by_derived_address, SocialApiError, SocialSubAgent};
 use crate::types::{AppState, AuthInfo};
-
-/// Estimated gas for a sponsored File Storage upload (MIST). Conservative ceiling for max_action_spend checks.
-pub const ESTIMATED_FILE_STORAGE_UPLOAD_MIST: u64 = 5_000_000;
 
 async fn constant_time_reject() -> StatusCode {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -284,21 +281,6 @@ pub async fn verify_signature(
                 }));
             }
         }
-        if requires_file_storage_spend(method.as_str(), &path_only) {
-            if let Err(code) = check_spend_limit(
-                resolved.agent.max_action_spend.map(|v| v as u64),
-                ESTIMATED_FILE_STORAGE_UPLOAD_MIST,
-            ) {
-                tracing::warn!(
-                    "max_action_spend exceeded for agent {} (code={})",
-                    resolved.agent.agent_object_id,
-                    code
-                );
-                return Err(policy_reject(PolicyError::SpendLimitExceeded {
-                    limit_mist: resolved.agent.max_action_spend.map(|v| v as u64),
-                }));
-            }
-        }
     }
 
     if requires_mydata_access(&path_only)
@@ -335,7 +317,13 @@ pub async fn verify_signature(
     });
 
     let request = Request::from_parts(parts, axum::body::Body::from(body_bytes));
-    Ok(next.run(request).await)
+    Ok(private_response(next.run(request).await))
+}
+
+/// Signed responses carry account/agent context and must not enter shared caches.
+fn private_response(mut response:Response)->Response{
+    response.headers_mut().insert(CACHE_CONTROL,HeaderValue::from_static("private, no-store"));
+    response
 }
 
 struct ResolvedSubAgent {
@@ -360,31 +348,62 @@ fn is_write_route(method: &str, path: &str) -> bool {
             || path == "/api/chain/approvals/request"
             || path == "/api/analyze"
             || path == "/api/ask"
+            || path == "/api/ai-credit/chat"
             || path == "/api/ai-credit/inference"
             || path == "/api/ai-credit/record-inference"
-            || path == "/api/restore")
+            || path == "/api/restore"
+            || path == "/api/task/deliverable/upload"
+            || path == "/api/messaging/attachments/upload"
+            || path.starts_with("/api/work/"))
 }
 
 fn requires_mydata_access(path: &str) -> bool {
-    path.starts_with("/api/remember")
+    path == "/api/mydata/read-content"
+        || path == "/api/mydata/check-current-access"
+        || path.starts_with("/api/work/")
+        || path.starts_with("/api/remember")
         || path.starts_with("/api/recall")
         || path == "/api/restore"
         || path == "/api/analyze"
         || path == "/api/ask"
 }
 
-fn requires_file_storage_spend(method: &str, path: &str) -> bool {
-    method == "POST" && (path.starts_with("/api/remember") || path == "/api/restore")
+pub(crate) fn require_path_capability(auth: &AuthInfo, method: &str, path: &str) -> Result<(), crate::types::AppError> {
+    let required = required_capability_for_path(method, path);
+    if auth.capabilities & required == required {
+        Ok(())
+    } else {
+        Err(crate::types::AppError::Forbidden("The active sub-agent lacks the required capability".into()))
+    }
 }
 
 fn required_capability_for_path(method: &str, path: &str) -> u64 {
+    // The owner-agent module enforces its documented any-of management capability guard.
+    if path.starts_with("/api/agent/read/agent_admin_") {return 0;}
+    if path == "/api/agent/read/mydata_agent_funding_coins" { return CAP_MYDATA_READ; }
+    if path == "/api/agent/read/task_agent_funding_coins" { return CAP_TASK_TRADE; }
+    if path.starts_with("/api/agent/read/payments_") {return crate::memory_contract::CAP_TRADE_EXECUTE;}
+    if path == "/api/agent/read/dex_receipt" {return crate::memory_contract::CAP_TRADE_EXECUTE;}
+    if path.starts_with("/api/agent/read/poc_") {return crate::memory_contract::CAP_TRADE_EXECUTE;}
+    if path.starts_with("/api/agent/read/subscription_") {return crate::memory_contract::CAP_TRADE_EXECUTE;}
+    if matches!(path, "/api/mydata/read-content" | "/api/mydata/check-current-access" | "/api/mydata/graph/verify-seller") { return CAP_MYDATA_READ; }
+    if path == "/api/task/deliverable/upload" { return crate::memory_contract::CAP_TASK_TRADE; }
+    if matches!(path, "/api/agent/read/mydata_listings" | "/api/agent/read/mydata_graph_offers" | "/api/agent/read/mydata_owned_listings" | "/api/agent/read/mydata_quote" | "/api/agent/read/mydata_receipt" | "/api/agent/read/mydata_owner_receipt" | "/api/agent/read/mydata_owner_access_history") { return CAP_MYDATA_READ; }
+    if path == "/api/messaging/attachments/upload" {
+        return crate::memory_contract::CAP_MESSAGE_SEND;
+    }
     if path.starts_with("/api/messaging/") {
         return CAP_MESSAGE_READ;
     }
-    if path == "/api/agent/context" || path.starts_with("/api/chain/actions/") {
+    if matches!(path, "/api/agent/read/rooms" | "/api/agent/read/organization_rooms") {
+        return CAP_MESSAGE_READ;
+    }
+    if matches!(path, "/api/agent/read/social_messaging_group_digests" | "/api/agent/read/social_messaging_group_members" | "/api/agent/read/social_messaging_message_receipt") { return CAP_MESSAGE_READ; }
+    if path == "/api/agent/read/social_mydata_buyer_purchases" { return CAP_MYDATA_READ; }
+    if path == "/api/agent/context" || path.starts_with("/api/agent/read/") || path.starts_with("/api/chain/actions/") {
         return 0;
     }
-    if path == "/api/ai-credit/inference" || path == "/api/ai-credit/record-inference" {
+    if path == "/api/ai-credit/chat" || path == "/api/ai-credit/inference" || path == "/api/ai-credit/record-inference" {
         return CAP_AI_SPEND;
     }
     if path.starts_with("/api/social/") {
@@ -413,7 +432,8 @@ fn required_capability_for_path(method: &str, path: &str) -> u64 {
     if method != "POST" {
         return CAP_MEMORY_READ;
     }
-    if path.starts_with("/api/remember")
+    if path.starts_with("/api/work/")
+        || path.starts_with("/api/remember")
         || path == "/api/analyze"
         || path == "/api/ask"
         || path == "/api/restore"
@@ -569,6 +589,33 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_responses_disable_caching_without_replacing_cors_vary(){
+        let mut response=Response::new(axum::body::Body::empty());
+        response.headers_mut().insert(axum::http::header::VARY,HeaderValue::from_static("Origin"));
+        let response=private_response(response);
+        assert_eq!(response.headers()[CACHE_CONTROL],"private, no-store");
+        assert_eq!(response.headers()[axum::http::header::VARY],"Origin");
+    }
+    #[test]
+    fn coin_reads_require_the_trade_capability(){
+        for resource in ["payments_quote","payments_coins","payments_balance","payments_receipt"]{
+            assert_eq!(required_capability_for_path("GET",&format!("/api/agent/read/{resource}")),crate::memory_contract::CAP_TRADE_EXECUTE);
+        }
+    }
+    #[test]
+    fn subscription_reads_require_the_trade_capability(){
+        for resource in ["subscription_quote","subscription_renewal_quote","subscription_get","subscription_list","subscription_plans","subscription_receipt"]{
+            assert_eq!(required_capability_for_path("GET",&format!("/api/agent/read/{resource}")),crate::memory_contract::CAP_TRADE_EXECUTE);
+        }
+    }
+    #[test]
+    fn direct_content_disclosure_requires_mydata_capability_without_a_spend_route() {
+        assert_eq!(required_capability_for_path("POST", "/api/mydata/read-content"), CAP_MYDATA_READ);
+        assert_eq!(required_capability_for_path("POST", "/api/mydata/graph/verify-seller"), CAP_MYDATA_READ);
+        assert!(requires_mydata_access("/api/mydata/read-content"));
+        assert!(!is_write_route("POST", "/api/mydata/read-content"));
+    }
+    #[test]
     fn messaging_inbox_requires_message_read() {
         assert_eq!(
             required_capability_for_path("GET", "/api/messaging/inbox"),
@@ -615,10 +662,6 @@ mod tests {
             0
         );
         assert!(is_write_route("POST", "/api/chain/actions/prepare"));
-        assert!(!requires_file_storage_spend(
-            "POST",
-            "/api/chain/actions/prepare"
-        ));
     }
 
     #[test]
@@ -635,21 +678,15 @@ mod tests {
         assert!(requires_mydata_access("/api/ask"));
         assert!(is_write_route("POST", "/api/analyze"));
         assert!(is_write_route("POST", "/api/ask"));
-        assert!(!requires_file_storage_spend("POST", "/api/analyze"));
-        assert!(!requires_file_storage_spend("POST", "/api/ask"));
     }
 
     #[test]
-    fn inference_requires_ai_spend_without_file_storage_allowance() {
+    fn inference_requires_ai_spend_capability() {
         assert_eq!(
             required_capability_for_path("POST", "/api/ai-credit/inference"),
             CAP_AI_SPEND
         );
         assert!(is_write_route("POST", "/api/ai-credit/inference"));
-        assert!(!requires_file_storage_spend(
-            "POST",
-            "/api/ai-credit/inference"
-        ));
     }
 
     #[test]

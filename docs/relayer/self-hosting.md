@@ -4,7 +4,7 @@ title: "Self-Hosting"
 
 Self-hosting means running your own relayer — either pointing at an existing Memory package ID or deploying an entirely new Memory instance with your own contract, database, and server wallet.
 
-The managed relayer provided by File Storage Foundation is a reference implementation. You can also build your own implementation that fits the same API surface with custom logic. This guide covers how to run the reference implementation as your own self-hosted relayer.
+The managed relayer is a reference implementation. You can also build your own implementation that fits the same API surface with custom logic. This guide covers how to run the reference implementation as your own self-hosted relayer.
 
 ## Personas & When to Self-Host
 
@@ -30,7 +30,7 @@ Because the relayer inherently scopes all vector searches and storage operations
 If you are a Managed Service Provider or need to handle high agentic throughput, you can horizontally scale your hosted relayer natively. To run multiple instances of the relayer behind a load balancer for the *same* account/package ID:
 
 1. Point all relayer instances to the **same PostgreSQL database**.
-2. Supply the **same `SERVER_MYSO_PRIVATE_KEYS` pool** to all instances so they can seamlessly execute concurrent File Storage uploads.
+2. Supply the same service identity configuration to all instances. Private blob writes use the shared R2 bucket and deterministic object IDs, so relayer replicas do not need a WAL-funded upload key pool.
 3. Configure the **same Redis cluster** (`REDIS_URL`) across all nodes so that the rate limiter sliding window accurately tracks global user quotas across your deployment.
 
 ## What Runs
@@ -40,8 +40,9 @@ A self-hosted Memory backend has:
 | Component | Location | Description |
 |-----------|----------|-------------|
 | **Rust relayer** | `services/server` | Axum HTTP server — auth, routing, embedding, vector search |
-| **TypeScript sidecar** | `services/server/scripts` | MYDATA encrypt/decrypt, File Storage upload, blob query (uses `@socialproof/mydata` and `@socialproof/file-storage`) |
+| **TypeScript sidecar** | `services/server/scripts` | MYDATA encrypt/decrypt and blob query; encrypted blob bytes are stored by the Rust service in Cloudflare R2 |
 | **PostgreSQL + pgvector** | External | Vector storage, sub-agent auth cache |
+| **Cloudflare R2** | External | Private object storage for encrypted memory blobs and task artifacts; configure bucket, endpoint, and credentials on the relayer |
 | **Social server** (recommended) | myso-core | Sub-agent index — `GET /sub-agents/:derivedAddress` |
 
 The Rust relayer starts the TypeScript sidecar as a child process on boot. They communicate over HTTP (`localhost:9000` by default). If the sidecar fails to start within 15 seconds, the relayer exits.
@@ -78,37 +79,40 @@ curl http://localhost:8000/health
 - `MEMORY_PACKAGE_ID`
 - `MEMORY_REGISTRY_ID` — optional for relayer auth (still used by some sidecar flows)
 - `SOCIAL_SERVER_URL` — social API for sub-agent lookup (default `http://127.0.0.1:9126`)
-- `SERVER_MYSO_PRIVATE_KEY` or `SERVER_MYSO_PRIVATE_KEYS`
+- `SERVER_MYSO_PRIVATE_KEY` or `SERVER_MYSO_PRIVATE_KEYS` — required by the MYDATA sidecar for decrypt operations; not used for R2 uploads
 - `MYDATA_KEY_SERVERS` — comma-separated list of MYDATA key server object IDs
+- `R2_BUCKET`
+- `R2_ENDPOINT`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
 
 ### Recommended
 
 - `OPENAI_API_KEY` — enables real embeddings (falls back to mock embeddings without it)
 - `OPENAI_API_BASE` — point to an OpenAI-compatible provider like OpenRouter
 
-### Rate Limits & Storage (Optional)
+### Rate Limits (Optional)
 
 By default, the relayer enforces rate limits and storage quotas via Redis to prevent abuse. You can customize these limits:
 
 - `RATE_LIMIT_REQUESTS_PER_MINUTE` — max burst weighted-requests per minute per user (default: 60)
 - `RATE_LIMIT_REQUESTS_PER_HOUR` — max sustained weighted-requests per hour per user (default: 500)
 - `RATE_LIMIT_DELEGATE_KEY_PER_MINUTE` — max weighted-requests per minute per sub-agent key (default: 30)
-- `RATE_LIMIT_STORAGE_BYTES` — max storage per user in bytes (default: 1 GB, `1073741824`)
+- `RATE_LIMIT_STORAGE_BYTES` — max encrypted R2 storage per user in bytes (default: 1 GB, `1073741824`)
 - `REDIS_URL` — required to track sliding windows for rate limits (default: `redis://localhost:6379`)
+
+R2 must be configured before memory-blob or task-artifact writes are available. The bucket should remain private and grant the relayer only the object read, write, and list permissions it needs. MySo agent spending limits apply only to on-chain MYSO actions; R2 is operator-configured infrastructure and does not spend WAL or invoke an on-chain storage purchase.
 
 ### Defaults
 
 - `PORT` defaults to `8000`
 - `SIDECAR_URL` defaults to `http://localhost:9000`
 - `MYSO_NETWORK` defaults to `mainnet`
-- `MYSO_RPC_URL`, File Storage endpoints, and `FILE_STORAGE_PACKAGE_ID` fall back to network defaults based on `MYSO_NETWORK`
-- The sidecar File Storage upload route defaults storage `epochs` by network: `50` on `testnet`, `2` on `mainnet` (unless the request passes `epochs`)
+- `MYSO_RPC_URL` falls back to the network default based on `MYSO_NETWORK`
 
 ### Server Keys
 
-- `SERVER_MYSO_PRIVATE_KEY` is the main server key
-- `SERVER_MYSO_PRIVATE_KEYS` is a comma-separated key pool for parallel File Storage uploads
-- if both are set, the key pool takes priority for uploads
+The MYDATA sidecar uses its configured MySo key for decrypt operations. Cloudflare R2 uploads and downloads use the separate R2 credentials and do not spend WAL or require a storage wallet key.
 
 ## Package Contract IDs
 ### Staging (Testnet)

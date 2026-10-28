@@ -1,30 +1,39 @@
 # ============================================================
 # Automation memory bridge — Dockerfile
 #
-# BUILD CONTEXT IS THE myso-memory REPO ROOT, not services/automation-sidecar.
-# `@socialproof/memory` is a workspace dependency, and `packages/sdk/dist` is
-# gitignored, so the image installs the workspace and builds the SDK itself.
+# BUILD CONTEXT is the directory containing both `myso-memory` and
+# `myso-messaging-stack`, because hosted MCP reuses the messaging SDK from that
+# sibling checkout.
 #
-#   docker build -f services/automation-sidecar/Dockerfile -t myso-automation-bridge .
+#   docker build -f myso-memory/services/automation-sidecar/Dockerfile -t myso-automation-bridge .
 #
-# On Railway, set the service Root Directory to the repo root and point
-# RAILWAY_DOCKERFILE_PATH at this file. Railway no longer reads config-as-code
-# for new services, so there is deliberately no railway.json beside it.
+# The Railway build context must contain the parent directory's sibling repo
+# layout. Point RAILWAY_DOCKERFILE_PATH at this file; Railway no longer reads
+# config-as-code for new services, so there is deliberately no railway.json.
 # ============================================================
 
 FROM node:22-bookworm-slim AS builder
 
-# corepack reads `packageManager` from the root package.json (pnpm@9.12.3), so the
-# image installs with the same package manager version as every developer machine.
+# corepack reads `packageManager` from the Memory workspace root.
 RUN corepack enable
 WORKDIR /app
 
-# Whole-repo copy rather than per-package manifests: the layer cache is less
-# granular, but a monorepo install is far more reliable when pnpm can see the
-# complete workspace. .dockerignore keeps node_modules, dist, and .env out.
-COPY . .
+# Copy only build inputs: do not bake local .env files, key material, or unrelated
+# workspace files into the image. The messaging SDK is built in its own repository.
+COPY myso-memory/package.json myso-memory/pnpm-workspace.yaml myso-memory/pnpm-lock.yaml ./
+COPY myso-memory/packages/sdk/package.json ./packages/sdk/package.json
+COPY myso-memory/packages/sub-agents/package.json ./packages/sub-agents/package.json
+COPY myso-memory/packages/mcp/package.json ./packages/mcp/package.json
+COPY myso-memory/services/automation-sidecar/package.json ./services/automation-sidecar/package.json
+COPY myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/package.json /myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/package.json
+COPY myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/dist /myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/dist
 
-RUN corepack pnpm install --frozen-lockfile
+RUN corepack pnpm install --frozen-lockfile --filter @socialproof/automation-sidecar...
+
+COPY myso-memory/packages/sdk ./packages/sdk
+COPY myso-memory/packages/sub-agents ./packages/sub-agents
+COPY myso-memory/packages/mcp ./packages/mcp
+COPY myso-memory/services/automation-sidecar ./services/automation-sidecar
 
 # Apps import the SDK's compiled output, and it is gitignored, so this is not
 # optional — skipping it produces a runtime "cannot find module" instead of a
@@ -33,6 +42,10 @@ RUN corepack pnpm build:sdk
 
 # Chain actions go through the registered-action client, which is also gitignored output.
 RUN corepack pnpm --filter @socialproof/sub-agents build
+
+# The run-scoped room-history bridge reuses the hosted MCP's strict room
+# authorization/decryption adapter rather than implementing a second reader.
+RUN corepack pnpm --filter @socialproof/memory-mcp build
 
 # Compiled output, so the runtime image ships no TypeScript and no tsx.
 RUN corepack pnpm --filter @socialproof/automation-sidecar build
@@ -52,7 +65,10 @@ COPY --from=builder /app/package.json /app/pnpm-workspace.yaml /app/
 COPY --from=builder /app/node_modules /app/node_modules
 COPY --from=builder /app/packages/sdk /app/packages/sdk
 COPY --from=builder /app/packages/sub-agents /app/packages/sub-agents
+COPY --from=builder /app/packages/mcp /app/packages/mcp
 COPY --from=builder /app/services/automation-sidecar /app/services/automation-sidecar
+COPY --from=builder /myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/package.json /myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/package.json
+COPY --from=builder /myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/dist /myso-messaging-stack/ts-sdks/packages/myso-messaging-stack/dist
 
 ENV NODE_ENV=production
 # Bind all interfaces. The code default is loopback, which is right on a laptop

@@ -9,15 +9,15 @@ The relayer is the backend that turns SDK calls into memory operations. Using a 
 - **Authenticates requests** by verifying Ed25519 signatures against onchain delegate keys, then resolving the owner and account context
 - **Generates embeddings** for text using an OpenAI-compatible API (default model: `text-embedding-3-small`, 1536 dimensions)
 - **Encrypts and decrypts** data through the MYDATA sidecar, bound to the owner's address and the Memory package ID
-- **Uploads and downloads** encrypted blobs to File Storage, with the server wallet covering storage costs
+- **Uploads and downloads** encrypted blobs from a private Cloudflare R2 bucket; no File Storage or WAL spend is required
 - **Stores and searches vectors** in PostgreSQL (pgvector), scoped by memory space (`owner + namespace`)
 - **Orchestrates higher-level flows** like `analyze` (LLM-based fact extraction using `gpt-4o-mini`) and `ask` (memory-augmented Q&A)
-- **Restores memory spaces** by querying onchain blobs, decrypting, re-embedding, and re-indexing anything missing from the local database
-- **Cleans up expired blobs** reactively — when File Storage returns 404 during recall, the relayer deletes the stale vector entries from the database
+- **Restores memory spaces** by listing authenticated owner/agent R2 objects, decrypting, re-embedding, and re-indexing anything missing from the local database
+- **Cleans up missing blobs** reactively — when an R2 object is missing during recall, the relayer deletes the stale vector entries from the database
 
 ## Architecture
 
-The relayer is a Rust service (Axum) that manages a TypeScript sidecar process for MYDATA and File Storage operations that require the `@socialproof/mydata` and `@socialproof/file-storage` SDKs.
+The relayer is a Rust service (Axum) that manages a TypeScript sidecar process for MYDATA operations. Rust stores ciphertext directly through the Cloudflare R2 S3-compatible API.
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,7 @@ flowchart LR
         direction LR
 
         Axum["Rust Relayer (Axum)<br>Auth + routes"]
-        Sidecar["TypeScript Sidecar<br>MYDATA + File Storage"]
+        Sidecar["TypeScript Sidecar<br>MYDATA"]
 
         %% container backend
         subgraph Stack
@@ -41,7 +41,7 @@ flowchart LR
 
     %% external
     MyData["MYDATA key servers"]
-    File Storage["File Storage"]
+    R2["Private Cloudflare R2"]
 
     %% flows
     Client --> Axum
@@ -52,14 +52,14 @@ flowchart LR
     %% sidecar
     Axum --> Sidecar
     Sidecar --> MyData
-    Sidecar --> File Storage  
+    Axum --> R2
 ```
 
 The sidecar is started automatically when the Rust server boots and communicates over HTTP on `localhost:9000` (configurable via `SIDECAR_URL`). If the sidecar fails to start, the relayer exits immediately.
 
 ## Key Pool
 
-For the `analyze` endpoint (which stores multiple facts concurrently), the relayer supports a pool of MySo private keys (`SERVER_MYSO_PRIVATE_KEYS`). Each concurrent File Storage upload uses a different key from the pool in round-robin order, bypassing per-signer serialization and enabling parallel uploads.
+For the `analyze` endpoint (which stores multiple facts concurrently), the relayer supports a pool of MySo private keys (`SERVER_MYSO_PRIVATE_KEYS`) for local gas sponsorship. R2 uploads do not require a MySo storage coin or signer.
 
 ## Rate Limiting & Abuse Prevention
 
@@ -67,8 +67,8 @@ To prevent spam and ensure stability, the relayer implements a cost-weighted, mu
 
 ### Cost-Weighted Points
 Because endpoints have different computational and storage costs, they consume varying amounts of "points":
-- **Heavy endpoints** (e.g., `/api/analyze` which does LLM extraction, embedding, encryption, and file storage upload) = **10 points**
-- `/api/remember` (embed, encrypt, upload) = **5 points**
+- **Heavy endpoints** (e.g., `/api/analyze` which does LLM extraction, embedding, encryption, and R2 upload) = **10 points**
+- `/api/remember` (embed, encrypt, R2 upload) = **5 points**
 - `/api/restore` and `/api/remember/manual` = **3 points**
 - `/api/ask` (recall + LLM answering) = **2 points**
 - **Simple endpoints** (e.g., `/api/recall`) = **1 point**
@@ -78,13 +78,13 @@ Because endpoints have different computational and storage costs, they consume v
    - **60 points / minute** (burst limit)
    - **500 points / hour** (sustained limit)
 2. **Per Delegate Key (Instance)**: A "Delegate Key" is the throwaway ed25519 keypair running directly on the client instance (e.g., in a browser extension or a specific device). To mitigate the risk if a specific ephemeral delegate key is compromised, each key is independently limited to **30 points / minute**.
-3. **Storage Quota**: Each account is limited to a total of **1 GB** of File Storage blob storage.
+3. **Storage Quota**: Each account is limited to the configured memory quota; ciphertext is stored in the private R2 bucket.
 
 For self-hosted deployments, *all* of these limits and quotas can be fully configured via environment variables. See [Self-Hosting](/relayer/self-hosting) for configuration details.
 
 ## Single-Instance Design
 
-Each relayer deployment is tied to a single Memory package ID (`MEMORY_PACKAGE_ID`). The package ID is used for MYDATA encryption key derivation and File Storage blob metadata. Queries in the vector database are scoped by `owner + namespace`, while the package ID provides cross-deployment isolation at the encryption layer.
+Each relayer deployment is tied to a single Memory package ID (`MEMORY_PACKAGE_ID`). The package ID is used for MYDATA encryption key derivation and R2 recovery metadata. Queries in the vector database are scoped by `owner + namespace`, while the package ID provides cross-deployment isolation at the encryption layer.
 
 <Note>
 The current relayer only supports a single active package ID at a time. If you deploy a separate Memory contract, you need to run a separate relayer instance with its own database.

@@ -10,7 +10,7 @@
  *   - the bridge resolves a `target_agent_key_ref` and refuses unknown ones
  *   - the engine reaches the bridge for a memory action rather than nudging
  *     messaging, which is what `MemoryRelayerCall` used to do
- *   - `max_mist_per_run` actually skips an over-budget run
+ *   - live AI-credit authority, not a legacy per-run cap, skips a denied AI run
  *   - a run that cannot complete is recorded `failed` with a reason, never left
  *     `running`
  *
@@ -399,35 +399,36 @@ async function main(): Promise<void> {
         return "400";
     });
 
-    // ---- budget cap: oracle says 5000 mist, job allows 100 ----------------
+    // ---- AI-credit authority: denied calls stop before bridge dispatch -----
     oracleEstimatedMist = 5000;
-    const budgetJobId = await createJob({
+    oracleAllowed = false;
+    const creditDeniedJobId = await createJob({
         organization_id: "0xsmokeorg",
         account_id: "0xsmokeaccount",
         owner_address: SMOKE_OWNER,
-        name: "smoke: over budget",
+        name: "smoke: AI-credit authority denied",
         trigger_set: intervalTriggerSet(),
         target_agent_object_id: "0xsmokeagent",
         target_agent_key_ref: "smoke-agent",
         action: { kind: "memory_relayer_call", config: { operation: "recall", query: "prefs" } },
         memory_scope: "chat-app",
-        max_mist_per_run: 100,
     });
 
-    await expect("a run over max_mist_per_run is skipped, not executed", async () => {
-        const run = await waitForRun(budgetJobId);
+    await expect("live AI-credit denial skips an AI run before bridge dispatch", async () => {
+        const run = await waitForRun(creditDeniedJobId);
         assert(
             run.status === "skipped",
             `expected skipped, got ${run.status} (${run.error ?? "no error"})`,
         );
         assert(
-            run.error?.includes("max_mist_per_run") ?? false,
-            `expected a budget reason, got ${run.error}`,
+            run.error?.includes("insufficient credits (stub)") ?? false,
+            `expected the live AI-credit authority reason, got ${run.error}`,
         );
         return run.error;
     });
 
-    // ---- in budget: the engine must reach the bridge ----------------------
+    // ---- authorized AI-credit call: the engine must reach the bridge -------
+    oracleAllowed = true;
     oracleEstimatedMist = 10;
     const wiredJobId = await createJob({
         organization_id: "0xsmokeorg",
@@ -442,7 +443,6 @@ async function main(): Promise<void> {
             config: { operation: "recall", query: "what does the user prefer" },
         },
         memory_scope: "chat-app",
-        max_mist_per_run: 1000,
         retry_policy: { max_attempts: 2, jitter_ms: 0 },
     });
 
@@ -511,7 +511,7 @@ async function main(): Promise<void> {
 
     // ---- AUTOMATION_ENABLED=false keeps the API but stops execution -------
     await expect("live engine is executing (runs settle without help)", async () => {
-        const run = await waitForRun(budgetJobId);
+        const run = await waitForRun(creditDeniedJobId);
         assert(run.status !== "running", "runs are not settling");
         return "tick loop active";
     });

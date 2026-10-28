@@ -1,5 +1,5 @@
-//! Per-run lifecycle: evaluate TriggerSet → oracle preflight → budget cap →
-//! execute (with retry) → audit/history.
+//! Per-run lifecycle: evaluate TriggerSet → live AI-credit/action authorization →
+//! execute (with retry) → audit/history. MYSO spending limits are enforced on chain per action.
 //!
 //! A run is recorded in `automation_runs` before any work happens, so a job that
 //! panics or is killed mid-flight still leaves a `running` row rather than no
@@ -16,14 +16,52 @@ use crate::trigger_eval::{due_window, event_matches_trigger, trigger_set_should_
 use crate::webhook::{self, Directive, WebhookClient};
 use crate::{
     AutomationJob, PlatformEvent, AUDIT_ACTION_JOB_RUN, AUDIT_ACTION_JOB_SKIP,
-    AUDIT_ACTION_TRIGGER_FIRED, RUN_STATUS_FAILED, RUN_STATUS_SKIPPED, RUN_STATUS_SUCCEEDED,
+    AUDIT_ACTION_TRIGGER_FIRED, RUN_STATUS_FAILED, RUN_STATUS_RECONCILING, RUN_STATUS_SKIPPED,
+    RUN_STATUS_SUCCEEDED,
 };
+use sha2::{Digest, Sha256};
 
 /// Retry backoff base. Attempt 1 waits ~100ms, attempt 2 ~200ms, and so on.
 const BACKOFF_BASE_MS: u64 = 100;
 /// Ceiling on a single backoff sleep, so a large `max_attempts` cannot stall a
 /// tick loop for minutes.
 const BACKOFF_CAP_MS: u64 = 30_000;
+
+/// A durable work run may be redelivered after its automation worker lease expires. Keep the
+/// journal turn identity stable across those deliveries; the encrypted work journal performs the
+/// final replay/reconciliation decision before any side effect is resumed.
+fn stable_work_dispatch_id(
+    job_id: uuid::Uuid,
+    event: Option<&PlatformEvent>,
+    fallback: uuid::Uuid,
+) -> uuid::Uuid {
+    let Some(event) = event else { return fallback };
+    let mut hash = Sha256::new();
+    hash.update(b"myso.work-run.dispatch.v1\0");
+    hash.update(job_id.as_bytes());
+    hash.update(event.deduplication_key.as_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
+/// A yielded model slice is resumed as a separately fenced app request. Keep
+/// this derivation byte-for-byte aligned with the sidecar's historical scheme
+/// so a reclaimed delivery replays the exact same continuation IDs.
+fn next_work_continuation_id(request_id: uuid::Uuid) -> uuid::Uuid {
+    let mut hash = Sha256::new();
+    hash.update(b"myso.work-run.continuation.v1\0");
+    hash.update(request_id.to_string().as_bytes());
+    let digest = hash.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
 
 pub struct RunContext {
     pub store: Arc<dyn AutomationStore>,
@@ -32,6 +70,21 @@ pub struct RunContext {
     pub webhook: WebhookClient,
     pub workflow: Option<WorkflowClient>,
     pub audit: Option<AuditClient>,
+}
+
+#[derive(Debug)]
+pub enum EventEvaluationError {
+    /// Evaluation failed before `run_job` could dispatch any external action.
+    SafeToRetry(String),
+    /// A run began and its external outcome may be uncertain.
+    Reconcile(String),
+}
+impl std::fmt::Display for EventEvaluationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SafeToRetry(message) | Self::Reconcile(message) => formatter.write_str(message),
+        }
+    }
 }
 
 /// What a completed action did, for the run row and the audit trail.
@@ -74,8 +127,21 @@ impl ActionOutcome {
     }
 }
 
-/// Only memory work is priced by the AI-credit oracle. Chain actions are bounded on chain by the
-/// delegate's spend cap, so they skip the preflight and the per-run credit budget.
+fn unverified_chain_effect(summary: &serde_json::Value) -> Option<String> {
+    let digest = summary.get("digest").and_then(|value| value.as_str()).filter(|value| !value.is_empty())?;
+    let verified = summary.get("receiptVerified").and_then(|value| value.as_bool()) == Some(true)
+        || summary.get("receipt_verified").and_then(|value| value.as_bool()) == Some(true)
+        || summary.get("status").and_then(|value| value.as_str()).is_some_and(|status| status == "finalized" || status == "executed");
+    if verified {
+        None
+    } else {
+        Some(format!("chain effect has digest {digest} but the scoped receipt is not verified"))
+    }
+}
+
+/// Memory inference is authorized by the live AI-credit oracle. Chain actions are authorized by
+/// the delegate's current on-chain capabilities and per-action spend limit. No automation-level
+/// or per-run spending ceiling grants or denies either kind of action.
 fn consumes_ai_credit(job: &AutomationJob) -> bool {
     matches!(job.action.kind, crate::JobActionKind::MemoryRelayerCall)
 }
@@ -85,12 +151,24 @@ impl RunContext {
         &self,
         event: &PlatformEvent,
         jobs: &[AutomationJob],
-    ) -> Result<(), String> {
+    ) -> Result<(), EventEvaluationError> {
+        let mut safe_failures = Vec::new();
+        let mut uncertain_failures = Vec::new();
         for job in jobs {
             if !job.enabled {
                 continue;
             }
             if !event_in_scope(event, job) {
+                continue;
+            }
+            let manual_run = event.target_job_id == Some(job.id)
+                && event.event_family == "automation"
+                && event.event_type == "manual_run";
+            let scheduled_run = event.target_job_id == Some(job.id)
+                && event.event_family == "automation"
+                && event.event_type == "scheduled_run"
+                && event.source_service == "automation_scheduler";
+            if event.target_job_id.is_some() && !manual_run && !scheduled_run {
                 continue;
             }
             let mut newly_matched = Vec::new();
@@ -99,26 +177,82 @@ impl RunContext {
                     newly_matched.push(idx);
                 }
             }
-            if !trigger_set_should_fire(
-                &job.trigger_set,
-                &newly_matched,
-                &[],
-                event.occurred_at_ms,
-                None,
-            ) {
+            let should_fire = if manual_run || scheduled_run {
+                true
+            } else if job.trigger_set.match_mode == crate::MatchMode::All {
+                if newly_matched.is_empty() {
+                    false
+                } else {
+                    match self
+                        .store
+                        .record_all_trigger_matches(
+                            job.id,
+                            &event.deduplication_key,
+                            &newly_matched,
+                            job.trigger_set.triggers.len(),
+                            job.trigger_set.evaluation_window_ms,
+                            event.occurred_at_ms,
+                        )
+                        .await
+                    {
+                        Ok(complete) => complete,
+                        Err(error) => {
+                            safe_failures
+                                .push(format!("job {} trigger matching failed: {error}", job.id));
+                            tracing::warn!(job_id = %job.id, "trigger matching failed; continuing event fanout: {error}");
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                trigger_set_should_fire(
+                    &job.trigger_set,
+                    &newly_matched,
+                    &[],
+                    event.occurred_at_ms,
+                    None,
+                )
+            };
+            if !should_fire {
                 continue;
             }
+            let retrying_work_run = if job.action.kind == crate::JobActionKind::WorkRun {
+                match self
+                    .store
+                    .has_run_for_event(job.id, &event.deduplication_key)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        safe_failures.push(format!(
+                            "job {} work-run recovery lookup failed: {error}",
+                            job.id
+                        ));
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
             // `cooldown_ms` was parsed and stored but never read. Without it, a
             // job triggered by `memory.created` that itself writes a memory
             // re-triggers itself on every run and spends credit in a loop.
-            let cooldown_ms = cooldown_ms_for(job, &newly_matched);
+            let cooldown_ms = if manual_run || scheduled_run || retrying_work_run {
+                0
+            } else {
+                cooldown_ms_for(job, &newly_matched)
+            };
             if cooldown_ms > 0 {
-                if let Some(last) = self
-                    .store
-                    .latest_run_started_at(job.id)
-                    .await
-                    .map_err(|e| e.to_string())?
-                {
+                let last = match self.store.latest_run_started_at(job.id).await {
+                    Ok(last) => last,
+                    Err(error) => {
+                        safe_failures
+                            .push(format!("job {} cooldown lookup failed: {error}", job.id));
+                        tracing::warn!(job_id = %job.id, "cooldown lookup failed; continuing event fanout: {error}");
+                        continue;
+                    }
+                };
+                if let Some(last) = last {
                     let since_ms = (chrono::Utc::now() - last).num_milliseconds();
                     if since_ms < cooldown_ms {
                         tracing::info!(
@@ -131,12 +265,70 @@ impl RunContext {
                     }
                 }
             }
-            // One job's store failure must not starve the jobs after it.
+            if !manual_run && !scheduled_run && !retrying_work_run {
+                let policy_indices: Vec<usize> =
+                    if job.trigger_set.match_mode == crate::MatchMode::All {
+                        (0..job.trigger_set.triggers.len()).collect()
+                    } else {
+                        newly_matched.clone()
+                    };
+                let policies: Vec<(usize, i64, Option<u32>)> = policy_indices
+                    .into_iter()
+                    .filter_map(|index| {
+                        job.trigger_set.triggers.get(index).map(|trigger| {
+                            (
+                                index,
+                                trigger.debounce_window_ms,
+                                trigger.max_executions_per_window,
+                            )
+                        })
+                    })
+                    .collect();
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let authorized = match self
+                    .store
+                    .authorize_trigger_fires(job.id, &event.deduplication_key, &policies, now_ms)
+                    .await
+                {
+                    Ok(authorized) => authorized,
+                    Err(error) => {
+                        safe_failures.push(format!(
+                            "job {} trigger policy check failed: {error}",
+                            job.id
+                        ));
+                        tracing::warn!(job_id = %job.id, "trigger policy check failed; continuing event fanout: {error}");
+                        continue;
+                    }
+                };
+                if !authorized {
+                    tracing::info!(job_id = %job.id, "event ignored: trigger debounce or execution cap is active");
+                    continue;
+                }
+            }
+            // One job's failure must not starve the jobs after it.
             if let Err(e) = self.run_job(job, Some(event)).await {
                 tracing::warn!(job_id = %job.id, "run failed to record: {e}");
+                if job.action.kind == crate::JobActionKind::WorkRun {
+                    // WorkRun dispatches have a stable journal identity. Re-delivery is safe:
+                    // the app resumes only terminal operations and holds uncertain side effects.
+                    safe_failures.push(format!(
+                        "job {} work-run dispatch can be resumed from its journal: {e}",
+                        job.id
+                    ));
+                } else {
+                    uncertain_failures.push(format!("job {}: {e}", job.id));
+                }
             }
         }
-        Ok(())
+        if !uncertain_failures.is_empty() {
+            Err(EventEvaluationError::Reconcile(
+                uncertain_failures.join("; "),
+            ))
+        } else if !safe_failures.is_empty() {
+            Err(EventEvaluationError::SafeToRetry(safe_failures.join("; ")))
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn run_job(
@@ -144,9 +336,8 @@ impl RunContext {
         job: &AutomationJob,
         event: Option<&PlatformEvent>,
     ) -> Result<(), String> {
-        // The tick loop passes its synthetic tick as `event`, but a tick never
-        // matches an Event trigger, so treating it as a real event recorded every
-        // scheduled run with an empty `matched_triggers`.
+        // Scheduler deliveries are durable targeted events, but carry no external
+        // event payload for action templating and must not match Event triggers.
         let real_event = event.filter(|e| !is_tick(e));
         let matched: Vec<usize> = job
             .trigger_set
@@ -157,7 +348,8 @@ impl RunContext {
                 real_event
                     .map(|e| event_matches_trigger(e, t))
                     .unwrap_or(
-                        t.kind == crate::TriggerKind::Cron || t.kind == crate::TriggerKind::Interval,
+                        t.kind == crate::TriggerKind::Cron
+                            || t.kind == crate::TriggerKind::Interval,
                     )
                     .then_some(i)
             })
@@ -171,7 +363,7 @@ impl RunContext {
                 job.id,
                 snapshot,
                 matched_json,
-                event.map(|e| e.source_event_id.clone()),
+                event.map(|e| e.deduplication_key.clone()),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -191,9 +383,11 @@ impl RunContext {
         let mut reserved_cost = 0;
         if consumes_ai_credit(job) {
             let preflight_result = if job.owner_address.trim().is_empty() {
-                Err("job has no owner_address, so the AI credit oracle cannot resolve \
+                Err(
+                    "job has no owner_address, so the AI credit oracle cannot resolve \
                      whose balance to charge; recreate the job"
-                    .to_string())
+                        .to_string(),
+                )
             } else {
                 self.oracle
                     .preflight(&job.owner_address, &job.target_agent_object_id, 1000, 0)
@@ -208,7 +402,13 @@ impl RunContext {
                     // that is still executing.
                     let message = format!("oracle preflight failed: {err}");
                     self.store
-                        .record_run_finish(run_id, RUN_STATUS_FAILED, None, Some(message.clone()), 1)
+                        .record_run_finish(
+                            run_id,
+                            RUN_STATUS_FAILED,
+                            None,
+                            Some(message.clone()),
+                            1,
+                        )
                         .await
                         .map_err(|e| e.to_string())?;
                     if let Some(audit) = &self.audit {
@@ -240,26 +440,6 @@ impl RunContext {
                     .await;
             }
 
-            // Per-run budget cap. `max_mist_per_run` was previously stored and never
-            // read, which meant a job documented a spending limit it did not honour.
-            if job.max_mist_per_run > 0 {
-                if let Some(estimated) = preflight.estimated_mist {
-                    if estimated > job.max_mist_per_run {
-                        return self
-                            .skip_run(
-                                job,
-                                run_id,
-                                Some(estimated),
-                                format!(
-                                    "estimated {estimated} mist exceeds the job's max_mist_per_run of {}",
-                                    job.max_mist_per_run
-                                ),
-                            )
-                            .await;
-                    }
-                }
-            }
-
             reserved_cost = preflight.estimated_mist.unwrap_or(0);
         }
 
@@ -276,10 +456,22 @@ impl RunContext {
         let outcome = loop {
             attempts += 1;
             match self
-                .execute_action(job, real_event, window.as_deref(), reserved_cost, attempts)
+                .execute_action(
+                    job,
+                    run_id,
+                    real_event,
+                    window.as_deref(),
+                    reserved_cost,
+                    attempts,
+                )
                 .await
             {
                 Ok(outcome) => break Ok(outcome),
+                Err(err) if err.message().to_ascii_lowercase().contains("lease") => {
+                    break Err(crate::memory_bridge::BridgeError::Uncertain {
+                        message: format!("lease expired after dispatch: {}", err.message()),
+                    });
+                }
                 Err(err) if err.retryable() && attempts < max_attempts => {
                     let delay = backoff_delay(attempts, job.retry_policy.jitter_ms);
                     tracing::warn!(
@@ -334,11 +526,21 @@ impl RunContext {
                 }
             }
             Err(err) => {
-                let message = err.to_string();
+                let exhausted = attempts >= max_attempts && err.retryable();
+                let uncertain = err.retryable() || matches!(err, crate::memory_bridge::BridgeError::Uncertain { .. });
+                let message = if exhausted {
+                    format!("retry exhaustion before a side effect: {}", err.message())
+                } else {
+                    err.to_string()
+                };
                 self.store
                     .record_run_finish(
                         run_id,
-                        RUN_STATUS_FAILED,
+                        if uncertain {
+                            RUN_STATUS_RECONCILING
+                        } else {
+                            RUN_STATUS_FAILED
+                        },
                         None,
                         Some(message.clone()),
                         attempts,
@@ -360,6 +562,12 @@ impl RunContext {
                             Some(&job.organization_id),
                         )
                         .await;
+                }
+                if uncertain {
+                    return Err(format!(
+                        "job {} run {} has an uncertain external outcome and requires reconciliation: {message}",
+                        job.id, run_id
+                    ));
                 }
             }
         }
@@ -386,7 +594,13 @@ impl RunContext {
         notify: bool,
     ) -> Result<(), String> {
         self.store
-            .record_run_finish(run_id, RUN_STATUS_SKIPPED, cost_mist, Some(reason.clone()), 1)
+            .record_run_finish(
+                run_id,
+                RUN_STATUS_SKIPPED,
+                cost_mist,
+                Some(reason.clone()),
+                1,
+            )
             .await
             .map_err(|e| e.to_string())?;
 
@@ -420,6 +634,7 @@ impl RunContext {
     async fn execute_action(
         &self,
         job: &AutomationJob,
+        automation_run_id: uuid::Uuid,
         event: Option<&PlatformEvent>,
         due_window: Option<&str>,
         reserved_cost: u64,
@@ -472,9 +687,58 @@ impl RunContext {
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
-                Ok(ActionOutcome::chain(result, attempts, serde_json::json!({})))
+                let outcome = ActionOutcome::chain(
+                    result,
+                    attempts,
+                    serde_json::json!({}),
+                );
+                if let Some(message) = unverified_chain_effect(&outcome.summary) {
+                    return Err(crate::memory_bridge::BridgeError::Uncertain { message });
+                }
+                Ok(outcome)
             }
             crate::JobActionKind::Webhook => self.execute_webhook(job, event, attempts).await,
+            crate::JobActionKind::WorkRun => {
+                let config = crate::work_run::parse_config(&job.action.config)
+                    .map_err(|message| BridgeError::Invalid { message })?;
+                let mut turn =
+                    serde_json::to_value(&config.turn).map_err(|error| BridgeError::Invalid {
+                        message: error.to_string(),
+                    })?;
+                let dispatch_id = stable_work_dispatch_id(job.id, event, automation_run_id);
+                let run_id = config.run_id.to_string();
+                let max_model_turns = config.turn.max_model_turns;
+                let mut request_id = dispatch_id;
+                let mut completed_model_turns = 0u32;
+                let summary = loop {
+                    turn["continueRun"] = serde_json::json!(completed_model_turns > 0);
+                    let result = self
+                        .memory
+                        .dispatch_work_run(
+                            &job.target_agent_key_ref,
+                            &job.account_id,
+                            &job.target_agent_object_id,
+                            &run_id,
+                            &request_id.to_string(),
+                            &turn,
+                        )
+                        .await?;
+                    if result.get("status").and_then(serde_json::Value::as_str) != Some("yielded") {
+                        break result;
+                    }
+                    completed_model_turns = completed_model_turns.saturating_add(1);
+                    if completed_model_turns >= max_model_turns {
+                        break serde_json::json!({"status":"turn_limit_yielded","runId":run_id,"completedModelTurns":completed_model_turns});
+                    }
+                    request_id = next_work_continuation_id(request_id);
+                };
+                Ok(ActionOutcome {
+                    cost_mist: 0,
+                    summary,
+                    attempts,
+                    skipped: None,
+                })
+            }
         }
     }
 
@@ -489,14 +753,18 @@ impl RunContext {
         let config = webhook::parse_config(&job.action.config).map_err(invalid)?;
         webhook::validate_config(&config, self.webhook.allow_private()).map_err(invalid)?;
         let Some(event) = event else {
-            return Err(invalid("a webhook job must be triggered by an event".into()));
+            return Err(invalid(
+                "a webhook job must be triggered by an event".into(),
+            ));
         };
 
         let now_ms = chrono::Utc::now().timestamp_millis();
         if let Some(reason) = registered_action::stale_reason(&event.payload, now_ms) {
             return Ok(ActionOutcome::skipped(reason, attempts));
         }
-        if let PolicyVerdict::Skip(reason) = registered_action::evaluate_policy(&config.policy, &event.payload) {
+        if let PolicyVerdict::Skip(reason) =
+            registered_action::evaluate_policy(&config.policy, &event.payload)
+        {
             return Ok(ActionOutcome::skipped(reason, attempts));
         }
 
@@ -530,7 +798,10 @@ impl RunContext {
 }
 
 fn is_tick(event: &PlatformEvent) -> bool {
-    event.event_family == "automation" && event.event_type == "tick"
+    event.event_family == "automation"
+        && (event.event_type == "tick"
+            || (event.event_type == "scheduled_run"
+                && event.source_service == "automation_scheduler"))
 }
 
 /// Whether an event may trigger this job at all, before trigger matching.
@@ -540,6 +811,11 @@ fn is_tick(event: &PlatformEvent) -> bool {
 /// scoped by account, so a tenant's memory writes cannot fire another tenant's
 /// jobs. Only a fully unscoped event is delivered to every job.
 pub(crate) fn event_in_scope(event: &PlatformEvent, job: &AutomationJob) -> bool {
+    if let Some(target_job_id) = event.target_job_id {
+        if target_job_id != job.id {
+            return false;
+        }
+    }
     match (&event.organization_id, &event.account_id) {
         (Some(org), _) => org == &job.organization_id,
         (None, Some(account)) => account.trim().eq_ignore_ascii_case(job.account_id.trim()),
@@ -598,8 +874,14 @@ mod tests {
     fn backoff_grows_then_caps() {
         let first = backoff_delay(1, 0);
         assert_eq!(first, Duration::from_millis(BACKOFF_BASE_MS));
-        assert_eq!(backoff_delay(2, 0), Duration::from_millis(BACKOFF_BASE_MS * 2));
-        assert_eq!(backoff_delay(3, 0), Duration::from_millis(BACKOFF_BASE_MS * 4));
+        assert_eq!(
+            backoff_delay(2, 0),
+            Duration::from_millis(BACKOFF_BASE_MS * 2)
+        );
+        assert_eq!(
+            backoff_delay(3, 0),
+            Duration::from_millis(BACKOFF_BASE_MS * 4)
+        );
         // Large attempts saturate at the cap rather than overflowing.
         assert_eq!(backoff_delay(40, 0), Duration::from_millis(BACKOFF_CAP_MS));
     }
@@ -628,11 +910,13 @@ mod tests {
             .collect();
         AutomationJob {
             id: uuid::Uuid::new_v4(),
+            version: 1,
             organization_id: org.into(),
             account_id: account.into(),
             owner_address: "0xowner".into(),
             name: "j".into(),
             enabled: true,
+            archived: false,
             trigger_set: crate::TriggerSet {
                 match_mode: crate::MatchMode::Any,
                 evaluation_window_ms: 0,
@@ -663,6 +947,7 @@ mod tests {
             source_event_id: "e".into(),
             deduplication_key: "d".into(),
             source_service: "test".into(),
+            target_job_id: None,
         }
     }
 
@@ -679,8 +964,14 @@ mod tests {
     #[test]
     fn an_org_scoped_event_is_scoped_by_org() {
         let job = job_with("0xaaa", "org-1", &[0]);
-        assert!(event_in_scope(&event_for(Some("org-1"), Some("0xzzz")), &job));
-        assert!(!event_in_scope(&event_for(Some("org-2"), Some("0xaaa")), &job));
+        assert!(event_in_scope(
+            &event_for(Some("org-1"), Some("0xzzz")),
+            &job
+        ));
+        assert!(!event_in_scope(
+            &event_for(Some("org-2"), Some("0xaaa")),
+            &job
+        ));
     }
 
     #[test]
@@ -721,7 +1012,11 @@ mod tests {
 
     #[test]
     fn a_skipped_chain_result_becomes_a_skipped_outcome_not_a_success() {
-        let skipped = ActionOutcome::chain(ChainActionResult::Skipped("already settled".into()), 2, serde_json::json!({}));
+        let skipped = ActionOutcome::chain(
+            ChainActionResult::Skipped("already settled".into()),
+            2,
+            serde_json::json!({}),
+        );
         assert_eq!(skipped.skipped.as_deref(), Some("already settled"));
         assert_eq!(skipped.attempts, 2);
         assert_eq!(skipped.cost_mist, 0);
@@ -743,10 +1038,14 @@ mod tests {
 
     #[test]
     fn jitter_actually_varies() {
-        let samples: std::collections::HashSet<u128> =
-            (0..32).map(|_| backoff_delay(1, 1000).as_millis()).collect();
+        let samples: std::collections::HashSet<u128> = (0..32)
+            .map(|_| backoff_delay(1, 1000).as_millis())
+            .collect();
         // With 1000ms of jitter, 32 draws collapsing to one value is
         // astronomically unlikely unless the jitter is broken.
-        assert!(samples.len() > 1, "jitter produced no variation: {samples:?}");
+        assert!(
+            samples.len() > 1,
+            "jitter produced no variation: {samples:?}"
+        );
     }
 }

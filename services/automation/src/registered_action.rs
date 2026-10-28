@@ -33,13 +33,16 @@ pub struct RegisteredActionConfig {
 }
 
 /// Conditions a triggering event must satisfy before the job acts. Every field is optional; a
-/// field that is set but absent from the event payload fails closed.
+/// field that is set but absent from the event payload fails closed. `max_amount_mist` is parsed
+/// only for compatibility with saved legacy jobs and is deliberately ignored: MYSO spending
+/// limits are enforced by live on-chain policy, never by an automation event predicate.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ActionPolicy {
     #[serde(default, deserialize_with = "opt_u128")]
     pub min_amount_mist: Option<u128>,
     #[serde(default, deserialize_with = "opt_u128")]
+    #[deprecated(note = "MYSO spend ceilings are enforced by live on-chain policy")]
     pub max_amount_mist: Option<u128>,
     #[serde(default, deserialize_with = "opt_u128")]
     pub min_delivery_window_ms: Option<u128>,
@@ -91,16 +94,19 @@ pub enum PolicyVerdict {
 
 impl ActionPolicy {
     pub fn is_empty(&self) -> bool {
-        *self == ActionPolicy::default()
+        self.min_amount_mist.is_none()
+            && self.min_delivery_window_ms.is_none()
+            && self.max_open_tasks.is_none()
+            && self.min_buyer_score_milli.is_none()
+            && self.min_buyer_credibility_bps.is_none()
+            && self.min_seller_score_milli.is_none()
+            && self.min_seller_credibility_bps.is_none()
+            && self.allowed_buyer_principals.is_none()
+            && self.scope_digest_allowlist.is_none()
     }
 
     /// Internal consistency, checked when a job is created.
     pub fn validate(&self) -> Result<(), String> {
-        if let (Some(min), Some(max)) = (self.min_amount_mist, self.max_amount_mist) {
-            if min > max {
-                return Err("policy.min_amount_mist exceeds policy.max_amount_mist".into());
-            }
-        }
         for (name, list) in [
             ("allowed_buyer_principals", &self.allowed_buyer_principals),
             ("scope_digest_allowlist", &self.scope_digest_allowlist),
@@ -139,14 +145,15 @@ pub fn evaluate_policy(policy: &ActionPolicy, payload: &Value) -> PolicyVerdict 
         match number(field) {
             None => return PolicyVerdict::Skip(format!("event payload has no `{field}`")),
             Some(actual) if actual < bound => {
-                return PolicyVerdict::Skip(format!("{field} {actual} is below the minimum {bound}"))
+                return PolicyVerdict::Skip(format!(
+                    "{field} {actual} is below the minimum {bound}"
+                ))
             }
             Some(_) => {}
         }
     }
 
-    let upper_bounds: [(&str, &str, Option<u128>); 2] = [
-        ("amount_mist", "amount_mist", policy.max_amount_mist),
+    let upper_bounds: [(&str, &str, Option<u128>); 1] = [
         ("seller_open_tasks", "max_open_tasks", policy.max_open_tasks),
     ];
     for (field, name, bound) in upper_bounds {
@@ -154,7 +161,9 @@ pub fn evaluate_policy(policy: &ActionPolicy, payload: &Value) -> PolicyVerdict 
         match number(field) {
             None => return PolicyVerdict::Skip(format!("event payload has no `{field}`")),
             Some(actual) if actual > bound => {
-                return PolicyVerdict::Skip(format!("{field} {actual} exceeds the {name} limit {bound}"))
+                return PolicyVerdict::Skip(format!(
+                    "{field} {actual} exceeds the {name} limit {bound}"
+                ))
             }
             Some(_) => {}
         }
@@ -255,7 +264,9 @@ fn render_string(template: &str, context: &Value) -> Result<Value, String> {
     while let Some(start) = rest.find("{{") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
-        let end = after.find("}}").ok_or("unterminated `{{` in a params template")?;
+        let end = after
+            .find("}}")
+            .ok_or("unterminated `{{` in a params template")?;
         let path = after[..end].trim();
         match lookup_path(context, path) {
             Some(Value::String(s)) => out.push_str(s),
@@ -294,7 +305,8 @@ fn render_value(value: &Value, context: &Value) -> Result<Value, String> {
         Value::Object(map) => {
             let mut out = Map::new();
             for (key, item) in map {
-                if matches!(item, Value::String(s) if s.contains("{{") && resolves_to_null(s, context)) {
+                if matches!(item, Value::String(s) if s.contains("{{") && resolves_to_null(s, context))
+                {
                     continue;
                 }
                 out.insert(key.clone(), render_value(item, context)?);
@@ -307,7 +319,11 @@ fn render_value(value: &Value, context: &Value) -> Result<Value, String> {
 
 /// Fill `{{event.payload.x}}` templates in `params` from the triggering event.
 pub fn resolve_params(params: &Value, event: Option<&PlatformEvent>) -> Result<Value, String> {
-    let params = if params.is_null() { json!({}) } else { params.clone() };
+    let params = if params.is_null() {
+        json!({})
+    } else {
+        params.clone()
+    };
     if !params.is_object() {
         return Err("params must be an object".into());
     }
@@ -316,9 +332,13 @@ pub fn resolve_params(params: &Value, event: Option<&PlatformEvent>) -> Result<V
         None => json!({}),
     };
     let rendered = render_value(&params, &context)?;
-    let size = serde_json::to_vec(&rendered).map_err(|e| e.to_string())?.len();
+    let size = serde_json::to_vec(&rendered)
+        .map_err(|e| e.to_string())?
+        .len();
     if size > MAX_PARAMS_BYTES {
-        return Err(format!("params are {size} bytes; the limit is {MAX_PARAMS_BYTES}"));
+        return Err(format!(
+            "params are {size} bytes; the limit is {MAX_PARAMS_BYTES}"
+        ));
     }
     Ok(rendered)
 }
@@ -340,7 +360,8 @@ pub fn idempotency_key(
 }
 
 pub fn parse_config(value: &Value) -> Result<RegisteredActionConfig, String> {
-    serde_json::from_value(value.clone()).map_err(|e| format!("invalid registered_action config: {e}"))
+    serde_json::from_value(value.clone())
+        .map_err(|e| format!("invalid registered_action config: {e}"))
 }
 
 /// Structural checks done when a job is created, so a typo fails then rather than at run time.
@@ -384,9 +405,12 @@ pub async fn submit(
         Ok(summary) => Ok(ChainActionResult::Executed(summary)),
         // 409: the chain moved on (already settled, deadline passed, another keeper won the race).
         // Retrying cannot help and it is not the owner's mistake, so it is a skip, not a failure.
-        Err(BridgeError::Rejected { status: 409, message }) => Ok(ChainActionResult::Skipped(
-            format!("chain state no longer allows {action_id}: {message}"),
-        )),
+        Err(BridgeError::Rejected {
+            status: 409,
+            message,
+        }) => Ok(ChainActionResult::Skipped(format!(
+            "chain state no longer allows {action_id}: {message}"
+        ))),
         Err(other) => Err(other),
     }
 }
@@ -399,7 +423,8 @@ pub async fn execute(
     window: Option<&str>,
     now_ms: i64,
 ) -> Result<ChainActionResult, BridgeError> {
-    let config = parse_config(&job.action.config).map_err(|message| BridgeError::Invalid { message })?;
+    let config =
+        parse_config(&job.action.config).map_err(|message| BridgeError::Invalid { message })?;
     validate_config(&config).map_err(|message| BridgeError::Invalid { message })?;
 
     if let Some(event) = event {
@@ -415,9 +440,18 @@ pub async fn execute(
         });
     }
 
-    let params = resolve_params(&config.params, event).map_err(|message| BridgeError::Invalid { message })?;
+    let params = resolve_params(&config.params, event)
+        .map_err(|message| BridgeError::Invalid { message })?;
     let key = idempotency_key(job.id, event, window, &config.action_id);
-    submit(bridge, job, config.key_ref.as_deref(), &config.action_id, &params, &key).await
+    submit(
+        bridge,
+        job,
+        config.key_ref.as_deref(),
+        &config.action_id,
+        &params,
+        &key,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -437,6 +471,7 @@ mod tests {
             source_event_id: "e1".into(),
             deduplication_key: "task:0xt:offered".into(),
             source_service: "social".into(),
+            target_job_id: None,
         }
     }
 
@@ -462,32 +497,65 @@ mod tests {
     #[test]
     fn an_empty_policy_always_proceeds() {
         assert!(ActionPolicy::default().is_empty());
-        assert_eq!(evaluate_policy(&ActionPolicy::default(), &json!({})), PolicyVerdict::Proceed);
+        assert_eq!(
+            evaluate_policy(&ActionPolicy::default(), &json!({})),
+            PolicyVerdict::Proceed
+        );
     }
 
     #[test]
-    fn amount_bounds_accept_strings_and_numbers() {
-        let p = policy(json!({ "min_amount_mist": "1000000000", "max_amount_mist": 10_000_000_000u64 }));
-        assert_eq!(evaluate_policy(&p, &offer_payload()), PolicyVerdict::Proceed);
+    fn amount_floor_is_a_workflow_condition_but_legacy_ceiling_is_ignored() {
+        let p = policy(
+            json!({ "min_amount_mist": "1000000000", "max_amount_mist": 10_000_000_000u64 }),
+        );
+        assert_eq!(
+            evaluate_policy(&p, &offer_payload()),
+            PolicyVerdict::Proceed
+        );
 
         let low = policy(json!({ "min_amount_mist": "6000000000" }));
-        assert!(matches!(evaluate_policy(&low, &offer_payload()), PolicyVerdict::Skip(r) if r.contains("below")));
+        assert!(
+            matches!(evaluate_policy(&low, &offer_payload()), PolicyVerdict::Skip(r) if r.contains("below"))
+        );
         let high = policy(json!({ "max_amount_mist": "4000000000" }));
-        assert!(matches!(evaluate_policy(&high, &offer_payload()), PolicyVerdict::Skip(r) if r.contains("exceeds")));
+        assert_eq!(evaluate_policy(&high, &offer_payload()), PolicyVerdict::Proceed);
+        assert!(high.is_empty());
     }
 
     #[test]
     fn each_field_passes_and_fails_independently() {
         let payload = offer_payload();
         let cases = [
-            (json!({ "min_delivery_window_ms": 86_400_000 }), json!({ "min_delivery_window_ms": 86_400_001u64 })),
-            (json!({ "max_open_tasks": 1 }), json!({ "max_open_tasks": 0 })),
-            (json!({ "min_buyer_score_milli": 3800 }), json!({ "min_buyer_score_milli": 3801 })),
-            (json!({ "min_buyer_credibility_bps": 4000 }), json!({ "min_buyer_credibility_bps": 4001 })),
+            (
+                json!({ "min_delivery_window_ms": 86_400_000 }),
+                json!({ "min_delivery_window_ms": 86_400_001u64 }),
+            ),
+            (
+                json!({ "max_open_tasks": 1 }),
+                json!({ "max_open_tasks": 0 }),
+            ),
+            (
+                json!({ "min_buyer_score_milli": 3800 }),
+                json!({ "min_buyer_score_milli": 3801 }),
+            ),
+            (
+                json!({ "min_buyer_credibility_bps": 4000 }),
+                json!({ "min_buyer_credibility_bps": 4001 }),
+            ),
         ];
         for (ok, bad) in cases {
-            assert_eq!(evaluate_policy(&policy(ok.clone()), &payload), PolicyVerdict::Proceed, "{ok}");
-            assert!(matches!(evaluate_policy(&policy(bad.clone()), &payload), PolicyVerdict::Skip(_)), "{bad}");
+            assert_eq!(
+                evaluate_policy(&policy(ok.clone()), &payload),
+                PolicyVerdict::Proceed,
+                "{ok}"
+            );
+            assert!(
+                matches!(
+                    evaluate_policy(&policy(bad.clone()), &payload),
+                    PolicyVerdict::Skip(_)
+                ),
+                "{bad}"
+            );
         }
     }
 
@@ -501,25 +569,40 @@ mod tests {
         assert_eq!(evaluate_policy(&ok, &payload), PolicyVerdict::Proceed);
 
         let other_buyer = policy(json!({ "allowed_buyer_principals": ["0xdef"] }));
-        assert!(matches!(evaluate_policy(&other_buyer, &payload), PolicyVerdict::Skip(r) if r.contains("allowlist")));
+        assert!(
+            matches!(evaluate_policy(&other_buyer, &payload), PolicyVerdict::Skip(r) if r.contains("allowlist"))
+        );
         let other_scope = policy(json!({ "scope_digest_allowlist": ["00".repeat(32)] }));
-        assert!(matches!(evaluate_policy(&other_scope, &payload), PolicyVerdict::Skip(_)));
+        assert!(matches!(
+            evaluate_policy(&other_scope, &payload),
+            PolicyVerdict::Skip(_)
+        ));
     }
 
     #[test]
     fn a_set_field_missing_from_the_payload_fails_closed() {
         let p = policy(json!({ "min_buyer_score_milli": 3000 }));
-        assert!(matches!(evaluate_policy(&p, &json!({})), PolicyVerdict::Skip(r) if r.contains("no `buyer_score_milli`")));
+        assert!(
+            matches!(evaluate_policy(&p, &json!({})), PolicyVerdict::Skip(r) if r.contains("no `buyer_score_milli`"))
+        );
         let p = policy(json!({ "allowed_buyer_principals": ["0x1"] }));
-        assert!(matches!(evaluate_policy(&p, &json!({})), PolicyVerdict::Skip(_)));
+        assert!(matches!(
+            evaluate_policy(&p, &json!({})),
+            PolicyVerdict::Skip(_)
+        ));
     }
 
     #[test]
     fn invalid_policies_are_rejected_when_parsed_or_validated() {
-        assert!(serde_json::from_value::<ActionPolicy>(json!({ "min_amount_mist": "ten" })).is_err());
+        assert!(
+            serde_json::from_value::<ActionPolicy>(json!({ "min_amount_mist": "ten" })).is_err()
+        );
         assert!(serde_json::from_value::<ActionPolicy>(json!({ "mystery": 1 })).is_err());
-        assert!(policy(json!({ "min_amount_mist": 5, "max_amount_mist": 1 })).validate().is_err());
-        assert!(policy(json!({ "allowed_buyer_principals": [] })).validate().is_err());
+        assert!(serde_json::from_value::<ActionPolicy>(json!({ "max_amount_mist": "ten" })).is_err());
+        assert!(policy(json!({ "min_amount_mist": 5, "max_amount_mist": 1 })).validate().is_ok());
+        assert!(policy(json!({ "allowed_buyer_principals": [] }))
+            .validate()
+            .is_err());
     }
 
     #[test]
@@ -532,10 +615,23 @@ mod tests {
 
     #[test]
     fn action_ids_are_namespaced_and_versioned() {
-        for ok in ["task.accept.v1", "task.cancel_offer.v1", "social.create_post.v12"] {
+        for ok in [
+            "task.accept.v1",
+            "task.cancel_offer.v1",
+            "social.create_post.v12",
+        ] {
             assert!(valid_action_id(ok), "{ok}");
         }
-        for bad in ["", "task.accept", "task.accept.v", "Task.accept.v1", "task..v1", "a.b.c.v1", "0x2::coin::transfer", "task.accept.v1 "] {
+        for bad in [
+            "",
+            "task.accept",
+            "task.accept.v",
+            "Task.accept.v1",
+            "task..v1",
+            "a.b.c.v1",
+            "0x2::coin::transfer",
+            "task.accept.v1 ",
+        ] {
             assert!(!valid_action_id(bad), "{bad}");
         }
         assert!(!valid_action_id(&format!("task.{}.v1", "a".repeat(80))));
@@ -564,7 +660,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["uri"], "wal://0xtask/3800");
-        assert!(resolve_params(&json!({ "x": "a {{event.payload}} b" }), Some(&event(offer_payload()))).is_err());
+        assert!(resolve_params(
+            &json!({ "x": "a {{event.payload}} b" }),
+            Some(&event(offer_payload()))
+        )
+        .is_err());
     }
 
     #[test]
@@ -595,8 +695,16 @@ mod tests {
         // A key the event never had is still a mistake in the job, not an absent optional.
         assert!(resolve_params(&json!({ "x": "{{event.payload.nope}}" }), Some(&e)).is_err());
         // Only a whole-value template is optional; a null inside an array or a string is an error.
-        assert!(resolve_params(&json!({ "x": ["{{event.payload.buyer_agent_id}}"] }), Some(&e)).is_err());
-        assert!(resolve_params(&json!({ "x": "a {{event.payload.buyer_agent_id}}" }), Some(&e)).is_err());
+        assert!(resolve_params(
+            &json!({ "x": ["{{event.payload.buyer_agent_id}}"] }),
+            Some(&e)
+        )
+        .is_err());
+        assert!(resolve_params(
+            &json!({ "x": "a {{event.payload.buyer_agent_id}}" }),
+            Some(&e)
+        )
+        .is_err());
     }
 
     #[test]
@@ -612,13 +720,21 @@ mod tests {
         let a = idempotency_key(job, Some(&e), None, "task.accept.v1");
         assert_eq!(a, idempotency_key(job, Some(&e), None, "task.accept.v1"));
         assert_ne!(a, idempotency_key(job, Some(&e), None, "task.decline.v1"));
-        assert_ne!(a, idempotency_key(uuid::Uuid::new_v4(), Some(&e), None, "task.accept.v1"));
+        assert_ne!(
+            a,
+            idempotency_key(uuid::Uuid::new_v4(), Some(&e), None, "task.accept.v1")
+        );
         let mut other = e.clone();
         other.deduplication_key = "task:0xt:accepted".into();
-        assert_ne!(a, idempotency_key(job, Some(&other), None, "task.accept.v1"));
+        assert_ne!(
+            a,
+            idempotency_key(job, Some(&other), None, "task.accept.v1")
+        );
         // The relayer accepts 8..=128 characters of [A-Za-z0-9-_:./].
         assert!((8..=128).contains(&a.len()));
-        assert!(a.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_:./".contains(&b)));
+        assert!(a
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_:./".contains(&b)));
         // Scheduled runs key on the due window.
         assert_ne!(
             idempotency_key(job, None, Some("100"), "task.release.v1"),
@@ -633,7 +749,8 @@ mod tests {
         assert!(parse_config(&json!({ "action_id": "task.accept.v1", "polcy": {} })).is_err());
         let bad_id = parse_config(&json!({ "action_id": "0x2::coin::transfer" })).unwrap();
         assert!(validate_config(&bad_id).is_err());
-        let blank_key = parse_config(&json!({ "action_id": "task.accept.v1", "key_ref": " " })).unwrap();
+        let blank_key =
+            parse_config(&json!({ "action_id": "task.accept.v1", "key_ref": " " })).unwrap();
         assert!(validate_config(&blank_key).is_err());
     }
 }

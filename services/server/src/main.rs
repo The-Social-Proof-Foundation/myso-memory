@@ -1,27 +1,46 @@
+mod wallet_root;
+mod work_turns;
+mod work_runs;
+mod task_deliverables;
+mod room_attachments;
 mod access_request_client;
 mod owner_auth;
 mod agent_key_backups;
 mod agent_key_setup;
 mod action_approvals;
 mod ai_spend;
+mod assets;
+mod dex;
 mod audit_push;
 mod auth;
 mod automation_proxy;
+mod platform_reads;
+mod structured_inference;
 mod blob_store;
 mod chain_actions;
 mod chain_discovery;
 mod compatibility;
 mod db;
-#[path = "file-storage.rs"]
-mod file_storage;
 mod jobs;
 mod lifecycle;
 mod llm_models;
 mod memory_contract;
 mod mydata;
+mod mydata_access;
+mod subscription_access;
+mod chain_reads;
+mod payments;
+mod poc_vault;
+mod poc_transfer;
+mod spot_payout;
+mod spt;
+mod owner_agents;
 mod myso;
 mod observability;
 mod org_chain;
+mod organization_treasury;
+mod organization_actions;
+mod platform_admin_actions;
 mod org_perms;
 mod policy;
 mod ranker;
@@ -46,7 +65,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use db::VectorDb;
-use types::{AppState, Config, KeyPool};
+use types::{AppState, Config};
 
 #[tokio::main]
 async fn main() {
@@ -129,7 +148,7 @@ async fn main() {
         );
     }
 
-    // Start TS sidecar HTTP server (MYDATA + File Storage operations)
+    // Start TS sidecar HTTP server (MYDATA operations)
     let sidecar_url = config.sidecar_url.clone();
     tracing::info!("  sidecar: starting at {}", sidecar_url);
     // Use SIDECAR_SCRIPTS_DIR if set (Docker), otherwise derive from CARGO_MANIFEST_DIR (local dev)
@@ -152,7 +171,7 @@ async fn main() {
         .expect("Failed to start TS sidecar. Is Node.js installed?");
 
     // Wait for sidecar to be ready (health check with retry)
-    // LOW-9: Set 30s timeout on HTTP client to prevent hanging LLM/File Storage requests
+    // LOW-9: Set 30s timeout on HTTP client to prevent hanging LLM/RPC requests
     let health_url = format!("{}/health", sidecar_url);
     let mut ready = false;
     for attempt in 1..=30 {
@@ -180,28 +199,6 @@ async fn main() {
         .await
         .expect("Failed to connect to PostgreSQL");
 
-    tracing::info!(
-        "  File Storage publisher: {}",
-        config.file_storage_publisher_url
-    );
-    tracing::info!(
-        "  File Storage aggregator: {}",
-        config.file_storage_aggregator_url
-    );
-    // Log upload key pool status
-    let pool_size = config.myso_private_keys.len();
-    if pool_size > 0 {
-        tracing::info!(
-            "  File Storage upload: {} key(s) in pool (parallel uploads up to {}x)",
-            pool_size,
-            pool_size
-        );
-    } else {
-        tracing::warn!("  File Storage upload: no MySo private keys configured, uploads will fail");
-    }
-
-    // Build key pool for parallel File Storage uploads
-    let key_pool = KeyPool::new(config.myso_private_keys.clone());
     let r2 = if config.blob_backend == types::BlobBackend::R2 {
         tracing::info!(
             "  blob backend: r2 bucket {}",
@@ -212,7 +209,7 @@ async fn main() {
                 .expect("R2 blob store configuration is incomplete"),
         )
     } else {
-        tracing::info!("  blob backend: file_storage");
+        tracing::info!("  blob backend: r2");
         None
     };
 
@@ -227,7 +224,6 @@ async fn main() {
         db,
         config: config.clone(),
         http_client,
-        key_pool,
         redis,
         fallback_rate_limit: tokio::sync::Mutex::new(crate::rate_limit::InMemoryFallback::default()),
         r2,
@@ -256,6 +252,32 @@ async fn main() {
     // auth + rate-limit middleware even sees the request.
     let protected_routes = Router::new()
         .route("/api/agent/context", get(routes::agent_context))
+        .route("/api/work/runs", get(work_runs::list).post(work_runs::create))
+        .route("/api/task/deliverable/upload", post(task_deliverables::upload).layer(DefaultBodyLimit::max(720 * 1024)))
+        .route("/api/messaging/attachments/upload", post(room_attachments::upload).layer(DefaultBodyLimit::max(7 * 1024 * 1024 + 8192)))
+        .route("/api/messaging/attachments/download", post(room_attachments::download).layer(DefaultBodyLimit::max(16 * 1024)))
+        .route("/api/work/runs/{id}", get(work_runs::get))
+        .route("/api/work/runs/{id}/task-history/refresh", post(work_runs::refresh_task_history))
+        .route("/api/work/runs/{id}/complete", post(work_runs::complete))
+        .route("/api/work/runs/{id}/worker-credential", post(work_runs::issue_worker_credential))
+        .route("/api/work/runs/{id}/worker-credential/revoke", post(work_runs::revoke_worker_credential))
+        .route("/api/work/runs/{id}/turns/acquire", post(work_turns::acquire))
+        .route("/api/work/runs/{id}/turns/renew", post(work_turns::renew))
+        .route("/api/work/runs/{id}/turns/checkpoint", post(work_turns::checkpoint))
+        .route("/api/work/runs/{id}/turns/finish", post(work_turns::finish))
+        .route("/api/work/runs/{id}/plan", post(work_runs::save_plan))
+        .route("/api/work/runs/{id}/operations", get(work_runs::list_operations).post(work_runs::reserve))
+        .route("/api/work/runs/{id}/receipts", post(work_runs::append_action_receipt))
+        .route("/api/work/runs/{id}/artifacts", post(work_runs::append_task_artifact))
+        .route("/api/work/runs/{id}/steps/{stepId}", post(work_runs::update_step))
+        .route("/api/work/operations/{id}", post(work_runs::settle))
+        .route("/api/agent/read/{resource}", get(platform_reads::read))
+        .route("/api/agent/poc/beneficiary-transfer", post(poc_transfer::handle))
+        .route("/api/mydata/read-content", post(mydata_access::read_content).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/mydata/check-current-access", post(mydata_access::check_current_access).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/mydata/graph/verify-seller", post(mydata_access::verify_graph_seller).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/mydata/graph/encrypt", post(mydata_access::encrypt_graph_manifest).layer(DefaultBodyLimit::max(512 * 1024)))
+        .route("/api/ai-credit/chat", post(structured_inference::chat).layer(DefaultBodyLimit::max(1024 * 1024)))
         .route("/api/models", get(llm_models::list_models))
         .route(
             "/api/agent/llm-model",
@@ -311,23 +333,46 @@ async fn main() {
             "/api/automation/jobs",
             get(automation_proxy::list_jobs).post(automation_proxy::create_job),
         )
+        .route("/api/automation/jobs/validate", post(automation_proxy::validate_job))
+        .route("/api/automation/jobs/{id}/simulate-event", post(automation_proxy::simulate_job_event))
+        .route("/api/automation/jobs/{id}/configuration", axum::routing::patch(automation_proxy::update_job_configuration))
         .route(
             "/api/automation/jobs/{id}",
-            get(automation_proxy::get_job),
+            get(automation_proxy::get_job).post(automation_proxy::set_job_enabled).patch(automation_proxy::rename_job).delete(automation_proxy::delete_job),
         )
+        .route("/api/automation/jobs/{id}/archive", post(automation_proxy::archive_job))
+        .route("/api/automation/jobs/{id}/restore", post(automation_proxy::restore_job))
         .route(
             "/api/automation/jobs/{id}/runs",
             get(automation_proxy::list_runs),
         )
         .route(
+            "/api/automation/jobs/{job_id}/runs/{run_id}/reconcile",
+            post(automation_proxy::resolve_orphan_run),
+        )
+        .route("/api/automation/jobs/{id}/run-now", post(automation_proxy::run_job_now))
+        .route("/api/automation/jobs/{id}/cancel", post(automation_proxy::cancel_job))
+        .route(
             "/api/automation/delegates",
             get(automation_proxy::list_delegates),
+        )
+        .route("/api/automation/delegates/events", get(automation_proxy::list_delegate_key_events))
+        .route(
+            "/api/automation/delegates/{name}/status",
+            get(automation_proxy::get_delegate_status),
+        )
+        .route(
+            "/api/automation/delegates/keys",
+            get(automation_proxy::list_delegate_public_keys),
         )
         .route(
             "/api/automation/delegates/{name}",
             axum::routing::put(automation_proxy::put_delegate)
                 .delete(automation_proxy::delete_delegate),
         )
+        .route("/api/automation/jobs/{id}/deliveries", get(automation_proxy::list_event_deliveries))
+        .route("/api/automation/deliveries/{id}/reconcile", post(automation_proxy::resolve_event_delivery))
+        .route("/api/automation/deliveries/{id}/cancel", post(automation_proxy::cancel_event_delivery))
         .route("/api/automation/health", get(automation_proxy::health))
         .route("/api/social/post", post(social_routes::create_post))
         .route("/api/social/comment", post(social_routes::create_comment))
@@ -390,6 +435,83 @@ async fn main() {
         .route(
             "/config",
             get(routes::get_config).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/internal/mcp/agent-context",
+            post(routes::internal_mcp_agent_context).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/internal/mcp/wallet-root",
+            post(wallet_root::internal_mcp_wallet_root).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-journal",
+            post(routes::internal_mcp_work_journal).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-worker-context",
+            post(routes::internal_mcp_work_worker_context).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-worker-credential/issue",
+            post(routes::internal_mcp_issue_work_credential).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-worker-credential/renew",
+            post(routes::internal_mcp_renew_work_worker_credential).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-worker-credential/revoke",
+            post(routes::internal_mcp_revoke_work_credential).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-models",
+            post(routes::internal_mcp_work_models).layer(DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-task-artifact",
+            post(routes::internal_mcp_work_task_artifact).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-inference",
+            post(routes::internal_mcp_work_inference).layer(DefaultBodyLimit::max(800 * 1024)),
+        )
+        .route(
+            "/internal/mcp/platform-read",
+            post(routes::internal_mcp_platform_read).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/internal/mcp/mydata-current-access",
+            post(routes::internal_mcp_mydata_access_check).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-graph-content",
+            post(routes::internal_mcp_work_graph_content).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/internal/mcp/work-graph-seller",
+            post(routes::internal_mcp_work_graph_seller).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/internal/mcp/automation-tool",
+            post(routes::internal_mcp_automation_tool).layer(DefaultBodyLimit::max(256 * 1024)),
+        );
+    public_routes = public_routes
+        .route(
+            "/internal/mcp/action-approval/request",
+            post(routes::internal_mcp_action_approval_request).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/internal/mcp/action-approval/list",
+            post(routes::internal_mcp_action_approvals_list).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/internal/mcp/action-approval/prepare",
+            post(routes::internal_mcp_action_prepare).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/internal/mcp/action-approval/submit",
+            post(routes::internal_mcp_action_submit).layer(DefaultBodyLimit::max(32 * 1024)),
         );
     let owner_approval_routes = Router::new()
         .route(

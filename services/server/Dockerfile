@@ -34,7 +34,8 @@ WORKDIR /app
 COPY workspace/sdk/ ./workspace/sdk/
 COPY workspace/social/ ./workspace/social/
 
-RUN cd workspace/sdk && npm install ai zod && npm run build
+# Match the peer versions used for the mirrored SDK compilation; avoid a drifting zod major.
+RUN cd workspace/sdk && npm install --no-save ai@7.0.22 zod@3.25.76 && npm run build
 RUN cd workspace/social && npm install && npm run build
 
 WORKDIR /app/scripts

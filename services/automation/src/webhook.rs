@@ -61,12 +61,21 @@ pub fn validate_config(config: &WebhookConfig, allow_private: bool) -> Result<()
         return Err("webhook secret must be at least 16 characters".into());
     }
     if config.allowed_hosts.is_empty() || config.allowed_hosts.len() > MAX_ALLOWED_HOSTS {
-        return Err(format!("allowed_hosts needs 1 to {MAX_ALLOWED_HOSTS} entries"));
+        return Err(format!(
+            "allowed_hosts needs 1 to {MAX_ALLOWED_HOSTS} entries"
+        ));
     }
-    if config.allowed_action_ids.is_empty() || config.allowed_action_ids.len() > MAX_ALLOWED_ACTIONS {
-        return Err(format!("allowed_action_ids needs 1 to {MAX_ALLOWED_ACTIONS} entries"));
+    if config.allowed_action_ids.is_empty() || config.allowed_action_ids.len() > MAX_ALLOWED_ACTIONS
+    {
+        return Err(format!(
+            "allowed_action_ids needs 1 to {MAX_ALLOWED_ACTIONS} entries"
+        ));
     }
-    if let Some(bad) = config.allowed_action_ids.iter().find(|id| !valid_action_id(id)) {
+    if let Some(bad) = config
+        .allowed_action_ids
+        .iter()
+        .find(|id| !valid_action_id(id))
+    {
         return Err(format!("`{bad}` is not a valid action id"));
     }
     if let Some(key_ref) = &config.key_ref {
@@ -79,9 +88,12 @@ pub fn validate_config(config: &WebhookConfig, allow_private: bool) -> Result<()
 }
 
 fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
-    allowed_hosts
-        .iter()
-        .any(|allowed| allowed.trim().trim_end_matches('.').eq_ignore_ascii_case(host.trim_end_matches('.')))
+    allowed_hosts.iter().any(|allowed| {
+        allowed
+            .trim()
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(host.trim_end_matches('.'))
+    })
 }
 
 /// Static checks on the destination URL. Address checks happen after DNS resolution, in `call`.
@@ -107,7 +119,10 @@ pub fn validate_url(
         return Err("webhook url must use the default https port".into());
     }
     if !allow_private {
-        if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        if let Ok(ip) = host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<IpAddr>()
+        {
             if is_blocked_ip(ip) {
                 return Err("webhook url points at a private or reserved address".into());
             }
@@ -182,7 +197,10 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
 pub fn signature_header(secret: &str, timestamp: i64, body: &[u8]) -> String {
     let mut message = format!("{timestamp}.").into_bytes();
     message.extend_from_slice(body);
-    format!("v1={}", hex::encode(hmac_sha256(secret.as_bytes(), &message)))
+    format!(
+        "v1={}",
+        hex::encode(hmac_sha256(secret.as_bytes(), &message))
+    )
 }
 
 #[derive(Deserialize)]
@@ -198,7 +216,10 @@ struct RawDirective {
 }
 
 /// Parse and constrain the endpoint's reply.
-pub fn parse_directive(bytes: &[u8], allowed_action_ids: &[String]) -> Result<Directive, BridgeError> {
+pub fn parse_directive(
+    bytes: &[u8],
+    allowed_action_ids: &[String],
+) -> Result<Directive, BridgeError> {
     let invalid = |message: String| BridgeError::Invalid { message };
     let raw: RawDirective = serde_json::from_slice(bytes)
         .map_err(|e| invalid(format!("webhook reply is not a directive object: {e}")))?;
@@ -208,7 +229,10 @@ pub fn parse_directive(bytes: &[u8], allowed_action_ids: &[String]) -> Result<Di
     let action_id = raw
         .action_id
         .ok_or_else(|| invalid("webhook directive has neither `noop` nor `action_id`".into()))?;
-    if !allowed_action_ids.iter().any(|allowed| allowed == &action_id) {
+    if !allowed_action_ids
+        .iter()
+        .any(|allowed| allowed == &action_id)
+    {
         return Err(invalid(format!(
             "webhook directive named `{action_id}`, which is not in allowed_action_ids"
         )));
@@ -217,9 +241,13 @@ pub fn parse_directive(bytes: &[u8], allowed_action_ids: &[String]) -> Result<Di
     if !params.is_object() {
         return Err(invalid("webhook directive params must be an object".into()));
     }
-    let size = serde_json::to_vec(&params).map(|v| v.len()).unwrap_or(usize::MAX);
+    let size = serde_json::to_vec(&params)
+        .map(|v| v.len())
+        .unwrap_or(usize::MAX);
     if size > MAX_PARAMS_BYTES {
-        return Err(invalid(format!("webhook directive params are {size} bytes; the limit is {MAX_PARAMS_BYTES}")));
+        return Err(invalid(format!(
+            "webhook directive params are {size} bytes; the limit is {MAX_PARAMS_BYTES}"
+        )));
     }
     Ok(Directive::Act { action_id, params })
 }
@@ -297,7 +325,9 @@ impl WebhookClient {
             "allowed_action_ids": config.allowed_action_ids,
             "event": event,
         }))
-        .map_err(|e| BridgeError::Invalid { message: e.to_string() })?;
+        .map_err(|e| BridgeError::Invalid {
+            message: e.to_string(),
+        })?;
         let timestamp = chrono::Utc::now().timestamp();
 
         let mut response = client
@@ -305,7 +335,10 @@ impl WebhookClient {
             .header("content-type", "application/json")
             .header("x-myso-timestamp", timestamp.to_string())
             .header("x-myso-delivery", delivery_id)
-            .header("x-myso-signature", signature_header(&config.secret, timestamp, &body))
+            .header(
+                "x-myso-signature",
+                signature_header(&config.secret, timestamp, &body),
+            )
             .body(body)
             .send()
             .await
@@ -321,9 +354,13 @@ impl WebhookClient {
         }
 
         let mut bytes: Vec<u8> = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| BridgeError::Unavailable {
-            message: format!("reading webhook reply failed: {e}"),
-        })? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| BridgeError::Unavailable {
+                message: format!("reading webhook reply failed: {e}"),
+            })?
+        {
             if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
                 return Err(BridgeError::Invalid {
                     message: format!("webhook reply exceeds {MAX_RESPONSE_BYTES} bytes"),
@@ -381,7 +418,10 @@ mod tests {
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
         // Keys longer than the block size are hashed first (RFC 4231 case 6).
-        let case_6 = hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First");
+        let case_6 = hmac_sha256(
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+        );
         assert_eq!(
             hex::encode(case_6),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
@@ -401,15 +441,43 @@ mod tests {
     #[test]
     fn private_and_reserved_addresses_are_blocked() {
         for blocked in [
-            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "0.0.0.0",
-            "100.64.0.1", "224.0.0.1", "255.255.255.255", "198.18.0.1", "240.0.0.1", "::1", "::",
-            "fe80::1", "fc00::1", "fd12:3456::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254",
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "100.64.0.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "198.18.0.1",
+            "240.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
             "2001:db8::1",
         ] {
-            assert!(is_blocked_ip(blocked.parse().unwrap()), "{blocked} should be blocked");
+            assert!(
+                is_blocked_ip(blocked.parse().unwrap()),
+                "{blocked} should be blocked"
+            );
         }
-        for public in ["8.8.8.8", "93.184.216.34", "2606:4700:4700::1111", "100.63.255.255", "172.32.0.1"] {
-            assert!(!is_blocked_ip(public.parse().unwrap()), "{public} should be allowed");
+        for public in [
+            "8.8.8.8",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            "100.63.255.255",
+            "172.32.0.1",
+        ] {
+            assert!(
+                !is_blocked_ip(public.parse().unwrap()),
+                "{public} should be allowed"
+            );
         }
     }
 
@@ -434,7 +502,11 @@ mod tests {
     #[test]
     fn ip_literals_and_metadata_hosts_are_refused_even_when_allowlisted() {
         let allowed = hosts(&["169.254.169.254", "127.0.0.1", "[::1]"]);
-        for bad in ["https://169.254.169.254/latest", "https://127.0.0.1/x", "https://[::1]/x"] {
+        for bad in [
+            "https://169.254.169.254/latest",
+            "https://127.0.0.1/x",
+            "https://[::1]/x",
+        ] {
             assert!(validate_url(bad, &allowed, false).is_err(), "{bad}");
         }
     }
@@ -453,8 +525,16 @@ mod tests {
         assert!(validate_config(&config(json!({ "secret": "short" })), false).is_err());
         assert!(validate_config(&config(json!({ "allowed_hosts": [] })), false).is_err());
         assert!(validate_config(&config(json!({ "allowed_action_ids": [] })), false).is_err());
-        assert!(validate_config(&config(json!({ "allowed_action_ids": ["not an id"] })), false).is_err());
-        assert!(validate_config(&config(json!({ "url": "https://evil.example.com/" })), false).is_err());
+        assert!(validate_config(
+            &config(json!({ "allowed_action_ids": ["not an id"] })),
+            false
+        )
+        .is_err());
+        assert!(validate_config(
+            &config(json!({ "url": "https://evil.example.com/" })),
+            false
+        )
+        .is_err());
         assert!(parse_config(&json!({ "url": "https://a.b/", "secret": "x" })).is_err());
         assert!(parse_config(&json!({
             "url": "https://worker.example.com/", "secret": "0123456789abcdef",
@@ -479,10 +559,16 @@ mod tests {
                 params: json!({ "taskId": "0x1", "digestHex": "ab" }),
             }
         );
-        assert_eq!(parse_directive(br#"{"noop":true,"reason":"too big"}"#, &allowed).unwrap(), Directive::Noop(Some("too big".into())));
+        assert_eq!(
+            parse_directive(br#"{"noop":true,"reason":"too big"}"#, &allowed).unwrap(),
+            Directive::Noop(Some("too big".into()))
+        );
         assert_eq!(
             parse_directive(br#"{"action_id":"task.deliver.v1"}"#, &allowed).unwrap(),
-            Directive::Act { action_id: "task.deliver.v1".into(), params: json!({}) }
+            Directive::Act {
+                action_id: "task.deliver.v1".into(),
+                params: json!({})
+            }
         );
 
         for bad in [
@@ -495,7 +581,10 @@ mod tests {
             b"",
         ] {
             assert!(
-                matches!(parse_directive(bad, &allowed), Err(BridgeError::Invalid { .. })),
+                matches!(
+                    parse_directive(bad, &allowed),
+                    Err(BridgeError::Invalid { .. })
+                ),
                 "{}",
                 String::from_utf8_lossy(bad)
             );

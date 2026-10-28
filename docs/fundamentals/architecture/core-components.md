@@ -12,7 +12,7 @@ sequenceDiagram
     participant Relayer as Relayer
     participant Social as Social API
     participant Contract as Memory Contract
-    participant File Storage as File Storage
+    participant R2 as Private Cloudflare R2
     participant DB as Relayer DB
 
     App->>SDK: remember / recall
@@ -21,7 +21,7 @@ sequenceDiagram
     Social-->>Relayer: account + agent + capabilities
     Relayer->>Contract: verify SubAgent + MemoryAccount
     Contract-->>Relayer: authorized
-    Relayer->>File Storage: store / fetch encrypted blob
+    Relayer->>R2: store / fetch encrypted blob
     Relayer->>DB: store / search vectors
     Relayer-->>SDK: result
     SDK-->>App: response
@@ -55,7 +55,7 @@ The relayer is the backend service that processes all SDK requests. It abstracts
 **Responsibilities:**
 - Verifies Ed25519 signatures and resolves sub-agents (cache → social API → on-chain)
 - Enforces capability bits (`CAP_MEMORY_READ` / `CAP_MEMORY_WRITE`) per route
-- Generates embeddings, MYDATA encrypt/decrypt (via sidecar), File Storage upload/download
+- Generates embeddings, MYDATA encrypt/decrypt (via sidecar), private R2 upload/download
 - Stores and searches vectors in PostgreSQL (pgvector)
 - Scopes operations to `owner + namespace`
 
@@ -81,16 +81,16 @@ The social indexer in **myso-core** indexes memory accounts and sub-agents. The 
 
 **Relayer env:** `SOCIAL_SERVER_URL` (default `http://127.0.0.1:9126`)
 
-## File Storage
+## Private Cloudflare R2
 
-Decentralized storage for encrypted memory payloads. Blob metadata includes `memory_namespace`, `memory_owner`, `memory_package_id`, and `memory_agent_id` (SubAgent object ID).
+The relayer stores encrypted memory payloads in its private Cloudflare R2 bucket. Object metadata includes the authenticated owner, agent, package, and visibility scope so the vector index can be rebuilt after database loss. The SDK sends encrypted bytes to the authenticated relayer; it does not upload to File Storage or require its client package.
 
 ## Relayer Database
 
 PostgreSQL + pgvector for the relayer only:
 
-- `vector_entries` — embeddings linked to File Storage blob IDs
+- `vector_entries` — embeddings linked to private R2 blob IDs
 - `sub_agent_cache` — auth cache (public key → account, agent, capabilities)
 - Rate limit / quota state (Redis + SQL)
 
-If the database is lost, [restore](/sdk/usage/memory) can rebuild vectors from File Storage.
+If the database is lost, [restore](/sdk/usage/memory) can rebuild vectors from private R2. Legacy File Storage blob IDs are not readable by this R2-only service.

@@ -1,12 +1,12 @@
-# Automation engine — setup tutorial
+# MySo Agents Automation Engine — deployment and integration
+
+> **Current MySo Agents authority model:** automation adds no MYSO spending cap or permission. Each unattended action is checked against the selected delegate's live on-chain capabilities, explicit action allowlist, and per-action MYSO limit. AI-credit calls use the live AI-credit authorization and balance. The legacy `max_mist_per_run` database column is retained for migration compatibility, is written as zero for new jobs, and is not authorization. Deployments must use the matching app, Memory/MCP, sidecar, Core and Automation revisions described in the [MySo Agents MVP runbook](../../myso-agents-app/docs/myso-agents-mvp-runbook.md).
+
+The historical sections below document the original standalone automation service and still contain legacy names and environment examples. Where they describe per-run spend limits, memory-only delegates, or a frozen development scope, this current authority and integration note takes precedence.
 
 > ## Testnet first
 >
-> This system is **ready for Railway integration testing and testnet use.** It is
-> **non-custodial**: the memory bridge holds no user agent key. An unattended job signs as a
-> *delegate* the owner registered on-chain: memory read/write only, a spend cap, an expiry,
-> revocable at any time. The delegate's key is encrypted in the owner's browser to the bridge's
-> public key and stored only as ciphertext.
+> The original standalone system's Railway readiness statement is historical and does not establish current MySo Agents deployment readiness. Current unattended task-market work uses an explicitly scoped `action_worker` delegate with a live action allowlist and on-chain per-action capabilities and spending limits. Keys remain in the client custody vault; the sidecar obtains short-lived, run-bound credentials and never receives an owner OAuth bearer.
 >
 > What that does and does not guarantee is in [§13](#13-security-limitations). Read it before
 > mainnet: the bridge can still act *as the delegate*, inside the limits the owner set.
@@ -42,8 +42,7 @@ Two facts shape everything below:
 | Owner-authenticated `/api/automation/*` proxy | `services/server/src/automation_proxy.rs` | ✅ tested |
 | Chat-app automation panel + client | `chat-app/src/**/automation*` | ✅ read-only by design |
 
-**Feature development on these three services is frozen** until the §12 integration test passes
-end to end on Railway. Fixes that unblock that test are in scope; new capabilities are not.
+The old three-service freeze is superseded by the ongoing MySo Agents integration. The authoritative source checklist, deployed configuration gates and owner-run acceptance sequence are in the MySo Agents implementation status and MVP runbook.
 
 > **One deliberate exception: the task market** (§14). `registered_action` and `webhook` jobs,
 > the `task` event family, the `task_worker` delegate class and the bridge's `/internal/chain/act`
@@ -262,7 +261,7 @@ This boots the real engine and the real bridge plus stub oracle and relayer, the
 - both reject a missing or wrong secret
 - the bridge refuses an unknown key ref with a **404** and never leaks key material
 - the engine refuses an unauthenticated job read/create and an unscoped listing
-- a run over `max_mist_per_run` is **skipped**, not executed, with the budget reason recorded
+- live AI-credit authority determines whether an AI action can proceed; no automation-specific spending cap is applied
 - an in-budget run reaches the bridge and is recorded **failed** with a reason rather than
   left `running`
 - a retry is recorded (`attempt=2`) when `retry_policy.max_attempts=2`
@@ -309,7 +308,6 @@ curl -s -X POST localhost:8010/v1/automation/jobs \
       "config": { "operation": "recall", "query": "what does the user prefer", "limit": 5 }
     },
     "memory_scope": "chat-app",
-    "max_mist_per_run": 1000,
     "retry_policy": { "max_attempts": 3, "jitter_ms": 1000 }
   }' | jq
 ```
@@ -347,7 +345,7 @@ would pollute later recall.
 |---|---|
 | `running` | In flight. Should always become terminal — a stuck `running` row is a bug. |
 | `succeeded` | Action completed. `cost_mist` is the reserved amount from preflight. |
-| `skipped` | Preflight refused, or the estimate exceeded `max_mist_per_run`. The reason is in `error`. |
+| `skipped` | Live provider or authorization preflight refused the run. The reason is in `error`. |
 | `failed` | The action failed after all retries. The reason is in `error`. |
 
 ### Trigger kinds
@@ -357,13 +355,36 @@ would pollute later recall.
   therefore waits for its next slot instead of re-running every tick; retries within a run are
   governed by `retry_policy`.
 - `cron` — `cron_expr`. Accepts 5-field (`min hour dom month dow`), 6-field, or the crate's
-  7-field form.
+  7-field form. Optional `timezone` is an IANA name such as `America/Chicago`; omitted values
+  use `UTC`. Cron expressions use local wall-clock time in that zone. A nonexistent spring-forward
+  time is skipped; an ambiguous fall-back time runs at both corresponding instants.
 - `event` — `event_family` + `event_type`, optionally narrowed by `organization_id`,
   `account_id`, `agent_object_id`, and a shallow `payload_filter`.
 - `conditional` — matched by evaluator only; not scheduled.
 
-`match_mode: "all"` with `evaluation_window_ms` requires every trigger to have matched inside
-the window.
+`match_mode: "all"` persists each matching event-trigger index by job across workers and process
+restarts. With a positive `evaluation_window_ms`, every event trigger must have matched inside the
+rolling window; a complete set fires once and clears its progress. Event keys are deduplicated, and
+editing a paused job's trigger configuration clears partial progress. Until schedule-trigger
+participation is defined, `ALL` sets may contain event triggers only; mixed cron/interval sets are
+rejected during validation.
+
+Intervals are elapsed-time schedules measured from the latest run start and use UTC epoch buckets
+for stable slot IDs. Newly created interval and cron jobs fire once immediately. After a scheduler
+downtime, cron slots are replayed oldest-first, one at a time; a renewable Postgres-backed global
+lease serializes scheduler scans and is revalidated while each slot is persisted. Each slot has a stable UTC instant
+as its idempotency key. A retry or uncertain delivery blocks later events for the same job until
+it becomes terminal or an owner reconciles it. This avoids overlapping actions while preserving
+missed scheduled work. Timezone changes apply to future evaluation; a saved delivery keeps its
+original UTC slot identity.
+
+The multi-job evaluation helper isolates failures: a trigger-state or cooldown lookup error for
+one job does not prevent later in-scope jobs from being evaluated, and the caller receives the
+aggregated errors. The durable worker dispatches one job per delivery. Errors proven to occur before `run_job` are
+requeued with exponential backoff and a five-attempt ceiling; exhausted safe failures enter
+reconciliation. Errors after `run_job` begins, lost leases, and ambiguous outcomes remain in
+reconciliation because their external effects may be uncertain. Migration
+`015_event_delivery_safe_retry.sql` adds the delayed availability timestamp.
 
 ---
 
@@ -417,7 +438,7 @@ the chat-app. That is the pairing working end to end.
 | `invalid_entry … must be a 32-byte Ed25519 seed` | The key is 33 bytes (flag-prefixed) or a 64-byte expanded key. Use the 32-byte seed as 64 hex digits. |
 | Jobs vanish after a restart | `DATABASE_URL` is unset, so the engine is using the in-memory store. The startup log warns about this. |
 | Run stuck in `running` | Should not happen: an oracle failure is now recorded as `failed`. If you see one, the process was killed mid-run. |
-| Run `skipped` with a budget reason | Working as intended — the preflight estimate exceeded `max_mist_per_run`. Raise the cap or set it to `0` to disable the cap. |
+| Run `skipped` during preflight | Review the live authorization, provider balance and recorded reason. Automations do not add a spending ceiling. |
 | `502 bridge unavailable: … GET /config returned 404` | The bridge reached the SDK but the relayer origin has no `/config`. Check `MEMORY_SERVER_URL` on the **bridge**, not the engine — the engine has no relayer URL on purpose. |
 | Chat-app shows "engine not configured" | `AUTOMATION_ENGINE_URL` is unset on the memory relayer. |
 | Chat-app shows "engine not reachable" but the engine is up | The relayer cannot reach the engine URL. From the relayer's host, `curl $AUTOMATION_ENGINE_URL/health`. |
@@ -464,19 +485,27 @@ Stated plainly so nothing here reads as more finished than it is:
   registry in `docs/event_registry.json` defines the vocabulary, but few services publish
   yet. The bridge can publish `memory.created` when `AUTOMATION_EVENTS_URL` is set; wiring
   `message.received` and the social families is future work.
-- **`automation_trigger_state`.** The table exists in the migration for per-trigger debounce,
-  cooldown, and windowed execution counts. `cooldown_ms` **is** enforced (an event inside the
+- **Trigger state.** The legacy `automation_trigger_state` table holds the planned per-trigger
+  debounce, cooldown, and windowed execution counters. Persistent `ALL` progress and event-key
+  deduplication use the new `automation_trigger_match_state` and
+  `automation_trigger_match_events` tables. `cooldown_ms` **is** enforced (an event inside the
   cooldown of the job's last run is ignored — set it on any event-triggered job whose action
-  writes memory, or a `memory.created` trigger will re-trigger itself). `debounce_window_ms`
-  and `max_executions_per_window` are parsed but not yet enforced.
+  writes memory, or a `memory.created` trigger will re-trigger itself). For matching `ANY` event
+  triggers, ingestion coalesces pending deliveries to the newest matching event and delays dispatch
+  until the quiet period expires; pending delivery state and its due time survive process restarts.
+  `ALL` trigger sets begin the quiet period when their complete matching set is first satisfied;
+  further matching events during that period update the pending event and restart the timer.
+  `max_executions_per_window` uses the configured debounce duration as
+  a rolling period, tracked in `automation_trigger_fires` (migration
+  `016_trigger_execution_rolling_window.sql`); migration `014_trigger_execution_count_bigint.sql`
+  preserves the full public cap range. A cap without a positive debounce interval is rejected.
+  Manual and scheduled runs bypass these event-trigger policies.
 
 ---
 
 ## 12. Deploying
 
-> **Status: ready for Railway integration testing, not for production.** See
-> §13 — centralized agent-key custody is a security limitation that must be resolved
-> before mainnet.
+> **Historical deployment notes:** these standalone Railway instructions do not establish readiness of the integrated MySo Agents stack. Follow the linked MySo Agents MVP runbook for the current service set, required configuration and owner validation gates.
 
 There are **three services** to stand up, plus one variable in the chat-app:
 
@@ -557,8 +586,11 @@ MYDATA_DECRYPT_THRESHOLD=2
 MEMORY_PACKAGE_ID=0x...
 MEMORY_REGISTRY_ID=0x...
 PLATFORM_OBJECT_ID=0x...
-FILE_STORAGE_PUBLISHER_URL=...
-FILE_STORAGE_AGGREGATOR_URL=...
+# Private task-artifact and encrypted-memory bucket; storage is operator-paid R2, not WAL.
+R2_BUCKET=<private-bucket-name>
+R2_ENDPOINT=https://<cloudflare-account-id>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID=...
+R2_SECRET_ACCESS_KEY=...
 SERVER_MYSO_PRIVATE_KEYS=...
 AI_CREDIT_ORACLE_URL=...
 AI_CREDIT_ORACLE_API_SECRET=...
@@ -858,9 +890,8 @@ accurate; it is now the authorization, not just metadata.
 
 ### 13.3 Smaller items already recorded
 
-§11 lists the unimplemented pieces (a create-job UI, event
-producers, `automation_trigger_state` enforcement). They are scope gaps rather than security
-issues, but they are gaps.
+§11 lists the unimplemented pieces (event producers and schedule recovery/overlap behavior). They are scope gaps
+rather than security issues, but they are gaps.
 
 
 ---
@@ -901,7 +932,7 @@ deadline passing.
       "sellerAgentId": "{{event.payload.seller_agent_id}}",
       "termsDigestHex": "{{event.payload.terms_digest}}"
     },
-    "policy": { "max_amount_mist": "5000000000", "min_buyer_score_milli": 3000 }
+    "policy": { "min_buyer_score_milli": 3000 }
   }
 }
 ```
@@ -909,10 +940,12 @@ deadline passing.
 - Params are templated from the event. A whole-value template that resolves to `null` leaves the
   param out (a person buying directly has no `buyer_agent_id`); a path the event never had is an
   error in the job, not a blank.
-- `policy` fields are all optional and fail closed: a field that is set but missing from the event
-  skips the run. Supported: `min_amount_mist`, `max_amount_mist`, `min_delivery_window_ms`,
+- `policy` fields are optional workflow filters and fail closed: a field that is set but missing
+  from the event skips the run. Supported: `min_amount_mist`, `min_delivery_window_ms`,
   `max_open_tasks`, `min_buyer_score_milli`, `min_buyer_credibility_bps`, `min_seller_score_milli`,
   `min_seller_credibility_bps`, `allowed_buyer_principals`, `scope_digest_allowlist`.
+- Legacy `max_amount_mist` values are accepted when old jobs are read but ignored. They cannot
+  impose an off-chain MYSO ceiling; the action is checked against its live on-chain per-action cap.
 - A run that fails its policy, arrives after its deadline, or finds the chain state has moved on
   (the bridge answers 409) is recorded as **skipped** with the reason, never failed, and does not
   notify the owner's inbox.
@@ -971,7 +1004,7 @@ this engine so no case waits on a human. This is the second declared exception t
 - the proxy and bridge mapping from delegate class to allowed actions and event family;
 - the relayer's 409 classification for jury and governance races, and registry 1.5.0.
 
-Nothing else is unfrozen. A `juror` delegate is **zero-spend** and expires within 90 days; the
+The original feature-freeze statement is superseded. A `juror` delegate is **zero-spend** and expires within 90 days; the
 bridge checks both and re-verifies the delegate on-chain before each signature. The cranks are
 permissionless on chain and need no capability, so they run on the operator's own wallet rather
 than a delegate. Jury jobs use an empty `ActionPolicy`: the delegate's class and action list, or

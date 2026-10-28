@@ -78,6 +78,14 @@ export interface SidecarConfig {
     allowStaticKeys: boolean;
     /** Automation engine origin, where encrypted delegate keys are stored. */
     engineUrl?: string;
+    /** Hosted MCP endpoint proxied for a run worker; the MyData session stays in this process. */
+    workMcpUrl?: string;
+    /** Messaging relayer origin used for consented action-worker room reads. */
+    messagingRelayerUrl?: string;
+    /** Private app callback used to dispatch one durable run turn. */
+    workDispatchUrl?: string;
+    /** Secret shared only with the MySo Agents app callback. */
+    workDispatchSecret?: string;
     /** `id:base64url` MyData private key. Present means delegates are enabled. */
     myDataPrivateKeys?: string;
     /**
@@ -185,6 +193,42 @@ export function loadConfig(
     const myDataPrivateKeys = readString(env, "AUTOMATION_MYDATA_PRIVATE_KEYS");
     const eventsUrl = readString(env, "AUTOMATION_EVENTS_URL");
     const engineUrl = readString(env, "AUTOMATION_ENGINE_URL") ?? eventsUrl;
+    const workMcpUrl = readString(env, "AUTOMATION_WORK_MCP_URL");
+    if (workMcpUrl) {
+        let parsed: URL;
+        try { parsed = new URL(workMcpUrl); }
+        catch { throw new Error("AUTOMATION_WORK_MCP_URL must be a valid MCP URL"); }
+        if (parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname.replace(/\/$/, "") !== "/mcp"
+            || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)))) {
+            throw new Error("AUTOMATION_WORK_MCP_URL must be a credential-free /mcp HTTPS URL (HTTP is allowed only on loopback)");
+        }
+    }
+    const messagingRelayerUrl = readString(env, "MCP_MESSAGING_RELAYER_URL");
+    if (messagingRelayerUrl) {
+        let parsed: URL;
+        try { parsed = new URL(messagingRelayerUrl); }
+        catch { throw new Error("MCP_MESSAGING_RELAYER_URL must be a valid URL"); }
+        if (parsed.username || parsed.password || parsed.search || parsed.hash
+            || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)))) {
+            throw new Error("MCP_MESSAGING_RELAYER_URL must be a credential-free HTTPS URL (HTTP is allowed only on loopback)");
+        }
+    }
+    const workDispatchUrl = readString(env, "AUTOMATION_WORK_DISPATCH_URL");
+    const workDispatchSecret = readString(env, "AUTOMATION_WORK_DISPATCH_SECRET");
+    if (workDispatchUrl) {
+        let parsed: URL;
+        try { parsed = new URL(workDispatchUrl); }
+        catch { throw new Error("AUTOMATION_WORK_DISPATCH_URL must be a valid app origin"); }
+        if (parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/"
+            || (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)))) {
+            throw new Error("AUTOMATION_WORK_DISPATCH_URL must be a credential-free HTTPS app origin (HTTP is allowed only on loopback)");
+        }
+        if (!workDispatchSecret || workDispatchSecret.length < 32 || /[\r\n]/.test(workDispatchSecret)) {
+            throw new Error("AUTOMATION_WORK_DISPATCH_SECRET must be a high-entropy shared secret of at least 32 characters");
+        }
+    } else if (workDispatchSecret) {
+        throw new Error("AUTOMATION_WORK_DISPATCH_SECRET requires AUTOMATION_WORK_DISPATCH_URL");
+    }
     const rawInlineKeys = readString(env, "AUTOMATION_AGENT_KEYS_JSON");
     const explicitKeysFile = readString(env, "AUTOMATION_AGENT_KEYS_FILE");
 
@@ -199,10 +243,11 @@ export function loadConfig(
                     "jobs use encrypted delegate keys the account owner registers instead.",
             );
         }
-        if (!myDataPrivateKeys || !engineUrl || !readString(env, "MEMORY_SERVER_URL")) {
+        if (!myDataPrivateKeys || !engineUrl || !readString(env, "MEMORY_SERVER_URL") || !workMcpUrl) {
             throw new Error(
                 "Refusing to start: production needs AUTOMATION_MYDATA_PRIVATE_KEYS, " +
-                    "AUTOMATION_ENGINE_URL and MEMORY_SERVER_URL to resolve delegate keys.",
+                    "AUTOMATION_ENGINE_URL and MEMORY_SERVER_URL to resolve delegate keys, " +
+                    "and AUTOMATION_WORK_MCP_URL to proxy scoped unattended harness calls.",
             );
         }
     }
@@ -243,6 +288,10 @@ export function loadConfig(
         agentKeysJson,
         allowStaticKeys: !production,
         engineUrl,
+        workMcpUrl,
+        messagingRelayerUrl,
+        workDispatchUrl,
+        workDispatchSecret,
         myDataPrivateKeys,
         crankSigner: readCrankSigner(env),
     };

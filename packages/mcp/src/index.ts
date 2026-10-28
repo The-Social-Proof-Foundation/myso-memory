@@ -20,6 +20,13 @@ export {
 export { createMemoryMcpServer } from "./server.js";
 export { createHostedMcpHttpServer, type HostedMcpOptions } from "./hosted.js";
 export {
+    createConfiguredHostedServer,
+    createHostedDependencies,
+    loadHostedMcpConfig,
+    startHostedMcpServer,
+    type HostedMcpEnvConfig,
+} from "./hosted-runtime.js";
+export {
     authenticateHostedRequest,
     OAuthIntrospectionVerifier,
     type HostedMcpPrincipal,
@@ -28,6 +35,8 @@ export {
 export {
     SponsoredSocialGateway,
     type SocialGateway,
+    type WorkJournalClient,
+    type MyDataContentClient,
     type SponsoredSocialGatewayOptions,
 } from "./social-gateway.js";
 export {
@@ -54,8 +63,10 @@ export {
     type AgentSignerProvisioner,
     type ProvisionedAgentSigner,
 } from "./provisioning.js";
+export { McpRoomMessagingClient } from "./room-messaging.js";
 export {
     createToolCatalog,
+    connectionToolCatalog,
     executeTool,
     type MemoryClient,
     type ToolDependencies,

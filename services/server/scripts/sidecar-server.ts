@@ -1,13 +1,13 @@
 /**
- * MYDATA + File Storage HTTP Sidecar Server
+ * MYDATA HTTP Sidecar Server
  *
- * Long-lived Express server that wraps MYDATA encrypt/decrypt and File Storage upload.
+ * Long-lived Express server that wraps MYDATA encrypt/decrypt. Encrypted blobs
+ * are stored and restored through Cloudflare R2 in the Rust service.
  * Started once at server boot — eliminates ~1-2s Node.js cold-start per call.
  *
  * Endpoints:
  *   POST /mydata/encrypt   → { data, owner, packageId } → { encryptedData }
  *   POST /mydata/decrypt   → { data, packageId, accountId } (+ session headers) → { decryptedData }
- *   POST /file-storage/upload  → { data, privateKey, owner, epochs } → { blobId, objectId }
  *   GET  /health         → { status: "ok" }
  */
 
@@ -19,7 +19,7 @@ import { decodeMySoPrivateKey } from "@socialproof/myso/cryptography";
 import { Transaction } from "@socialproof/myso/transactions";
 import { MyDataClient, SessionKey, EncryptedObject } from "@socialproof/mydata";
 import { resolveKeyServers } from "./mydata-key-servers.js";
-import { FileStorageClient } from "@socialproof/file-storage";
+import { checkListingAccess, decryptListing, ListingAccessError } from "./mydata-listing.js";
 import { addApproveKeyPolicyCall, describeKeyMismatch, type OrgDecryptContext } from "./mydata-policy.js";
 
 // ============================================================
@@ -30,13 +30,13 @@ import { addApproveKeyPolicyCall, describeKeyMismatch, type OrgDecryptContext } 
 // ============================================================
 
 const MYSO_NETWORK_RAW = process.env.MYSO_NETWORK || "mainnet";
-// File Storage SDK only accepts mainnet|testnet; map devnet/localnet to testnet.
-const FILE_STORAGE_NETWORK: "mainnet" | "testnet" =
+// The MySo SDK client accepts mainnet|testnet; map devnet/localnet to testnet.
+const CLIENT_NETWORK: "mainnet" | "testnet" =
     MYSO_NETWORK_RAW === "mainnet" ? "mainnet" : "testnet";
 
 const MYSO_RPC_URL =
     process.env.MYSO_RPC_URL ||
-    getJsonRpcFullnodeUrl(FILE_STORAGE_NETWORK);
+    getJsonRpcFullnodeUrl(CLIENT_NETWORK);
 const ALLOW_LEGACY_SOCIAL_KEY_FORWARDING =
     /^(1|true)$/i.test(process.env.ALLOW_LEGACY_SOCIAL_KEY_FORWARDING || "");
 const ALLOW_LEGACY_DELEGATE_KEY_FORWARDING =
@@ -44,7 +44,7 @@ const ALLOW_LEGACY_DELEGATE_KEY_FORWARDING =
 
 const mysoClient = new MySoJsonRpcClient({
     url: MYSO_RPC_URL,
-    network: FILE_STORAGE_NETWORK,
+    network: CLIENT_NETWORK,
 });
 
 // MYDATA key server object IDs (comma-separated via env var). Duplicates are
@@ -64,7 +64,7 @@ if (MYDATA_KEY_SERVERS.length === 0) {
 
 const MYDATA_THRESHOLD = parseInt(process.env.MYDATA_THRESHOLD || "2", 10);
 
-// Server MySo Private Keys for File Storage uploads
+// Optional MySo keys for local gas sponsorship
 const SERVER_MYSO_PRIVATE_KEYS = (process.env.SERVER_MYSO_PRIVATE_KEYS || "")
     .split(",")
     .map((s) => s.trim())
@@ -75,23 +75,8 @@ if (SERVER_MYSO_PRIVATE_KEYS.length === 0 && process.env.SERVER_MYSO_PRIVATE_KEY
 }
 
 if (SERVER_MYSO_PRIVATE_KEYS.length === 0) {
-    console.error("[sidecar] WARNING: SERVER_MYSO_PRIVATE_KEYS env var is empty — File Storage uploads will fail");
+    console.warn("[sidecar] no local sponsor keys are configured");
 }
-
-// File Storage package ID (for on-chain Move calls: metadata, blob type queries)
-const FILE_STORAGE_PACKAGE_ID = process.env.FILE_STORAGE_PACKAGE_ID || (
-    FILE_STORAGE_NETWORK === "testnet"
-        ? "0xd84704c17fc870b8764832c535aa6b11f21a95cd6f5bb38a9b07d2cf42220c66"
-        : "0xfdc88f7d7cf30afab2f82e8380d11ee8f70efb90e863d1de8616fae1bb09ea77"
-);
-
-const FILE_STORAGE_UPLOAD_RELAY_URL = process.env.FILE_STORAGE_UPLOAD_RELAY_URL || (
-    FILE_STORAGE_NETWORK === "testnet"
-        ? "https://upload-relay.testnet.mysocial.network"
-        : "https://upload-relay.mainnet.mysocial.network"
-);
-
-const DEFAULT_FILE_STORAGE_EPOCHS = FILE_STORAGE_NETWORK === "testnet" ? 50 : 3;
 
 /**
  * MYDATA client, built lazily so a stale `MYDATA_KEY_SERVERS` pin (a regenesised localnet)
@@ -150,59 +135,7 @@ function getMydataClient(): Promise<MyDataClient> {
 }
 
 
-const fileStorageClient = new FileStorageClient({
-    network: FILE_STORAGE_NETWORK,
-    mysoClient: mysoClient as any,
-    uploadRelay: {
-        host: FILE_STORAGE_UPLOAD_RELAY_URL,
-        sendTip: { max: 10_000_000 },
-    },
-});
-
 const MYSO_CLOCK = "0x0000000000000000000000000000000000000000000000000000000000000006";
-
-const COIN_WITH_BALANCE_INTENT = "CoinWithBalance";
-const GAS_INTENT_TYPE = "gas";
-const MYSO_TYPE = "0x2::myso::MYSO";
-type TxIntentCommand = {
-    $kind?: string;
-    $Intent?: {
-        name?: string;
-        data?: { type?: string };
-    };
-};
-type TxDataWithCommands = { commands: TxIntentCommand[] };
-type UploadRelayTipConfigResponse = {
-    send_tip?: {
-        address?: string;
-    };
-};
-
-/**
- * Rewrite CoinWithBalance "gas" intents to explicit MYSO coin type so Enoki
- * sponsorship can build the transaction (Enoki rejects GasCoin tx arguments).
- */
-function patchGasCoinIntents(tx: Transaction): void {
-    tx.addSerializationPlugin(async (transactionData: TxDataWithCommands, _buildOptions, next) => {
-        let patched = 0;
-        for (const command of transactionData.commands) {
-            if (
-                command.$kind === "$Intent" &&
-                command.$Intent?.name === COIN_WITH_BALANCE_INTENT &&
-                command.$Intent?.data?.type === GAS_INTENT_TYPE
-            ) {
-                command.$Intent.data.type = MYSO_TYPE;
-                patched += 1;
-            }
-        }
-
-        if (patched > 0) {
-            console.log(`[patch] converted ${patched} CoinWithBalance intent(s) from GasCoin -> sender MYSO coins`);
-        }
-
-        await next();
-    });
-}
 
 const ENOKI_API_BASE_URL = "https://api.enoki.mystenlabs.com/v1";
 const enokiApiKey = process.env.ENOKI_API_KEY;
@@ -221,7 +154,7 @@ const LOCAL_SPONSOR_GAS_BUDGET = process.env.LOCAL_SPONSOR_GAS_BUDGET || "100000
 const LOCAL_SPONSOR_TTL_MS = 5 * 60 * 1000;
 
 type EnokiDataWrapper<T> = { data: T };
-type EnokiSponsorResponse = { bytes: string; digest: string };
+type EnokiSponsorResponse = { bytes: string; digest: string; gasBudgetMist?: string };
 type EnokiExecuteResponse = { digest: string };
 type LocalSponsoredTransaction = {
     bytes: string;
@@ -230,40 +163,6 @@ type LocalSponsoredTransaction = {
 };
 const localSponsoredTransactions = new Map<string, LocalSponsoredTransaction>();
 let localSponsorKeyIndex = 0;
-const signerUploadQueues = new Map<string, Promise<void>>();
-let uploadRelayTipAddressCache: string | null | undefined = undefined;
-
-function dedupeAddresses(addresses: (string | null | undefined)[]): string[] {
-    return [...new Set(addresses.filter((addr): addr is string => typeof addr === "string" && addr.length > 0))];
-}
-
-async function getUploadRelayTipAddress(): Promise<string | null> {
-    if (uploadRelayTipAddressCache !== undefined) {
-        return uploadRelayTipAddressCache;
-    }
-
-    try {
-        const resp = await fetch(`${FILE_STORAGE_UPLOAD_RELAY_URL}/v1/tip-config`);
-        if (!resp.ok) {
-            throw new Error(`tip-config request failed (${resp.status})`);
-        }
-
-        const json = await resp.json() as UploadRelayTipConfigResponse;
-        const address = json.send_tip?.address;
-        if (typeof address === "string" && address.startsWith("0x")) {
-            uploadRelayTipAddressCache = address;
-            return address;
-        }
-
-        uploadRelayTipAddressCache = null;
-        return null;
-    } catch (err: any) {
-        console.warn(`[upload-relay] could not load tip-config: ${err.message || err}`);
-        // Don't cache transient failures; retry on next request.
-        return null;
-    }
-}
-
 async function callEnoki<T>(path: string, payload: unknown): Promise<T> {
     if (!enokiApiKey) {
         throw new Error("ENOKI_API_KEY is not configured");
@@ -296,6 +195,7 @@ function pruneLocalSponsoredTransactions(now = Date.now()): void {
 async function createLocalSponsoredTransaction(
     transactionBlockKindBytes: string,
     sender: string,
+    gasBudgetMist?: string,
 ): Promise<EnokiSponsorResponse> {
     if (!LOCAL_SPONSOR_ENABLED || SERVER_MYSO_PRIVATE_KEYS.length === 0) {
         throw new Error("Local sponsorship is not configured");
@@ -320,7 +220,8 @@ async function createLocalSponsoredTransaction(
         throw new Error("transaction sender does not match the sponsorship request");
     }
     tx.setGasOwner(sponsor.toMySoAddress());
-    tx.setGasBudgetIfNotSet(LOCAL_SPONSOR_GAS_BUDGET);
+    if (gasBudgetMist !== undefined) tx.setGasBudget(BigInt(gasBudgetMist));
+    else tx.setGasBudgetIfNotSet(LOCAL_SPONSOR_GAS_BUDGET);
     const bytes = await tx.build({ client: mysoClient as any });
     const digest = await tx.getDigest({ client: mysoClient as any });
     const sponsorSignature = (await sponsor.signTransaction(bytes)).signature;
@@ -330,7 +231,17 @@ async function createLocalSponsoredTransaction(
         sponsorSignature,
         expiresAtMs: Date.now() + LOCAL_SPONSOR_TTL_MS,
     });
-    return { bytes: encodedBytes, digest };
+    return { bytes: encodedBytes, digest, gasBudgetMist: tx.getData().gasData.budget?.toString() };
+}
+
+function signedGasBudgetMist(bytesBase64: string): string {
+    const bytes = Buffer.from(bytesBase64, "base64");
+    if (bytes.length < 10 || bytes.length > 128 * 1024) throw new Error("sponsored transaction bytes are outside the allowed size");
+    const tx = Transaction.from(new Uint8Array(bytes));
+    const budget = tx.getData().gasData.budget;
+    if (budget === undefined || budget === null || (typeof budget === "number" && !Number.isSafeInteger(budget))) throw new Error("sponsor returned a transaction without a precisely represented signed gas budget");
+    if (BigInt(budget) <= 0n) throw new Error("sponsor returned a transaction without a valid signed gas budget");
+    return BigInt(budget).toString();
 }
 
 async function executeLocalSponsoredTransaction(
@@ -353,94 +264,18 @@ async function executeLocalSponsoredTransaction(
     return { digest: executed.digest };
 }
 
-async function executeWithEnokiSponsor(tx: Transaction, signer: Ed25519Keypair, allowedAddresses?: string[]): Promise<string> {
-    if (!enokiApiKey) {
-        const direct = await mysoClient.signAndExecuteTransaction({
-            signer,
-            transaction: tx,
-        });
-        return direct.digest;
-    }
-
-    try {
-        const txKindBytes = await tx.build({
-            client: mysoClient as any,
-            onlyTransactionKind: true,
-        });
-
-        const sponsored = await callEnoki<EnokiSponsorResponse>("/transaction-blocks/sponsor", {
-            network: enokiNetwork,
-            transactionBlockKindBytes: Buffer.from(txKindBytes).toString("base64"),
-            sender: signer.toMySoAddress(),
-            ...(allowedAddresses?.length ? { allowedAddresses } : {}),
-        });
-
-        const signature = await signer.signTransaction(
-            new Uint8Array(Buffer.from(sponsored.bytes, "base64"))
-        );
-
-        // LOW-15: Defense-in-depth — encode digest before path interpolation.
-        const encodedSponsoredDigest = encodeURIComponent(sponsored.digest);
-        const executed = await callEnoki<EnokiExecuteResponse>(
-            `/transaction-blocks/sponsor/${encodedSponsoredDigest}`,
-            {
-                digest: sponsored.digest,
-                signature: signature.signature,
-            }
-        );
-
-        return executed.digest;
-    } catch (err: any) {
-        const errMsg = err?.message || String(err);
-        if (!ENOKI_FALLBACK_TO_DIRECT_SIGN) {
-            console.error(`[enoki-sponsor] sponsor failed and fallback disabled: ${errMsg}`);
-            throw err;
-        }
-
-        console.warn(`[enoki-sponsor] sponsor failed, falling back to direct signing: ${errMsg}`);
-        const direct = await mysoClient.signAndExecuteTransaction({
-            signer,
-            transaction: tx,
-        });
-        return direct.digest;
-    }
-}
-
-/**
- * Queue tasks by signer to avoid coin-object lock conflicts when multiple
- * File Storage uploads are triggered concurrently for the same signing key.
- */
-async function runExclusiveBySigner<T>(signerAddress: string, task: () => Promise<T>): Promise<T> {
-    const previous = signerUploadQueues.get(signerAddress) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-        release = resolve;
-    });
-    const queued = previous.then(() => current);
-    signerUploadQueues.set(signerAddress, queued);
-
-    await previous;
-    try {
-        return await task();
-    } finally {
-        release();
-        // Cleanup queue map entry once this task is done and no newer task replaced it.
-        if (signerUploadQueues.get(signerAddress) === queued) {
-            signerUploadQueues.delete(signerAddress);
-        }
-    }
-}
-
 // ============================================================
 // Express app
 // ============================================================
 
 const app = express();
-// HIGH-13: Use a conservative global default — routes that need more bytes
-// (e.g. /file-storage/upload, /mydata/decrypt-batch) apply their own per-route
-// json() middleware that overrides this default.
+// HIGH-13: Use a conservative global default; MYDATA decrypt-batch has a
+// route-specific JSON size limit.
 // Global floor: 256 KiB is enough for every metadata-only JSON body
-// (mydata/encrypt, mydata/decrypt, file-storage/query-blobs, sponsor, sponsor/execute).
+// (mydata/encrypt, mydata/decrypt, sponsor, sponsor/execute).
+// On-chain listing ciphertext may be 256 KiB before base64 encoding.
+app.use("/mydata/decrypt-listing", express.json({ limit: "512kb" }));
+app.use("/mydata/check-listing-access", express.json({ limit: "512kb" }));
 app.use(express.json({ limit: "256kb" }));
 
 // CORS — sidecar is called only by the co-located Rust server, never by browsers.
@@ -611,6 +446,51 @@ function resolveOrgDecryptContext(body: {
 }
 
 // ============================================================
+// Named MyData listing path: session-only, fixed policy, no request-shared key cache.
+app.post("/mydata/decrypt-listing", async (req, res) => {
+    let plaintext: Uint8Array | undefined;
+    try {
+        plaintext = await decryptListing(req.body, req.headers["x-mydata-session"], {
+            packageId: process.env.MEMORY_PACKAGE_ID || "", memoryConfigId: process.env.MEMORY_CONFIG_ID || "",
+            blockListId: process.env.BLOCK_LIST_REGISTRY_ID || "", mysoClient: mysoClient as any,
+            createClient: async () => {
+                await getMydataClient(); // Public discovery only; never use its derived-key cache here.
+                const keyServerIds = [...activeKeyServerIds];
+                return { keyServerIds, client: new MyDataClient({ mysoClient: mysoClient as any,
+                    serverConfigs: keyServerIds.map(objectId => ({ objectId, weight: 1 })), verifyKeyServers: true }) };
+            },
+        });
+        res.setHeader("Cache-Control", "no-store");
+        return res.json({ decryptedData: Buffer.from(plaintext).toString("base64") });
+    } catch (error) {
+        // Do not log SDK exceptions: they can carry session/ciphertext/provider details.
+        return res.status(error instanceof ListingAccessError ? error.status : 403)
+            .json({ error: error instanceof ListingAccessError ? error.message : "Listing access or decryption could not be authorized" });
+    } finally { plaintext?.fill(0); }
+});
+
+// Check current key-server policy without constructing or returning plaintext.
+app.post("/mydata/check-listing-access", async (req, res) => {
+    try {
+        await checkListingAccess(req.body, req.headers["x-mydata-session"], {
+            packageId: process.env.MEMORY_PACKAGE_ID || "", memoryConfigId: process.env.MEMORY_CONFIG_ID || "",
+            blockListId: process.env.BLOCK_LIST_REGISTRY_ID || "", mysoClient: mysoClient as any,
+            createClient: async () => {
+                await getMydataClient(); // Public discovery only; never use its derived-key cache here.
+                const keyServerIds = [...activeKeyServerIds];
+                return { keyServerIds, client: new MyDataClient({ mysoClient: mysoClient as any,
+                    serverConfigs: keyServerIds.map(objectId => ({ objectId, weight: 1 })), verifyKeyServers: true }) };
+            },
+        });
+        res.setHeader("Cache-Control", "no-store");
+        return res.json({ authorized: true, source: "current_key_server_policy" });
+    } catch (error) {
+        // Never log SDK exceptions: they can contain session/ciphertext/provider data.
+        return res.status(error instanceof ListingAccessError ? error.status : 503)
+            .json({ error: error instanceof ListingAccessError ? error.message : "Current MyData access could not be authorized" });
+    }
+});
+
 // POST /mydata/decrypt
 // ============================================================
 app.post("/mydata/decrypt", async (req, res) => {
@@ -811,375 +691,6 @@ app.post("/mydata/decrypt-batch", express.json({ limit: "8mb" }), async (req, re
     }
 });
 
-// ============================================================
-// POST /file-storage/upload
-// ============================================================
-// HIGH-13: /file-storage/upload receives a base64-encoded MYDATA ciphertext which can
-// be up to ~87 KiB per 64 KiB plaintext (MYDATA overhead + base64 ≈ 1.37×).
-// The 10 MB ceiling matches the sidecar's original global File Storage limit and is
-// well above any realistic single-memory upload size.
-app.post("/file-storage/upload", express.json({ limit: "10mb" }), async (req, res) => {
-    try {
-        const {
-            data,
-            keyIndex,
-            owner,
-            namespace,
-            packageId,
-            agentId,
-            epochs: rawEpochs = DEFAULT_FILE_STORAGE_EPOCHS,
-        } = req.body;
-        // LOW-17: Cap epochs at 5 to prevent accidental large storage purchases
-        const epochs = Math.min(Number(rawEpochs) || DEFAULT_FILE_STORAGE_EPOCHS, 5);
-
-        if (!data || keyIndex === undefined) {
-            return res.status(400).json({ error: "Missing required fields: data, keyIndex" });
-        }
-
-        const privateKey = SERVER_MYSO_PRIVATE_KEYS[keyIndex];
-        if (!privateKey) {
-            return res.status(400).json({ error: `Invalid keyIndex: ${keyIndex}` });
-        }
-
-        // LOW-16: Validate packageId resembles a MySo address to prevent injection
-        if (packageId && !/^0x[0-9a-fA-F]{1,64}$/.test(packageId)) {
-            return res.status(400).json({ error: "Invalid packageId format" });
-        }
-
-        // MED-11: Validate owner address format
-        if (owner && !/^0x[0-9a-fA-F]{64}$/.test(owner)) {
-            return res.status(400).json({ error: "Invalid owner address format" });
-        }
-
-        // Decode signer
-        const { secretKey } = decodeMySoPrivateKey(privateKey);
-        const signer = Ed25519Keypair.fromSecretKey(secretKey);
-
-        const signerAddress = signer.toMySoAddress();
-        const blob = await runExclusiveBySigner(signerAddress, async () => {
-            const blobData = new Uint8Array(Buffer.from(data, "base64"));
-
-            // writeBlobFlow (stateful: encode → register → upload → certify)
-            const flow = fileStorageClient.writeBlobFlow({ blob: blobData });
-            await flow.encode();
-
-            const registerTx = flow.register({
-                epochs,
-                // Server owns the blob initially (needed for certify step)
-                owner: signerAddress,
-                deletable: true,
-                // Store namespace + owner as on-chain metadata (queryable for restore)
-                attributes: {
-                    ...(namespace ? { memory_namespace: namespace } : {}),
-                    ...(owner ? { memory_owner: owner } : {}),
-                    ...(packageId ? { memory_package_id: packageId } : {}),
-                },
-            });
-
-            // Patch: convert GasCoin intents → sender's MYSO coins.
-            // Enoki rejects GasCoin as tx argument, but relay requires the tip.
-            // After patching, signer pays tip from own MYSO; Enoki sponsors gas.
-            patchGasCoinIntents(registerTx);
-            const tipRecipient = await getUploadRelayTipAddress();
-            const registerAllowedAddresses = dedupeAddresses([signerAddress, tipRecipient]);
-            const registerDigest = await executeWithEnokiSponsor(registerTx, signer, registerAllowedAddresses);
-            await mysoClient.waitForTransaction({ digest: registerDigest });
-
-            await flow.upload({ digest: registerDigest });
-
-            const certifyTx = flow.certify();
-            // Wait until certify tx is confirmed before returning this upload.
-            const certifyDigest = await executeWithEnokiSponsor(certifyTx, signer);
-            await mysoClient.waitForTransaction({ digest: certifyDigest });
-
-            return flow.getBlob();
-        });
-
-        // Extract objectId — handle both { id: "0x..." } and { id: { id: "0x..." } }
-        let blobObjectId: string | null = null;
-        const rawId = (blob.blobObject as any)?.id;
-        if (typeof rawId === 'string') {
-            blobObjectId = rawId;
-        } else if (rawId && typeof rawId === 'object' && typeof rawId.id === 'string') {
-            blobObjectId = rawId.id;
-        }
-
-        // File Storage package for on-chain Move calls (from env-driven FILE_STORAGE_PACKAGE_ID)
-        const FILE_STORAGE_PKG = FILE_STORAGE_PACKAGE_ID;
-
-        // Set on-chain metadata + transfer blob to user in a single transaction
-        if (owner && owner !== signerAddress && blobObjectId) {
-            try {
-                const metaTx = new Transaction();
-                const blobArg = metaTx.object(blobObjectId);
-
-                // Set memory_namespace metadata on-chain
-                metaTx.moveCall({
-                    target: `${FILE_STORAGE_PKG}::blob::insert_or_update_metadata_pair`,
-                    arguments: [
-                        blobArg,
-                        metaTx.pure.string("memory_namespace"),
-                        metaTx.pure.string(namespace || "default"),
-                    ],
-                    typeArguments: [],
-                });
-
-                // Set memory_owner
-                metaTx.moveCall({
-                    target: `${FILE_STORAGE_PKG}::blob::insert_or_update_metadata_pair`,
-                    arguments: [
-                        blobArg,
-                        metaTx.pure.string("memory_owner"),
-                        metaTx.pure.string(owner),
-                    ],
-                    typeArguments: [],
-                });
-
-                // Set memory_package_id
-                if (packageId) {
-                    metaTx.moveCall({
-                        target: `${FILE_STORAGE_PKG}::blob::insert_or_update_metadata_pair`,
-                        arguments: [
-                            blobArg,
-                            metaTx.pure.string("memory_package_id"),
-                            metaTx.pure.string(packageId),
-                        ],
-                        typeArguments: [],
-                    });
-                }
-
-                // Set memory_agent_id
-                if (agentId) {
-                    metaTx.moveCall({
-                        target: `${FILE_STORAGE_PKG}::blob::insert_or_update_metadata_pair`,
-                        arguments: [
-                            blobArg,
-                            metaTx.pure.string("memory_agent_id"),
-                            metaTx.pure.string(agentId),
-                        ],
-                        typeArguments: [],
-                    });
-                }
-
-                // Transfer blob to user
-                metaTx.transferObjects([blobArg], owner);
-
-                const metaDigest = await executeWithEnokiSponsor(metaTx, signer, dedupeAddresses([signerAddress, owner]));
-                await mysoClient.waitForTransaction({ digest: metaDigest });
-                console.log(`[file-storage/upload] metadata set + transferred blob ${blobObjectId} to owner (ns=${namespace})`);
-            } catch (metaErr: any) {
-                // LOW-14: Previously the metadata-set + transfer failure was swallowed
-                // and /file-storage/upload returned 200 with the blob_id, leaving the blob
-                // owned by the server wallet and the client unable to observe the
-                // failure. We still can't delete the blob from File Storage (no delete
-                // primitive after certify), so at minimum we log loudly AND return
-                // 500 so the caller can react (retry / mark stored-but-not-owned).
-                console.error(
-                    `[file-storage/upload] metadata+transfer FAILED for blob_object=${blobObjectId} ` +
-                    `ns=${namespace || "default"}: ${metaErr?.message || metaErr}`
-                );
-                return res.status(500).json({
-                    error: "Blob uploaded but metadata/transfer to owner failed",
-                    blobId: blob.blobId,
-                    objectId: blobObjectId,
-                    transferStatus: "failed",
-                });
-            }
-        }
-
-        res.json({
-            blobId: blob.blobId,
-            objectId: blobObjectId,
-            transferStatus: "ok",
-        });
-    } catch (err: any) {
-        const traceId = randomUUID();
-        console.error(`[file-storage/upload] [${traceId}] error:`, err);
-        res.status(500).json({ error: "Internal server error", traceId });
-    }
-});
-
-// ============================================================
-// POST /file-storage/query-blobs
-// Query user's File Storage Blob objects from MySo chain, filter by namespace
-// ============================================================
-
-/**
- * Fetch a dynamic field with retry + exponential backoff on 429 rate limit errors.
- */
-async function getDynamicFieldWithRetry(
-    parentId: string,
-    fieldName: { type: string; value: number[] },
-    maxRetries = 4,
-): Promise<any> {
-    let lastErr: any;
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-            return await mysoClient.getDynamicFieldObject({
-                parentId,
-                name: fieldName,
-            });
-        } catch (err: any) {
-            lastErr = err;
-            const msg = String(err?.message || err);
-            // Retry on 429 (rate limit) or 503 (service unavailable)
-            const isRetryable = msg.includes("429") || msg.includes("503") || msg.includes("rate");
-            if (!isRetryable || attempt === maxRetries - 1) throw err;
-            const delayMs = 250 * Math.pow(2, attempt); // 250ms, 500ms, 1000ms, 2000ms
-            console.warn(`[query-blobs] getDynamicField 429/503 for ${parentId}, retrying in ${delayMs}ms (attempt ${attempt + 1}/${maxRetries})`);
-            await new Promise(r => setTimeout(r, delayMs));
-        }
-    }
-    throw lastErr;
-}
-
-/**
- * Run async tasks with a bounded concurrency limit.
- * Avoids overwhelming MySo RPC with too many parallel calls (→ 429).
- */
-async function mapConcurrent<T, R>(
-    items: T[],
-    concurrency: number,
-    fn: (item: T) => Promise<R>,
-): Promise<R[]> {
-    const results: R[] = new Array(items.length);
-    let index = 0;
-
-    async function worker() {
-        while (true) {
-            const i = index++;
-            if (i >= items.length) break;
-            results[i] = await fn(items[i]);
-        }
-    }
-
-    const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
-    await Promise.all(workers);
-    return results;
-}
-
-app.post("/file-storage/query-blobs", async (req, res) => {
-    try {
-        const { owner, namespace, packageId } = req.body;
-        if (!owner) {
-            return res.status(400).json({ error: "Missing required field: owner" });
-        }
-
-        // File Storage Blob type (derived from env-driven FILE_STORAGE_PACKAGE_ID)
-        const FILE_STORAGE_BLOB_TYPE = `${FILE_STORAGE_PACKAGE_ID}::blob::Blob`;
-
-        // Step 1: Collect all raw blob objects (paginated, each page = 1 RPC call)
-        type RawBlobObj = { objectId: string; rawBlobId: string | number | null };
-        const rawObjs: RawBlobObj[] = [];
-        let cursor: string | null | undefined = undefined;
-        let hasMore = true;
-
-        while (hasMore) {
-            const result = await mysoClient.getOwnedObjects({
-                owner,
-                filter: { StructType: FILE_STORAGE_BLOB_TYPE },
-                options: { showContent: true },
-                cursor: cursor ?? undefined,
-                limit: 50,
-            });
-
-            for (const obj of result.data) {
-                if (!obj.data?.content || obj.data.content.dataType !== "moveObject") continue;
-                const fields = (obj.data.content as any).fields;
-                if (!fields) continue;
-                const rawBlobId = fields.blob_id ?? fields.blobId ?? null;
-                rawObjs.push({ objectId: obj.data.objectId, rawBlobId });
-            }
-
-            hasMore = result.hasNextPage;
-            cursor = result.nextCursor;
-        }
-
-        console.log(`[query-blobs] found ${rawObjs.length} raw blob objects for owner=${owner}`);
-
-        // Step 2: Fetch metadata for each blob with bounded concurrency (5 at a time)
-        // to avoid overwhelming MySo RPC and hitting 429 rate limits.
-        const METADATA_FIELD_NAME = {
-            type: "vector<u8>",
-            value: [109, 101, 116, 97, 100, 97, 116, 97], // b"metadata"
-        };
-
-        type BlobMeta = {
-            objectId: string;
-            rawBlobId: string | number | null;
-            blobNamespace: string;
-            blobOwner: string;
-            blobPackageId: string;
-            blobAgentId: string;
-        };
-
-        const metas: BlobMeta[] = await mapConcurrent(rawObjs, 5, async (obj) => {
-            let blobNamespace = "default";
-            let blobOwner = "";
-            let blobPackageId = "";
-            let blobAgentId = "";
-
-            try {
-                const dynField = await getDynamicFieldWithRetry(obj.objectId, METADATA_FIELD_NAME);
-
-                if (dynField.data?.content && dynField.data.content.dataType === "moveObject") {
-                    const dynFields = (dynField.data.content as any).fields;
-                    // Path: fields.value.fields.metadata.fields.contents[]
-                    const contents = dynFields?.value?.fields?.metadata?.fields?.contents;
-                    if (Array.isArray(contents)) {
-                        for (const entry of contents) {
-                            const key = entry?.fields?.key;
-                            const value = entry?.fields?.value;
-                            if (key === "memory_namespace") blobNamespace = value;
-                            if (key === "memory_owner") blobOwner = value;
-                            if (key === "memory_package_id") blobPackageId = value;
-                            if (key === "memory_agent_id") blobAgentId = value;
-                        }
-                    }
-                }
-            } catch {
-                // No dynamic field = no metadata = use defaults
-            }
-
-            return { ...obj, blobNamespace, blobOwner, blobPackageId, blobAgentId };
-        });
-
-        // Step 3: Filter + convert blob IDs
-        const blobs: { blobId: string; objectId: string; namespace: string; packageId: string; agentId: string }[] = [];
-
-        for (const meta of metas) {
-            // Filter by namespace if specified
-            if (namespace && meta.blobNamespace !== namespace) continue;
-            // Filter by packageId if specified
-            if (packageId && meta.blobPackageId !== packageId) continue;
-
-            if (meta.rawBlobId) {
-                // blob_id from chain is a big integer (U256) — convert to base64url (little-endian!)
-                let blobIdStr = String(meta.rawBlobId);
-                if (/^\d+$/.test(blobIdStr) && blobIdStr.length > 20) {
-                    try {
-                        const bigInt = BigInt(blobIdStr);
-                        const hex = bigInt.toString(16).padStart(64, '0');
-                        // Convert hex to bytes (big-endian), then REVERSE to little-endian
-                        const bytesBE = hex.match(/.{2}/g)!.map(b => parseInt(b, 16));
-                        const bytesLE = new Uint8Array(bytesBE.reverse());
-                        blobIdStr = Buffer.from(bytesLE).toString('base64url');
-                    } catch {
-                        // Keep as-is if conversion fails
-                    }
-                }
-                blobs.push({ blobId: blobIdStr, objectId: meta.objectId, namespace: meta.blobNamespace, packageId: meta.blobPackageId, agentId: meta.blobAgentId });
-            }
-        }
-
-        console.log(`[query-blobs] returning ${blobs.length} blobs (filtered from ${rawObjs.length}) for owner=${owner} ns=${namespace || '*'}`);
-        res.json({ blobs, total: blobs.length });
-    } catch (err: any) {
-        console.error(`[file-storage/query-blobs] error: ${err.message || err}`);
-        res.status(500).json({ error: err.message || String(err) });
-    }
-});
-
 function keypairFromPool(keyIndex: number): Ed25519Keypair {
     const privateKey = SERVER_MYSO_PRIVATE_KEYS[keyIndex];
     if (!privateKey) {
@@ -1300,9 +811,12 @@ app.post("/social/execute", async (req, res) => {
 // ============================================================
 app.post("/sponsor", async (req, res) => {
     try {
-        const { transactionBlockKindBytes, sender } = req.body;
+        const { transactionBlockKindBytes, sender, gasBudgetMist } = req.body;
         if (!transactionBlockKindBytes || !sender) {
             return res.status(400).json({ error: "Missing required fields: transactionBlockKindBytes, sender" });
+        }
+        if (gasBudgetMist !== undefined && (typeof gasBudgetMist !== "string" || !/^[1-9][0-9]{0,19}$/.test(gasBudgetMist) || BigInt(gasBudgetMist) > 18_446_744_073_709_551_615n)) {
+            return res.status(400).json({ error: "gasBudgetMist must be a positive canonical u64 MIST amount" });
         }
         if (!LOCAL_SPONSOR_ENABLED && !enokiApiKey) {
             return res.status(503).json({ error: "Transaction sponsorship is not configured" });
@@ -1312,12 +826,18 @@ app.post("/sponsor", async (req, res) => {
         const senderPrefix = typeof sender === "string" ? sender.slice(0, 10) : "unknown";
         console.log(`[sponsor] creating sponsored tx for sender=${senderPrefix}...`);
         const sponsored = LOCAL_SPONSOR_ENABLED
-            ? await createLocalSponsoredTransaction(transactionBlockKindBytes, sender)
+            ? await createLocalSponsoredTransaction(transactionBlockKindBytes, sender, gasBudgetMist)
             : await callEnoki<EnokiSponsorResponse>("/transaction-blocks/sponsor", {
                 network: enokiNetwork,
                 transactionBlockKindBytes,
                 sender,
             });
+
+        const signedBudget = signedGasBudgetMist(sponsored.bytes);
+        if (gasBudgetMist !== undefined && BigInt(signedBudget) > BigInt(gasBudgetMist)) {
+            return res.status(422).json({ error: "sponsor assigned a signed gas budget above the authorized work-run ceiling" });
+        }
+        sponsored.gasBudgetMist = signedBudget;
 
         console.log(`[sponsor] sponsored tx created (digest_len=${sponsored.digest.length})`);
         res.json(sponsored); // { bytes, digest }

@@ -10,6 +10,7 @@ pub mod registered_action;
 pub mod store;
 pub mod trigger_eval;
 pub mod webhook;
+pub mod work_run;
 
 pub use config::Config;
 pub use event_bus::EventBus;
@@ -34,6 +35,10 @@ pub struct PlatformEvent {
     pub source_event_id: String,
     pub deduplication_key: String,
     pub source_service: String,
+    /// Internal, single-job dispatch target used by owner-requested run-now and scheduled slots.
+    /// Ordinary platform events omit this and retain scoped fanout behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_job_id: Option<uuid::Uuid>,
 }
 
 /// Single trigger within a TriggerSet.
@@ -43,6 +48,9 @@ pub struct EventTrigger {
     pub kind: TriggerKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron_expr: Option<String>,
+    /// IANA timezone for cron evaluation. Omitted values retain UTC semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interval_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,6 +118,8 @@ pub enum JobActionKind {
     RegisteredAction,
     /// Ask the owner's endpoint what to do, then run its directive as a registered action.
     Webhook,
+    /// Resume a MySo Agents encrypted work run through its registered action_worker.
+    WorkRun,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -121,6 +131,9 @@ pub struct JobAction {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AutomationJob {
     pub id: uuid::Uuid,
+    /// Monotonic revision for optimistic concurrency on owner mutations.
+    #[serde(default = "default_job_version")]
+    pub version: u64,
     pub organization_id: String,
     pub account_id: String,
     /// Wallet address of the MemoryAccount's owner. The AI credit oracle bills
@@ -131,6 +144,8 @@ pub struct AutomationJob {
     pub owner_address: String,
     pub name: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub archived: bool,
     pub trigger_set: TriggerSet,
     pub target_agent_object_id: String,
     pub target_agent_key_ref: String,
@@ -138,6 +153,10 @@ pub struct AutomationJob {
     pub memory_scope: String,
     pub max_mist_per_run: u64,
     pub retry_policy: RetryPolicy,
+}
+
+fn default_job_version() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -156,9 +175,11 @@ impl Default for RetryPolicy {
 }
 
 pub const RUN_STATUS_RUNNING: &str = "running";
+pub const RUN_STATUS_RECONCILING: &str = "reconciling";
 pub const RUN_STATUS_SUCCEEDED: &str = "succeeded";
 pub const RUN_STATUS_SKIPPED: &str = "skipped";
 pub const RUN_STATUS_FAILED: &str = "failed";
+pub const RUN_STATUS_ABANDONED: &str = "abandoned";
 
 pub const AUDIT_SOURCE_SCHEDULER: &str = "scheduler";
 pub const AUDIT_ACTION_JOB_RUN: &str = "automation_job_run";

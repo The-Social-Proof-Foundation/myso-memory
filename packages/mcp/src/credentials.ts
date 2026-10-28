@@ -22,6 +22,8 @@ export interface McpCredentials {
         network?: "mainnet" | "testnet" | "devnet" | "localnet";
         /** Optional deployment pin. Authenticated agent context remains authoritative. */
         rpcUrl?: string;
+        /** Messaging SDK relayer URL for signed reactions, receipts, and encrypted room history. */
+        messagingRelayerUrl?: string;
         /** Optional object-id pins for deployments that previously configured them locally. */
         chain?: Partial<SocialChainConfig>;
     };
@@ -114,6 +116,13 @@ function parseSocialChain(value: unknown): Partial<SocialChainConfig> | undefine
         "mydataRegistryId",
         "clockId",
         "socialGraphId",
+        "mydataConfigId",
+        "subscriptionConfigId",
+        "taskConfigId",
+        "juryConfigId",
+        "jurorRosterId",
+        "ecosystemTreasuryId",
+        "pocConfigId",
         "messagingPackageId",
         "messagingVersionId",
         "messagingConfigId",
@@ -176,6 +185,9 @@ export function parseCredentials(value: unknown): McpCredentials {
               rpcUrl: input.mysoRpcUrl === undefined
                   ? undefined
                   : normalizeUrl(input.mysoRpcUrl, "mysoRpcUrl", ""),
+              messagingRelayerUrl: input.messagingRelayerUrl === undefined
+                  ? undefined
+                  : normalizeUrl(input.messagingRelayerUrl, "messagingRelayerUrl", ""),
               chain: parseSocialChain(input.socialChain),
           }
         : undefined;

@@ -2,7 +2,7 @@
 name: memory
 version: 0.0.1
 description: |
-  Privacy-first AI memory SDK for decentralized storage on MySo blockchain with File Storage.
+  Privacy-first AI memory SDK with MYDATA encryption and private Cloudflare R2 blob storage.
 
   Use when users say:
   - "add memory to my app"
@@ -10,7 +10,7 @@ description: |
   - "integrate Memory"
   - "AI agent memory"
   - "persistent memory SDK"
-  - "File Storage memory storage"
+  - "Cloudflare R2 memory storage"
   - "setup Memory"
   - "recall memories"
 
@@ -19,7 +19,7 @@ keywords:
   - memory sdk
   - ai memory
   - encrypted memory
-  - file storage storage
+  - private R2 storage
   - myso blockchain
   - delegate key
   - semantic search
@@ -28,7 +28,7 @@ keywords:
 
 # Memory — Privacy-First AI Memory SDK
 
-Memory is a TypeScript SDK for persistent, encrypted AI memory. It stores memories on File Storage (decentralized storage), encrypts them with MYDATA, enforces ownership onchain via MySo smart contracts, and retrieves them with semantic (vector) search. Memories are scoped by `owner + namespace` — each namespace is an isolated memory space.
+Memory is a TypeScript SDK for persistent, encrypted AI memory. It encrypts memories with MYDATA, stores ciphertext in a private Cloudflare R2 bucket, enforces ownership onchain via MySo smart contracts, and retrieves them with semantic (vector) search. Memories are scoped by `owner + namespace` — each namespace is an isolated memory space.
 
 ---
 
@@ -39,7 +39,7 @@ Use Memory when your app or agent needs:
 - **Persistent memory** across sessions, devices, or restarts
 - **Encrypted storage** — end-to-end encryption, only the owner and authorized delegates can decrypt
 - **Semantic recall** — retrieve memories by meaning, not just keywords
-- **Decentralized storage** — no single point of failure, stored on File Storage
+- **Private blob storage** — ciphertext is stored in the operator's private Cloudflare R2 bucket
 - **Onchain ownership** — cryptographically enforced access control on MySo
 - **Cross-app memory** — share memory between apps via delegate keys
 
@@ -63,7 +63,7 @@ pnpm add @socialproof/memory
 pnpm add ai zod
 
 # Optional: for manual client (client-side MYDATA encryption)
-pnpm add @socialproof/myso @socialproof/mydata @socialproof/file-storage
+pnpm add @socialproof/myso @socialproof/mydata
 ```
 
 ---
@@ -75,7 +75,7 @@ pnpm add @socialproof/myso @socialproof/mydata @socialproof/file-storage
 You need a **delegate key** (Ed25519 private key) and **account ID** (MemoryAccount object ID on MySo).
 
 Generate them at:
-- Production: https://mysocial.network or https://memory.wal.app
+- Production: https://mysocial.network
 - Staging: https://testnet.mysocial.network
 
 ### 2. Initialize the SDK
@@ -117,7 +117,7 @@ await memory.health();
 
 | Entry Point | Import | Description |
 |---|---|---|
-| `Memory` | `@socialproof/memory` | **Default.** Relayer handles embedding, MYDATA encryption, File Storage upload, vector search |
+| `Memory` | `@socialproof/memory` | **Default.** Relayer handles embedding, MYDATA encryption, private R2 upload, vector search |
 | `MemoryManual` | `@socialproof/memory/manual` | Manual flow — client handles embedding and MYDATA encryption |
 | `withMemory` | `@socialproof/memory/ai` | Vercel AI SDK middleware — auto recall + save around AI conversations |
 | Account utils | `@socialproof/memory/account` | Account creation, delegate key management |
@@ -136,7 +136,7 @@ await memory.health();
 | `rememberBulk(texts[])` | Bulk enqueue (202) | `{ job_ids, status }` |
 | `recall(query, limit?, namespace?)` | Semantic search for memories | `{ results: [{ blob_id, text, distance }], total }` |
 | `analyze(text, namespace?)` | Extract facts via LLM, store each as a memory | `{ facts: [{ text, id, blob_id }], total, owner }` |
-| `restore(namespace, limit?)` | Rebuild missing index entries from File Storage | `{ restored, skipped, total, namespace, owner }` |
+| `restore(namespace, limit?)` | Rebuild missing index entries from private R2 | `{ restored, skipped, total, namespace, owner }` |
 | `health()` | Check relayer health | `{ status, version }` |
 | `getPublicKeyHex()` | Get hex-encoded public key | `string` |
 
@@ -292,7 +292,7 @@ Delete post/comment requires **owner co-sign** (delete only in v1) — sub-agent
 | `recall()` returns empty | Verify namespace matches what was used in `remember()` |
 | `401 Unauthorized` | Verify delegate key is correct and registered on the account |
 | SDK import errors | Run `pnpm add @socialproof/memory` — check Node.js ≥ 18 |
-| Manual client errors | Install peer deps: `@socialproof/myso @socialproof/mydata @socialproof/file-storage` |
+| Manual client errors | Install peer deps: `@socialproof/myso @socialproof/mydata`; ensure the relayer has its private R2 bucket configured |
 
 ---
 

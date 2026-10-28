@@ -2,7 +2,7 @@
  * @socialproof/memory/manual
  *
  * Manual (client-side) mode entry point.
- * Requires: @socialproof/mydata, @socialproof/file-storage, @socialproof/myso
+ * Requires: @socialproof/mydata, @socialproof/myso
  *
  * Usage:
  *   import { MemoryManual } from "@socialproof/memory/manual";

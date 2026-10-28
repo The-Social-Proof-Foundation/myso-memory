@@ -62,6 +62,27 @@ test("OAuth introspection preserves scoped identity and observes revocation", as
     await assert.rejects(() => verifier.verifyAccessToken("token"), /inactive or revoked/);
 });
 
+test("a MySocial wallet session does not need the MCP resource audience", async () => {
+    const verifier = new OAuthIntrospectionVerifier({
+        introspectionUrl: "https://auth.testnet.mysocial.network/oauth/introspect",
+        clientId: "mcp",
+        clientSecret: "secret",
+        resourceUrl: resource.toString(),
+        fetch: async () => new Response(JSON.stringify({
+            active: true,
+            client_id: "mysocial-auth-client-id",
+            exp: Math.floor(Date.now() / 1000) + 60,
+            aud: "mysocial-auth-client-id",
+            sub: "user-1",
+            wallet_address: "0xabc",
+        })),
+    });
+    const auth = await verifier.verifyAccessToken("session-token");
+    assert.equal(auth.clientId, "mysocial-auth-client-id");
+    assert.deepEqual(auth.scopes, ["mcp:connect", "agent:read"]);
+    assert.equal(auth.extra?.walletAddress, "0xabc");
+});
+
 test("KMS session signer reauthorizes immediately before every signature", async () => {
     const operations = [];
     let active = true;
@@ -141,6 +162,7 @@ test("authorized Streamable HTTP completes MCP initialization", async () => {
                 memory: {
                     async rememberAndWait() { return {}; },
                     async recall() { return {}; },
+                    async getAgentContext() { return {memoryAccountId:"0x1",agentObjectId:"0x2",capabilities:5}; },
                     async health() { return { status: "ok" }; },
                 },
             };

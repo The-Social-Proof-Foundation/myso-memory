@@ -10,7 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { verifyPersonalMessageSignature } from "@socialproof/myso/verify";
 import type { SocialActionId, SocialChainConfig, SocialExecuteAction } from "@socialproof/social";
 import {
-    SOCIAL_ACTION_REGISTRY_VERSION,
+    isSupportedSocialRegistryVersion,
     buildRegisteredSocialAction,
     createSocialActionRequestMetadata,
     finalizeSocialActionPreparation,
@@ -28,20 +28,20 @@ import {
 import { parseSocialTxEffects } from "@socialproof/social";
 
 const MYSO_NETWORK_RAW = process.env.MYSO_NETWORK || "mainnet";
-const FILE_STORAGE_NETWORK: "mainnet" | "testnet" =
+const MYSO_NETWORK: "mainnet" | "testnet" =
     MYSO_NETWORK_RAW === "mainnet" ? "mainnet" : "testnet";
 const MYSO_RPC_URL =
-    process.env.MYSO_RPC_URL || getJsonRpcFullnodeUrl(FILE_STORAGE_NETWORK);
+    process.env.MYSO_RPC_URL || getJsonRpcFullnodeUrl(MYSO_NETWORK);
 
 const mysoClient = new MySoJsonRpcClient({
     url: MYSO_RPC_URL,
-    network: FILE_STORAGE_NETWORK,
+    network: MYSO_NETWORK,
 });
 
 const ENOKI_API_KEY = process.env.ENOKI_API_KEY?.trim() || "";
 const ENOKI_API_BASE_URL =
     process.env.ENOKI_API_BASE_URL?.trim() || "https://api.enoki.mysocial.network/v1";
-const ENOKI_NETWORK = process.env.ENOKI_NETWORK?.trim() || FILE_STORAGE_NETWORK;
+const ENOKI_NETWORK = process.env.ENOKI_NETWORK?.trim() || MYSO_NETWORK;
 const ENOKI_FALLBACK_TO_DIRECT_SIGN =
     process.env.ENOKI_FALLBACK_TO_DIRECT_SIGN !== "0";
 
@@ -126,7 +126,10 @@ export function loadSocialChainConfig(): SocialChainConfig {
         postConfigId: required("POST_CONFIG_ID"),
         memoryConfigId: required("MEMORY_CONFIG_ID"),
         mydataRegistryId: required("MYDATA_REGISTRY_ID"),
+        memoryRegistryId: process.env.SOCIAL_MEMORY_REGISTRY_ID?.trim() || undefined,
         socialGraphId: process.env.SOCIAL_GRAPH_ID?.trim() || undefined,
+        mydataConfigId: process.env.MYDATA_CONFIG_ID?.trim() || undefined,
+        subscriptionConfigId: process.env.SUBSCRIPTION_CONFIG_ID?.trim() || undefined,
         taskConfigId: process.env.TASK_CONFIG_ID?.trim() || undefined,
         juryConfigId: process.env.JURY_CONFIG_ID?.trim() || undefined,
         jurorRosterId: process.env.JUROR_ROSTER_ID?.trim() || undefined,
@@ -151,7 +154,7 @@ export interface SocialExecuteRequest {
 
 export interface RegisteredSocialPrepareRequest {
     registryAction: SocialActionId;
-    registryVersion: typeof SOCIAL_ACTION_REGISTRY_VERSION;
+    registryVersion: string;
     parameters: unknown;
     memoryAccountId: string;
     idempotencyKey: string;
@@ -162,7 +165,7 @@ export interface RegisteredSocialPrepareRequest {
 export async function prepareRegisteredSocialAction(
     req: RegisteredSocialPrepareRequest,
 ) {
-    if (req.registryVersion !== SOCIAL_ACTION_REGISTRY_VERSION) {
+    if (!isSupportedSocialRegistryVersion(req.registryVersion, req.registryAction)) {
         throw new Error("Unsupported social action registry version");
     }
     if (
@@ -223,7 +226,7 @@ export async function prepareRegisteredSocialAction(
 
     return {
         ...prepared,
-        registryVersion: SOCIAL_ACTION_REGISTRY_VERSION,
+        registryVersion: req.registryVersion,
         transactionBlockKindBytes: Buffer.from(bytes).toString("base64"),
     };
 }

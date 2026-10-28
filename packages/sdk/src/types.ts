@@ -152,6 +152,29 @@ export interface GatewayInferenceResult {
     providerGenerationId: string | null;
 }
 
+/** Text/tool messages supported by the reserve-before-provider chat gateway. */
+export interface GatewayChatMessage {
+    role: "system" | "user" | "assistant" | "tool";
+    content?: string | null;
+    tool_call_id?: string;
+    tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
+}
+export interface GatewayChatRequest {
+    modelId: string;
+    /** Persist before sending and reuse for retries of this exact model call. */
+    idempotencyKey: string;
+    messages: GatewayChatMessage[];
+    tools?: Array<{ type: "function"; function: { name: string; description?: string; parameters: Record<string, unknown> } }>;
+    toolChoice?: unknown;
+    maxTokens?: number;
+}
+export interface GatewayChatResult extends Omit<GatewayInferenceResult, "amountMist" | "reservationNonce"> {
+    amountMist: string;
+    reservationNonce: string | null;
+    finishReason: string | null;
+    toolCalls: Array<{ id: string; name: string; arguments: string }>;
+}
+
 /** Runtime compatibility metadata from GET /version */
 export interface RelayerVersionMetadata {
     relayerVersion: string;
@@ -187,10 +210,10 @@ export interface HealthResult {
 // Manual Flow Types — Lightweight (user provides pre-computed data)
 // ============================================================
 
-/** Options for rememberManual() on Memory class */
+/** Options for rememberManual() on Memory class. Encrypted bytes are stored through the private R2 relayer. */
 export interface RememberManualOptions {
-    /** File Storage blob ID (user already uploaded encrypted data) */
-    blobId: string;
+    /** MYDATA-encrypted bytes, provided as base64 or a byte array */
+    encryptedData: string | Uint8Array;
     /** Embedding vector (user already generated) */
     vector: number[];
     /** Namespace (default: config namespace or "default") */
@@ -239,14 +262,14 @@ export interface RestoreResult {
 // Full Client-Side Manual Flow — MemoryManual class
 // ============================================================
 
-/** Config for MemoryManual (full client-side: MYDATA + File Storage + embedding) */
+/** Config for MemoryManual (client-side MYDATA + embedding; encrypted data uses private R2 transport) */
 export interface MemoryManualConfig {
     /** Ed25519 sub-agent private key (hex or Uint8Array) for server auth */
     key: string | Uint8Array;
     /** Server URL (default: http://localhost:8000) */
     serverUrl?: string;
     /**
-     * MySo private key (bech32 mysoprivkey1...) for MYDATA + File Storage signing.
+     * MySo private key (bech32 mysoprivkey1...) for MYDATA signing.
      * Provide EITHER this OR `walletSigner` — not both.
      */
     mysoPrivateKey?: string;
@@ -286,12 +309,6 @@ export interface MemoryManualConfig {
      * Default: 2 (matches sidecar MYDATA_THRESHOLD default).
      */
     mydataThreshold?: number;
-    /** File Storage storage epochs (default: 50) */
-    fileStorageEpochs?: number;
-    /** File Storage aggregator URL for direct blob downloads (default: mainnet aggregator) */
-    fileStorageAggregatorUrl?: string;
-    /** File Storage publisher URL for direct blob uploads (default: mainnet publisher) */
-    fileStoragePublisherUrl?: string;
     /** Default namespace for memory isolation (default: "default") */
     namespace?: string;
 }
@@ -738,4 +755,49 @@ export function buildGrantOrgMemoryPermissionOptsFromWorkflow(
         memberAddress: payload.member_address,
         permissionsMask: opts.permissionsMask ?? payload.permissions_mask,
     };
+}
+
+/** Explicit private-content disclosure. Use nextOffset exactly as returned; UTF-8
+ * offsets count Unicode scalars, while base64 offsets count source bytes. */
+export interface MyDataContentRequest {
+    mydataId: string;
+    encryptedDataDigestHex: string;
+    format: "utf8" | "base64";
+    offset: number;
+    limit: number;
+    /** Request the current org audience for a graph purchase; verified against authenticated agent identity. */
+    organizationAudienceId?: string;
+}
+/** Current caller-bound authorization check for one exact encrypted listing version. */
+export interface MyDataCurrentAccessRequest {
+    mydataId: string;
+    encryptedDataDigestHex: string;
+    organizationAudienceId?: string;
+}
+export interface MyDataCurrentAccessResult {
+    authorized: true;
+    mydataId: string;
+    encryptedDataDigestHex: string;
+    objectVersion: string;
+    source: "current_key_server_policy";
+    callerAddress: string;
+    accountId: string;
+    agentId: string;
+    network: string;
+    plaintextReturned: false;
+    sharedDerivedKeyCache: false;
+    organizationAudienceId?: string;
+}
+export interface MyDataContentPage {
+    mydataId: string;
+    encryptedDataDigestHex: string;
+    objectVersion: string;
+    data: string;
+    format: "utf8" | "base64";
+    offset: number;
+    offsetUnit: "unicode_scalar" | "byte";
+    total: number;
+    nextOffset: number | null;
+    hasNext: boolean;
+    access: { source: "current_key_server_policy"; callerAddress: string; accountId: string; agentId: string; network: string; sharedDerivedKeyCache: false; organizationAudienceId?: string; purchaseQuote?: { expectedSeller: string; mediaType: string; tags: string[]; accessKind: 2 | 3; priceMist: string; durationDays: string } };
 }

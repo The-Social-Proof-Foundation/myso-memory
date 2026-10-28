@@ -24,6 +24,7 @@ pub struct ChainActionRow {
     pub package_version: String,
     pub sender: String,
     pub approval_id: Option<String>,
+    pub receipt_context: Option<Value>,
     pub sponsored_bytes: Option<String>,
     pub digest: Option<String>,
     pub signature_hash: Option<String>,
@@ -46,6 +47,7 @@ pub struct NewChainAction<'a> {
     pub package_version: &'a str,
     pub sender: &'a str,
     pub approval_id: Option<&'a str>,
+    pub receipt_context: Option<Value>,
     pub prepared_at_ms: i64,
     pub expires_at_ms: i64,
 }
@@ -79,6 +81,7 @@ fn same_preparation(row: &ChainActionRow, input: &NewChainAction<'_>) -> bool {
         && row.package_version == input.package_version
         && row.sender == input.sender
         && row.approval_id.as_deref() == input.approval_id
+        && row.receipt_context == input.receipt_context
 }
 
 pub async fn claim_preparation(
@@ -95,8 +98,8 @@ pub async fn claim_preparation(
             idempotency_scope, account_id, agent_object_id, registry_action,
             registry_version, idempotency_key, parameter_hash,
             transaction_kind_hash, package_id, package_version, sender, approval_id, status,
-            prepared_at_ms, expires_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'preparing',$13,$14)
+            prepared_at_ms, expires_at_ms, receipt_context
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'preparing',$13,$14,$15)
          ON CONFLICT (account_id, agent_object_id, registry_action, idempotency_key)
          DO NOTHING",
     )
@@ -114,6 +117,7 @@ pub async fn claim_preparation(
     .bind(input.approval_id)
     .bind(input.prepared_at_ms)
     .bind(input.expires_at_ms)
+    .bind(&input.receipt_context)
     .execute(&mut *tx)
     .await
     .map_err(|error| AppError::Internal(format!("claim chain action preparation: {error}")))?;
@@ -121,7 +125,7 @@ pub async fn claim_preparation(
     let row = sqlx::query_as::<_, ChainActionRow>(
         "SELECT idempotency_scope, account_id, agent_object_id, registry_action,
                 registry_version, idempotency_key, parameter_hash,
-                transaction_kind_hash, package_id, package_version, sender, approval_id,
+                transaction_kind_hash, package_id, package_version, sender, approval_id, receipt_context,
                 sponsored_bytes, digest, signature_hash, status, simulation_response,
                 execution_response, expires_at_ms
          FROM chain_action_requests
@@ -321,7 +325,7 @@ pub async fn get_by_identity(
     sqlx::query_as::<_, ChainActionRow>(
         "SELECT idempotency_scope, account_id, agent_object_id, registry_action,
                 registry_version, idempotency_key, parameter_hash,
-                transaction_kind_hash, package_id, package_version, sender, approval_id,
+                transaction_kind_hash, package_id, package_version, sender, approval_id, receipt_context,
                 sponsored_bytes, digest, signature_hash, status, simulation_response,
                 execution_response, expires_at_ms
          FROM chain_action_requests
@@ -335,6 +339,51 @@ pub async fn get_by_identity(
     .fetch_optional(db.pool())
     .await
     .map_err(|error| AppError::Internal(format!("read chain action request: {error}")))
+}
+
+/// Find a registered action by its caller-scoped idempotency key. Work-run
+/// recovery uses server-issued unique keys to reconnect an uncertain journal
+/// operation to its durable chain-action preparation without accepting a
+/// caller-supplied account or agent identity.
+pub async fn get_by_idempotency_key(
+    db: &VectorDb,
+    account_id: &str,
+    agent_object_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<ChainActionRow>, AppError> {
+    let rows = sqlx::query_as::<_, ChainActionRow>(
+        "SELECT idempotency_scope, account_id, agent_object_id, registry_action,
+                registry_version, idempotency_key, parameter_hash,
+                transaction_kind_hash, package_id, package_version, sender, approval_id, receipt_context,
+                sponsored_bytes, digest, signature_hash, status, simulation_response,
+                execution_response, expires_at_ms
+         FROM chain_action_requests
+         WHERE account_id = $1 AND agent_object_id = $2 AND idempotency_key = $3
+         ORDER BY prepared_at_ms DESC LIMIT 2",
+    )
+    .bind(account_id)
+    .bind(agent_object_id)
+    .bind(idempotency_key)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|error| AppError::Internal(format!("read chain action by idempotency key: {error}")))?;
+    match rows.as_slice() {
+        [] => Ok(None),
+        [row] => Ok(Some(row.clone())),
+        _ => Err(AppError::Conflict(
+            "idempotency key matches multiple registered actions".into(),
+        )),
+    }
+}
+
+pub async fn get_by_digest(
+    db: &VectorDb,
+    account: &str,
+    agent: &str,
+    digest: &str,
+) -> Result<Option<ChainActionRow>, AppError> {
+    sqlx::query_as::<_,ChainActionRow>("SELECT idempotency_scope,account_id,agent_object_id,registry_action,registry_version,idempotency_key,parameter_hash,transaction_kind_hash,package_id,package_version,sender,approval_id,receipt_context,sponsored_bytes,digest,signature_hash,status,simulation_response,execution_response,expires_at_ms FROM chain_action_requests WHERE account_id=$1 AND agent_object_id=$2 AND digest=$3 ORDER BY prepared_at_ms LIMIT 1")
+        .bind(account).bind(agent).bind(digest).fetch_optional(db.pool()).await.map_err(|_|AppError::Internal("Scoped transaction receipt lookup failed".into()))
 }
 
 #[cfg(test)]
@@ -355,6 +404,7 @@ mod tests {
             package_version: "1".into(),
             sender: "0xsender".into(),
             approval_id: None,
+            receipt_context: None,
             sponsored_bytes: None,
             digest: None,
             signature_hash: None,
@@ -381,10 +431,16 @@ mod tests {
             package_version: "1",
             sender: "0xsender",
             approval_id: None,
+            receipt_context: None,
             prepared_at_ms: 1,
             expires_at_ms: 2,
         };
         assert!(same_preparation(&row, &matching));
+        let wrong_currency = NewChainAction {
+            receipt_context: Some(serde_json::json!({"coinType":"0x3::test::USD"})),
+            ..matching
+        };
+        assert!(!same_preparation(&row, &wrong_currency));
         let conflicting = NewChainAction {
             parameter_hash: "sha256:different",
             ..matching

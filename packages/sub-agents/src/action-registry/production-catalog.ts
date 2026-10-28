@@ -16,9 +16,12 @@ import {
     CAP_TRADE_EXECUTE,
 } from "../contract.js";
 
-export const PRODUCTION_ACTION_CATALOG_VERSION = "1.5.0" as const;
+export const PRODUCTION_ACTION_CATALOG_VERSION = "1.33.0" as const;
 
 export const TIER_1_ACTION_IDS = Object.freeze([
+    "access.publish_mydata_graph.v1",
+    "access.purchase_mydata_access.v1",
+    "access.purchase_post_access.v1",
     "social.react_to_post.v1",
     "social.remove_post_reaction.v1",
     "social.react_to_comment.v1",
@@ -35,6 +38,7 @@ export const TIER_1_ACTION_IDS = Object.freeze([
     "social.unblock_profile.v1",
     "messaging.send_message.v1",
     "messaging.create_group.v1",
+    "messaging.bind_room_to_task.v1",
     "organization.accept_invitation.v1",
     "organization.decline_invitation.v1",
     "agent.register_child.v1",
@@ -85,26 +89,22 @@ export const TIER_1_ACTION_IDS = Object.freeze([
 ] as const);
 
 export const TIER_2_ACTION_IDS = Object.freeze([
-    "payments.tip_profile.v1",
     "payments.tip_post.v1",
+    "poc.accept_beneficiary_transfer.v1",
     "payments.send_token.v1",
     "subscription.subscribe_to_plan.v1",
     "subscription.renew_subscription.v1",
     "subscription.cancel_subscription.v1",
     "subscription.enable_auto_renew.v1",
     "subscription.disable_auto_renew.v1",
-    "access.purchase_post_access.v1",
-    "access.purchase_mydata_access.v1",
     "access.share_mydata.v1",
     "access.revoke_mydata_share.v1",
     "spt.buy.v1",
     "spt.sell.v1",
-    "spot.create_market.v1",
     "spot.place_bet.v1",
-    "spot.claim_payout.v1",
-    "storage.purchase_capacity.v1",
     "dex.swap.v1",
     "bridge.initiate_transfer.v1",
+    "governance.vote.v1",
 ] as const);
 
 export const TIER_3_ACTION_IDS = Object.freeze([
@@ -122,11 +122,14 @@ export const TIER_3_ACTION_IDS = Object.freeze([
     "agent.grant_capability.v1",
     "agent.revoke_capability.v1",
     "agent.raise_spending_limit.v1",
+    "agent.lower_spending_limit.v1",
     "account.rotate_owner_key.v1",
-    "account.configure_multisig.v1",
+    "social.delete_post.v1",
+    "social.delete_comment.v1",
     "poc.claim_creator_vault.v1",
+    "spot.claim_payout.v1",
+    "spot.create_market.v1",
     "poc.transfer_beneficiary_rights.v1",
-    "governance.vote.v1",
     "governance.delegate_vote.v1",
     "assets.transfer_object.v1",
     "assets.burn_object.v1",
@@ -134,6 +137,7 @@ export const TIER_3_ACTION_IDS = Object.freeze([
     "platform.update_fee_recipient.v1",
     "organization.grant_treasury_access.v1",
     "organization.withdraw_treasury.v1",
+    "organization.fund_treasury.v1",
     "subscription.change_service_payment_recipient.v1",
 ] as const);
 
@@ -148,7 +152,8 @@ export type ProductionActionTier = "1" | "2" | "3";
 export type ProductionActionApproval =
     | "agent-capability"
     | "owner-wallet"
-    | "owner-wallet-and-cosign";
+    | "owner-wallet-and-cosign"
+    | "verified-identity-and-recipient-wallet";
 export type ProductionActionAvailability =
     | "enabled"
     | "contract-change-required"
@@ -165,6 +170,45 @@ export interface ProductionActionDescriptor {
 }
 
 const enabled = new Set<string>([
+    "task.create.v1",
+    "access.publish_mydata_graph.v1",
+    "access.purchase_mydata_access.v1",
+    "access.purchase_post_access.v1",
+    "agent.revoke_agent.v1",
+    "agent.grant_capability.v1",
+    "agent.revoke_capability.v1",
+    "agent.raise_spending_limit.v1",
+    "agent.lower_spending_limit.v1",
+    "social.delete_post.v1",
+    "social.delete_comment.v1",
+    "payments.tip_post.v1",
+    "poc.accept_beneficiary_transfer.v1",
+    "poc.transfer_beneficiary_rights.v1",
+    "poc.claim_creator_vault.v1",
+    "spot.claim_payout.v1",
+    "spot.place_bet.v1",
+    "spot.create_market.v1",
+    "dex.swap.v1",
+    "spt.buy.v1",
+    "spt.sell.v1",
+    "governance.vote.v1",
+    "governance.delegate_vote.v1",
+    "assets.transfer_object.v1",
+    "assets.burn_object.v1",
+    "organization.grant_treasury_access.v1",
+    "organization.withdraw_treasury.v1",
+    "organization.fund_treasury.v1",
+    "platform.transfer_platform.v1",
+    "platform.update_fee_recipient.v1",
+    "payments.send_token.v1",
+    "subscription.subscribe_to_plan.v1",
+    "subscription.renew_subscription.v1",
+    "subscription.cancel_subscription.v1",
+    "subscription.enable_auto_renew.v1",
+    "subscription.disable_auto_renew.v1",
+    "subscription.change_service_payment_recipient.v1",
+    "access.share_mydata.v1",
+    "access.revoke_mydata_share.v1",
     ...TIER_1_ACTION_IDS,
     "organization.create.v1",
     "organization.update_metadata.v1",
@@ -179,6 +223,9 @@ const enabled = new Set<string>([
 ]);
 
 const tierOneCapabilities: Readonly<Record<string, number>> = Object.freeze({
+    "access.publish_mydata_graph.v1": CAP_MYDATA_READ,
+    "access.purchase_mydata_access.v1": CAP_MYDATA_READ,
+    "access.purchase_post_access.v1": CAP_MYDATA_READ,
     "social.react_to_post.v1": CAP_REACT,
     "social.remove_post_reaction.v1": CAP_REACT,
     "social.react_to_comment.v1": CAP_REACT,
@@ -195,6 +242,7 @@ const tierOneCapabilities: Readonly<Record<string, number>> = Object.freeze({
     "social.unblock_profile.v1": CAP_SOCIAL_GRAPH,
     "messaging.send_message.v1": CAP_MESSAGE_SEND,
     "messaging.create_group.v1": CAP_MESSAGE_SEND,
+    "messaging.bind_room_to_task.v1": CAP_MESSAGE_SEND,
     "organization.accept_invitation.v1": CAP_MEMORY_READ,
     "organization.decline_invitation.v1": CAP_MEMORY_READ,
     "agent.register_child.v1": CAP_AGENT_REGISTER,
@@ -247,12 +295,21 @@ const tierOneCapabilities: Readonly<Record<string, number>> = Object.freeze({
 const tierOneBlockers: Readonly<Record<string, string>> = Object.freeze({});
 
 const tierTwoCapabilities: Readonly<Record<string, number>> = Object.freeze({
+    "poc.accept_beneficiary_transfer.v1": CAP_TRADE_EXECUTE,
     "access.purchase_mydata_access.v1": CAP_MYDATA_READ,
     "access.share_mydata.v1": CAP_MYDATA_READ,
     "access.revoke_mydata_share.v1": CAP_MYDATA_READ,
+    "spot.place_bet.v1": CAP_TRADE_EXECUTE,
+    "governance.vote.v1": CAP_TRADE_EXECUTE,
 });
 
 const tierThreeCapabilities: Readonly<Record<string, number>> = Object.freeze({
+    "poc.claim_creator_vault.v1": CAP_TRADE_EXECUTE,
+    "poc.transfer_beneficiary_rights.v1": CAP_TRADE_EXECUTE,
+    "spot.claim_payout.v1": CAP_TRADE_EXECUTE,
+    "spot.create_market.v1": CAP_TRADE_EXECUTE,
+    "social.delete_post.v1": CAP_POST_PUBLISH,
+    "social.delete_comment.v1": CAP_COMMENT,
     "organization.create.v1": CAP_AGENT_REGISTER,
     "organization.update_metadata.v1": CAP_AGENT_UPDATE,
     "organization.update_category.v1": CAP_AGENT_UPDATE,
@@ -267,23 +324,58 @@ const tierThreeCapabilities: Readonly<Record<string, number>> = Object.freeze({
     "agent.grant_capability.v1": CAP_AGENT_UPDATE,
     "agent.revoke_capability.v1": CAP_AGENT_UPDATE,
     "agent.raise_spending_limit.v1": CAP_BUDGET_MANAGE,
+    "agent.lower_spending_limit.v1": CAP_BUDGET_MANAGE,
+    "assets.transfer_object.v1": CAP_TRADE_EXECUTE,
+    "assets.burn_object.v1": CAP_TRADE_EXECUTE,
+    "organization.grant_treasury_access.v1": CAP_AGENT_UPDATE,
+    "organization.withdraw_treasury.v1": CAP_TRADE_EXECUTE,
+    "organization.fund_treasury.v1": CAP_TRADE_EXECUTE,
+    "governance.delegate_vote.v1": CAP_TRADE_EXECUTE,
 });
 
 const protocolAdapters = new Set<string>([
     "payments.send_token.v1",
-    "storage.purchase_capacity.v1",
-    "dex.swap.v1",
     "bridge.initiate_transfer.v1",
-    "assets.transfer_object.v1",
-    "assets.burn_object.v1",
-    "account.rotate_owner_key.v1",
-    "account.configure_multisig.v1",
 ]);
 
 function descriptor(
     id: ProductionActionId,
     tier: ProductionActionTier,
 ): ProductionActionDescriptor {
+    if (id === "account.rotate_owner_key.v1") {
+        return Object.freeze({
+            id,
+            tier: "3" as const,
+            approval: "owner-wallet" as const,
+            requiredCapability: null,
+            availability: enabled.has(id) ? "enabled" as const : "transaction-builder-required" as const,
+            ...(enabled.has(id) ? {} : { blocker: "An exact owner-wallet proposal builder and scoped migration receipt are required." }),
+        });
+    }
+    if (id === "organization.grant_treasury_access.v1" || id === "organization.withdraw_treasury.v1" || id === "organization.fund_treasury.v1") {
+        const isEnabled = enabled.has(id);
+        return Object.freeze({
+            id,
+            tier: "3" as const,
+            approval: "owner-wallet" as const,
+            requiredCapability: tierThreeCapabilities[id],
+            availability: isEnabled ? "enabled" as const : "transaction-builder-required" as const,
+            ...(isEnabled ? {} : { blocker: "Organization treasury actions require live owner/account validation, exact typed coin builders, event receipts, and explicit authority checks." }),
+        });
+    }
+    if (id === "platform.transfer_platform.v1" || id === "platform.update_fee_recipient.v1") {
+        return Object.freeze({ id, tier: "3" as const, approval: "owner-wallet" as const, requiredCapability: null, availability: enabled.has(id) ? "enabled" as const : "transaction-builder-required" as const });
+    }
+    if (id === "poc.transfer_beneficiary_rights.v1") {
+        return Object.freeze({
+            id,
+            tier: "3" as const,
+            approval: "verified-identity-and-recipient-wallet" as const,
+            requiredCapability: CAP_TRADE_EXECUTE,
+            availability: enabled.has(id) ? "enabled" as const : "protocol-adapter-required" as const,
+            ...(enabled.has(id) ? {} : { blocker: "A recipient-bound identity attestation bridge, live oracle validation, exact proposal receipt and recipient-wallet acceptance are required." }),
+        });
+    }
     if (tier === "1") {
         const isEnabled = enabled.has(id);
         return Object.freeze({
@@ -299,14 +391,14 @@ function descriptor(
         return Object.freeze({
             id,
             tier,
-            approval: "owner-wallet" as const,
+            approval: id === "spt.buy.v1" || id === "spt.sell.v1" ? "agent-capability" as const : "owner-wallet" as const,
             requiredCapability: tierTwoCapabilities[id] ?? CAP_TRADE_EXECUTE,
-            availability: protocolAdapters.has(id)
+            availability: enabled.has(id) ? "enabled" as const : protocolAdapters.has(id)
                 ? "protocol-adapter-required" as const
                 : "transaction-builder-required" as const,
-            blocker: protocolAdapters.has(id)
+            ...(enabled.has(id)?{}:{blocker:protocolAdapters.has(id)
                 ? "A protocol-specific allowlisted adapter, resolver, limits, and simulation policy are required."
-                : "A validated registry schema, deterministic PTB builder, object resolver, and event parser are required.",
+                : "A validated registry schema, deterministic PTB builder, object resolver, and event parser are required."}),
         });
     }
     const isEnabled = enabled.has(id);

@@ -21,7 +21,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
-import { BridgeError, MemoryBridge, type MemoryBridgeOptions } from "./bridge.js";
+import { BridgeError, MemoryBridge, type MemoryBridgeOptions, type RoomManagementRequest, type RoomToolRequest } from "./bridge.js";
 import { loadConfig, type SidecarConfig } from "./config.js";
 import { EngineDelegateSource } from "./delegates.js";
 import { AgentKeyStore, KeyStoreError } from "./keys.js";
@@ -111,7 +111,7 @@ function optionalPositiveInt(body: Record<string, unknown>, field: string): numb
 
 export interface BridgeServerDeps {
     config: SidecarConfig;
-    bridge: Pick<MemoryBridge, "recall" | "remember" | "probe" | "act" | "delegateStatus">;
+    bridge: Pick<MemoryBridge, "recall" | "remember" | "probe" | "act" | "delegateStatus" | "workJournal" | "workMcp" | "workRoomHistory" | "roomManagement" | "roomTool" | "workRunDispatch">;
     /** Static dev keys, absent in production. Used by /health for a count. */
     store?: Pick<AgentKeyStore, "size">;
     /** Public MyData keys for browsers to encrypt delegate seeds to. Never private halves. */
@@ -232,6 +232,81 @@ export function createBridgeServer(deps: BridgeServerDeps): Server {
                     sendJson(res, 200, result);
                     return;
                 }
+                case "/internal/work/run-journal": {
+                    const result = await bridge.workJournal({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                        parent_agent_id: requireString(body, "parent_agent_id"),
+                        worker_agent_id: requireString(body, "worker_agent_id"),
+                        run_id: requireString(body, "run_id"),
+                        credential: requireString(body, "credential"),
+                        operation: requireString(body, "operation"),
+                        params: asRecord(body.params, "params"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
+                case "/internal/work/mcp": {
+                    const result = await bridge.workMcp({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                        parent_agent_id: requireString(body, "parent_agent_id"),
+                        worker_agent_id: requireString(body, "worker_agent_id"),
+                        run_id: requireString(body, "run_id"),
+                        credential: requireString(body, "credential"),
+                        request: asRecord(body.request, "request"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
+                case "/internal/work/room-history": {
+                    const result = await bridge.workRoomHistory({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                        parent_agent_id: requireString(body, "parent_agent_id"),
+                        worker_agent_id: requireString(body, "worker_agent_id"),
+                        run_id: requireString(body, "run_id"),
+                        credential: requireString(body, "credential"),
+                        tool_name: requireString(body, "tool_name") as "messaging_get_room_history" | "messaging_get_room_attachment",
+                        request: asRecord(body.request, "request"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
+                case "/internal/mcp/room-management": {
+                    const result = await bridge.roomManagement({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                        agent_object_id: requireString(body, "agent_object_id"),
+                        operation: requireString(body, "operation") as RoomManagementRequest["operation"],
+                        request: asRecord(body.request, "request"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
+                case "/internal/mcp/room-tool": {
+                    const result = await bridge.roomTool({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                        agent_object_id: requireString(body, "agent_object_id"),
+                        tool_name: requireString(body, "tool_name"),
+                        arguments: asRecord(body.arguments, "arguments"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
+                case "/internal/work/dispatch": {
+                    const result = await bridge.workRunDispatch({
+                        key_ref: requireString(body, "key_ref"),
+                        account_id: requireString(body, "account_id"),
+                        parent_agent_id: requireString(body, "parent_agent_id"),
+                        run_id: requireString(body, "run_id"),
+                        dispatch_id: requireString(body, "dispatch_id"),
+                        turn: asRecord(body.turn, "turn"),
+                    });
+                    sendJson(res, 200, result);
+                    return;
+                }
                 default:
                     sendJson(res, 404, { error: "not found", code: "not_found" });
                     return;
@@ -294,6 +369,11 @@ async function main(): Promise<void> {
         requestTimeoutMs: config.requestTimeoutMs,
         eventsUrl: config.eventsUrl,
         eventsSecret: config.eventsSecret ?? config.internalSyncSecret,
+        internalSyncSecret: config.internalSyncSecret,
+        workMcpUrl: config.workMcpUrl,
+        messagingRelayerUrl: config.messagingRelayerUrl,
+        workDispatchUrl: config.workDispatchUrl,
+        workDispatchSecret: config.workDispatchSecret,
     };
     const bridge = new MemoryBridge(bridgeOptions);
 

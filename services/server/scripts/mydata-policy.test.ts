@@ -31,7 +31,7 @@ test("organization approval puts the key id first, then config, account, org, gr
 const configId = process.env.TEST_MEMORY_CONFIG_ID;
 const accountId = process.env.TEST_MEMORY_ACCOUNT_ID;
 test("owner approval resolves against the deployed Move ABI", { skip: !configId || !accountId }, async () => {
-    const client = new MySoJsonRpcClient({ url: process.env.MYSO_RPC_URL || "http://127.0.0.1:9000" });
+    const client = new MySoJsonRpcClient({ url: process.env.MYSO_RPC_URL || "http://127.0.0.1:9000", network: process.env.MYSO_NETWORK ?? "localnet" });
     const tx = new Transaction();
     addApproveKeyPolicyCall(tx, process.env.MEMORY_PACKAGE_ID || "0x50c1", configId!, Array(32).fill(1), accountId!, null);
     const bytes = await tx.build({ client, onlyTransactionKind: true });
@@ -44,7 +44,7 @@ test("owner approval resolves against the deployed Move ABI", { skip: !configId 
 test("organization approval resolves against the deployed Move ABI", {
     skip: !configId || !accountId || !process.env.TEST_ORGANIZATION_ID || !process.env.TEST_ORG_MEMORY_GROUP_ID,
 }, async () => {
-    const client = new MySoJsonRpcClient({ url: process.env.MYSO_RPC_URL || "http://127.0.0.1:9000" });
+    const client = new MySoJsonRpcClient({ url: process.env.MYSO_RPC_URL || "http://127.0.0.1:9000", network: process.env.MYSO_NETWORK ?? "localnet" });
     const tx = new Transaction();
     addApproveKeyPolicyCall(tx, process.env.MEMORY_PACKAGE_ID || "0x50c1", configId!, Array(32).fill(1), accountId!, {
         organizationId: process.env.TEST_ORGANIZATION_ID!,

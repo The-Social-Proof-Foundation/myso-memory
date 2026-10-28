@@ -1,4 +1,5 @@
 export type McpErrorCode =
+    | "NOT_FOUND"
     | "INVALID_ARGUMENT"
     | "INVALID_CONFIGURATION"
     | "UNSAFE_LEGACY_CREDENTIALS"

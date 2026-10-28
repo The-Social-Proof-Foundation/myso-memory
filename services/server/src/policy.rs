@@ -31,7 +31,6 @@ pub enum PolicyError {
     MissingCapability { required: u64 },
     WrongPlatformScope,
     ApprovalRequired { required: u64 },
-    SpendLimitExceeded { limit_mist: Option<u64> },
 }
 
 impl PolicyError {
@@ -46,9 +45,6 @@ impl PolicyError {
             }
             PolicyError::ApprovalRequired { .. } => {
                 crate::memory_contract::E_SUB_AGENT_APPROVAL_REQUIRED
-            }
-            PolicyError::SpendLimitExceeded { .. } => {
-                crate::memory_contract::E_SUB_AGENT_SPEND_EXCEEDED
             }
         }
     }
@@ -76,9 +72,6 @@ impl std::fmt::Display for PolicyError {
                 required,
                 capability_label(*required)
             ),
-            PolicyError::SpendLimitExceeded { limit_mist } => {
-                write!(f, "action exceeds max_action_spend ({:?} MIST)", limit_mist)
-            }
         }
     }
 }

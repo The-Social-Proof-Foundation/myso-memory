@@ -1,6 +1,7 @@
 import { blake2b } from "@noble/hashes/blake2.js";
 import type {
     AgentPolicyParams,
+    BindAgentRoomToTaskParams,
     CreateMessagingGroupParams,
     CreateOrganizationInvitationParams,
     CreateOrganizationParams,
@@ -9,6 +10,9 @@ import type {
     OrganizationInvitationDecisionParams,
     OrganizationObjectParams,
     OrganizationRoleParams,
+    OrganizationTreasuryAccessParams,
+    OrganizationTreasuryFundParams,
+    OrganizationTreasuryWithdrawParams,
     RegisterChildAgentParams,
     RegisterRootAgentParams,
     SocialChainConfig,
@@ -18,6 +22,7 @@ import type {
 } from "../types.js";
 import type { BuildTxContext } from "./post.js";
 import { MYSO_CLOCK, optAddress, optString, optU8 } from "./helpers.js";
+import { canonicalCoinType } from "./coin-type.js";
 
 /** `messaging::room_kind_agent_room()`; the only room kind defined on-chain. */
 const AGENT_ROOM_KIND = 1;
@@ -69,6 +74,27 @@ function optAddressString(tx: any, value: string | undefined, label: string): un
 function normalizeAddress(value: string): string {
     const raw = value.replace(/^0x/, "").toLowerCase();
     return `0x${raw.padStart(64, "0")}`;
+}
+
+/** Canonical `memory::org_memory_group_address`: matches the derived object ID
+ * claimed from AgenticOrganization by `OrgMemoryGroupTag`. */
+export function deriveOrgMemoryGroupId(packageId: string, organizationId: string): string {
+    const addressBytes = (value: string, label: string): Uint8Array => {
+        if (!/^0x[0-9a-fA-F]{1,64}$/.test(value)) throw new TypeError(`${label} must be a MySo address`);
+        const hex = value.slice(2).toLowerCase().padStart(64, "0");
+        return Uint8Array.from({ length: 32 }, (_, index) => Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16));
+    };
+    const identifier = (value: string): number[] => [value.length, ...Array.from(new TextEncoder().encode(value))];
+    const packageBytes = addressBytes(packageId, "packageId");
+    const parentBytes = addressBytes(organizationId, "organizationId");
+    const orgTag = [7, ...packageBytes, ...identifier("memory"), ...identifier("OrgMemoryGroupTag"), 0];
+    const derivedObjectKey = [7, ...new Uint8Array(31), 2, ...identifier("derived_object"), ...identifier("DerivedObjectKey"), 1, ...orgTag];
+    const preimage = new Uint8Array(1 + 32 + 8 + 1 + derivedObjectKey.length);
+    preimage[0] = 0xf0; preimage.set(parentBytes, 1);
+    preimage[33] = 1; // BCS u64 little-endian key length (one byte)
+    preimage[41] = 0; // BCS DerivedObjectKey(false)
+    preimage.set(derivedObjectKey, 42);
+    return `0x${Array.from(blake2b(preimage, { dkLen: 32 })).map((byte) => byte.toString(16).padStart(2, "0")).join("")}`;
 }
 
 export function deriveAgentAddress(publicKeyHex: string): string {
@@ -178,6 +204,64 @@ function organizationObjectAction(fn: "deactivate_agentic_organization" | "ensur
 
 export const buildDeactivateOrganizationTx = organizationObjectAction("deactivate_agentic_organization");
 export const buildEnsureOrganizationMemoryGroupTx = organizationObjectAction("ensure_org_memory_group");
+
+function organizationTreasuryCoinType(value: string): string {
+    const normalized = canonicalCoinType(value);
+    if (normalized !== value) throw new TypeError("coinType must use its canonical fully-qualified form");
+    return normalized;
+}
+
+export function buildGrantOrganizationTreasuryAccessTx(ctx: BuildTxContext, params: OrganizationTreasuryAccessParams): any {
+    if (!ADDRESS.test(params.recipient)) throw new TypeError("recipient must be a MySo address");
+    const tx = new ctx.Transaction();
+    tx.moveCall({
+        target: memoryTarget(ctx, "grant_org_treasury_access"),
+        arguments: [
+            tx.object(ctx.memoryAccountId),
+            tx.object(params.organizationId),
+            tx.object(params.orgMemoryGroupId),
+            tx.pure("address", params.recipient),
+            tx.pure("bool", params.hasAccess),
+            tx.object(ctx.chain.clockId ?? MYSO_CLOCK),
+        ],
+    });
+    return tx;
+}
+
+export function buildWithdrawOrganizationTreasuryTx(ctx: BuildTxContext, params: OrganizationTreasuryWithdrawParams): any {
+    if (!ADDRESS.test(params.recipient)) throw new TypeError("recipient must be a MySo address");
+    if (!/^[1-9][0-9]{0,19}$/.test(params.amountBaseUnits) || BigInt(params.amountBaseUnits) > MAX_U64) throw new TypeError("amountBaseUnits must be a positive u64 decimal string");
+    const tx = new ctx.Transaction();
+    tx.moveCall({
+        target: memoryTarget(ctx, "withdraw_from_org_treasury"),
+        typeArguments: [organizationTreasuryCoinType(params.coinType)],
+        arguments: [
+            tx.object(ctx.memoryAccountId),
+            tx.object(params.organizationId),
+            tx.object(params.orgMemoryGroupId),
+            tx.pure("address", params.recipient),
+            tx.pure("u64", params.amountBaseUnits),
+            tx.object(ctx.chain.clockId ?? MYSO_CLOCK),
+        ],
+    });
+    return tx;
+}
+
+export function buildFundOrganizationTreasuryTx(ctx: BuildTxContext, params: OrganizationTreasuryFundParams): any {
+    if (!/^[1-9][0-9]{0,19}$/.test(params.amountBaseUnits) || BigInt(params.amountBaseUnits) > MAX_U64) throw new TypeError("amountBaseUnits must be a positive u64 decimal string");
+    const tx = new ctx.Transaction();
+    tx.moveCall({
+        target: memoryTarget(ctx, "fund_org_treasury"),
+        typeArguments: [organizationTreasuryCoinType(params.coinType)],
+        arguments: [
+            tx.object(params.organizationId),
+            tx.object(params.paymentCoinId),
+            tx.pure("u64", params.amountBaseUnits),
+            tx.object(ctx.chain.clockId ?? MYSO_CLOCK),
+        ],
+    });
+    return tx;
+}
 
 export function buildDefineOrganizationRoleTx(ctx: BuildTxContext, params: DefineOrganizationRoleParams): any {
     const tx = new ctx.Transaction();
@@ -379,6 +463,29 @@ export function buildCreateMessagingGroupTx(ctx: BuildTxContext, params: CreateM
             optU8(tx, params.roomKind),
             // `ID` has the same BCS bytes as an address.
             optAddress(tx, params.roomTaskId),
+            tx.object(ctx.chain.clockId ?? MYSO_CLOCK),
+        ],
+    });
+    return tx;
+}
+
+export function buildBindAgentRoomToTaskTx(ctx: BuildTxContext, params: BindAgentRoomToTaskParams): any {
+    if (!ADDRESS.test(params.groupId) || !ADDRESS.test(params.taskId)) {
+        throw new TypeError("groupId and taskId must be MySo object ids");
+    }
+    const tx = new ctx.Transaction();
+    const packageId = requiredChainField(ctx.chain, "messagingPackageId");
+    tx.moveCall({
+        target: `${packageId}::messaging::bind_agent_room_to_task`,
+        arguments: [
+            tx.object(requiredChainField(ctx.chain, "messagingVersionId")),
+            tx.object(requiredChainField(ctx.chain, "messagingGroupManagerId")),
+            tx.object(params.groupId),
+            tx.object(params.taskId),
+            tx.object(ctx.chain.blockListRegistryId),
+            tx.object(params.platformObjectId ?? ctx.chain.platformObjectId),
+            tx.object(ctx.chain.memoryConfigId),
+            tx.object(ctx.memoryAccountId),
             tx.object(ctx.chain.clockId ?? MYSO_CLOCK),
         ],
     });

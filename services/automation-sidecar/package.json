@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@socialproof/memory": "workspace:*",
+    "@socialproof/memory-mcp": "workspace:*",
     "@socialproof/myso": "0.0.4",
     "@socialproof/sub-agents": "workspace:*"
   },

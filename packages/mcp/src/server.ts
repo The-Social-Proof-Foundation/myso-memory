@@ -5,10 +5,9 @@ import {
     type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import { MCP_PACKAGE_VERSION, MCP_SERVER_NAME } from "./version.js";
-import { createToolCatalog, executeTool, type ToolDependencies } from "./tools.js";
+import { connectionToolCatalog, executeTool, type ToolDependencies } from "./tools.js";
 
 export function createMemoryMcpServer(dependencies: ToolDependencies): Server {
-    const socialToolNames = dependencies.social?.supportedToolNames ?? [];
     const server = new Server(
         { name: MCP_SERVER_NAME, version: MCP_PACKAGE_VERSION },
         {
@@ -19,7 +18,7 @@ export function createMemoryMcpServer(dependencies: ToolDependencies): Server {
     );
 
     server.setRequestHandler(ListToolsRequestSchema, async () => ({
-        tools: createToolCatalog(socialToolNames, dependencies.oauthScopes),
+        tools: await connectionToolCatalog(dependencies),
     }));
 
     server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {

@@ -44,11 +44,11 @@ async fn push_usage_stats(state: &Arc<AppState>) -> Result<(), crate::types::App
     let stats: Vec<MemoryUsageStatEntry> = rows
         .into_iter()
         .map(
-            |(agent_object_id, organization_id, entries, bytes, org_shared_entries)| {
+            |(agent_object_id, organization_id, account_id, entries, bytes, org_shared_entries)| {
                 MemoryUsageStatEntry {
                     agent_object_id,
                     organization_id,
-                    account_id: None,
+                    account_id: normalize_account_id(account_id),
                     entries,
                     bytes,
                     org_shared_entries,
@@ -81,4 +81,13 @@ async fn push_usage_stats(state: &Arc<AppState>) -> Result<(), crate::types::App
     }
     tracing::debug!(agents = count, "memory usage-stats pushed");
     Ok(())
+}
+
+fn normalize_account_id(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let hex = value.trim().strip_prefix("0x").unwrap_or(value.trim());
+    if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("0x{:0>64}", hex.to_ascii_lowercase()))
 }

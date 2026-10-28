@@ -21,12 +21,15 @@ export async function runCli(): Promise<void> {
     const social = credentials.socialEnabled && credentials.social
         ? new SponsoredSocialGateway({
               signer,
+              workJournal: memory,
+              privateData: memory,
               accountId: credentials.accountId,
               serverUrl: credentials.socialGatewayUrl,
               platformId: credentials.platformId,
               network: credentials.social.network,
               rpcUrl: credentials.social.rpcUrl,
               chain: credentials.social.chain,
+              messagingRelayerUrl: credentials.social.messagingRelayerUrl,
           })
         : undefined;
     const server = createMemoryMcpServer({

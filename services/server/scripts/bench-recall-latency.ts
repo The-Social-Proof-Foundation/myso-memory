@@ -494,7 +494,7 @@ async function main(): Promise<void> {
     console.log(
       color(col, C.red, `✘ Warm recall p50 = ${ms(warmStats.p50)} — still above ${TARGET_RECALL_WARM_P50_MS}ms target`)
     );
-    console.log("  → Check server logs for per-phase breakdown (embed / vector_search / file_storage_fetch / mydata_batch_decrypt)");
+    console.log("  → Check server logs for per-phase breakdown (embed / vector_search / r2_fetch / mydata_batch_decrypt)");
   }
   console.log();
 

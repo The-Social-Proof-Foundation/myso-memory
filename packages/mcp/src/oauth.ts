@@ -46,9 +46,11 @@ export class OAuthIntrospectionVerifier implements OAuthTokenVerifier {
         if (result.active !== true) {
             throw new McpRuntimeError("AUTHENTICATION_FAILED", "OAuth token is inactive or revoked.");
         }
+        const walletAddress = typeof result.wallet_address === "string" ? result.wallet_address : "";
         const audience = Array.isArray(result.aud) ? result.aud : [result.aud];
         const expected = normalizeResource(this.resource);
-        if (!audience.some((value) => typeof value === "string" && safeNormalizedResource(value) === expected)) {
+        const audienceMatches = audience.some((value) => typeof value === "string" && safeNormalizedResource(value) === expected);
+        if (!audienceMatches && !walletAddress) {
             throw new McpRuntimeError("AUTHENTICATION_FAILED", "OAuth token audience is invalid.");
         }
         const scopes = typeof result.scope === "string" ? result.scope.split(/\s+/).filter(Boolean) : [];
@@ -59,13 +61,20 @@ export class OAuthIntrospectionVerifier implements OAuthTokenVerifier {
         return {
             token,
             clientId,
-            scopes,
+            scopes: scopes.length > 0 ? scopes : walletAddress ? ["mcp:connect", "agent:read"] : scopes,
             expiresAt: typeof result.exp === "number" ? result.exp : undefined,
             resource: this.resource,
             extra: {
                 accountId: result.account_id,
                 agentObjectId: result.agent_object_id,
                 signerSessionId: result.signer_session_id,
+                ...(walletAddress ? { walletAddress } : {}),
+                ...(typeof result.key_id === "string" ? { keyId: result.key_id } : {}),
+                ...(typeof result.expected_address === "string"
+                    ? { expectedAddress: result.expected_address }
+                    : typeof result.derived_address === "string"
+                        ? { expectedAddress: result.derived_address }
+                        : {}),
             },
         };
     }
@@ -84,6 +93,24 @@ export interface HostedMcpPrincipal {
     accountId: string;
     agentObjectId: string;
     signerSessionId: string;
+    /** Ephemeral MyData session supplied by the client vault; forwarded only for work_run_* tools. */
+    myDataSession?: string;
+    /** Narrow service-issued identity for one unattended action-worker run. */
+    workerRun?: {
+        credential: string;
+        runId: string;
+        workerAgentObjectId: string;
+        workerCapabilities: number;
+        workerMaxActionSpend: string;
+        delegateRef: string;
+        allowedActionIds: readonly string[];
+        expiresAt: string;
+        taskId: string | null;
+        allowPrivateGraph: boolean;
+        allowRoomHistory: boolean;
+        allowPrivateTaskArtifacts: boolean;
+        allowPrivateContentSharing: boolean;
+    };
 }
 
 function extraString(auth: AuthInfo, name: string): string {
@@ -94,10 +121,17 @@ function extraString(auth: AuthInfo, name: string): string {
     return value;
 }
 
+export interface WalletPrincipalBinding {
+    accountId: string;
+    agentObjectId: string;
+    signerSessionId: string;
+}
+
 export async function authenticateHostedRequest(
     request: IncomingMessage,
     verifier: OAuthTokenVerifier,
     resource: URL,
+    resolveWalletPrincipal?: (walletAddress: string, boundAgentId?: string) => Promise<WalletPrincipalBinding | null>,
 ): Promise<HostedMcpPrincipal> {
     const header = request.headers.authorization;
     const match = typeof header === "string" ? /^Bearer ([A-Za-z0-9._~+\/-]+=*)$/.exec(header) : null;
@@ -105,6 +139,22 @@ export async function authenticateHostedRequest(
         throw new McpRuntimeError("AUTHENTICATION_FAILED", "A Bearer access token is required.");
     }
     const auth = await verifier.verifyAccessToken(match[1]);
+    const boundHeader = request.headers["x-myso-bound-agent"];
+    if (Array.isArray(boundHeader)) throw new McpRuntimeError("INVALID_ARGUMENT", "Only one bound agent may be supplied.");
+    const boundAgentId = typeof boundHeader === "string" && boundHeader.length > 0 ? boundHeader : undefined;
+    if (boundAgentId && !/^0x[0-9a-f]{1,64}$/i.test(boundAgentId)) {
+        throw new McpRuntimeError("AUTHENTICATION_FAILED", "The bound agent id is invalid.");
+    }
+    const walletAddress = typeof auth.extra?.walletAddress === "string" ? auth.extra.walletAddress : "";
+    const alreadyBound = ["accountId", "agentObjectId", "signerSessionId"].every((name) => typeof auth.extra?.[name] === "string" && String(auth.extra?.[name]).trim());
+    if ((!alreadyBound || boundAgentId) && walletAddress && resolveWalletPrincipal) {
+        const resolved = await resolveWalletPrincipal(walletAddress, boundAgentId);
+        if (resolved) {
+            auth.extra = { ...auth.extra, accountId: resolved.accountId, agentObjectId: resolved.agentObjectId, signerSessionId: resolved.signerSessionId };
+        }
+    } else if (boundAgentId && !walletAddress) {
+        throw new McpRuntimeError("AUTHENTICATION_FAILED", "A bound agent requires a verified wallet session.");
+    }
     const nowSeconds = Math.floor(Date.now() / 1000);
     if (auth.expiresAt !== undefined && auth.expiresAt <= nowSeconds) {
         throw new McpRuntimeError("AUTHENTICATION_FAILED", "The OAuth access token expired.");
@@ -115,11 +165,20 @@ export async function authenticateHostedRequest(
     if (!auth.resource || normalizeResource(auth.resource) !== normalizeResource(resource)) {
         throw new McpRuntimeError("AUTHENTICATION_FAILED", "The OAuth token audience does not match this MCP resource.");
     }
+    const myDataSessionHeader = request.headers["x-mydata-session"];
+    if (Array.isArray(myDataSessionHeader)) {
+        throw new McpRuntimeError("INVALID_ARGUMENT", "Only one MyData session may be supplied.");
+    }
+    const myDataSession = typeof myDataSessionHeader === "string" ? myDataSessionHeader : undefined;
+    if (myDataSession !== undefined && (!/^[A-Za-z0-9+/]+={0,2}$/.test(myDataSession) || myDataSession.length > 32_768)) {
+        throw new McpRuntimeError("INVALID_ARGUMENT", "The MyData session is malformed or exceeds the size limit.");
+    }
     return {
         auth,
         accountId: extraString(auth, "accountId"),
         agentObjectId: extraString(auth, "agentObjectId"),
         signerSessionId: extraString(auth, "signerSessionId"),
+        ...(myDataSession ? { myDataSession } : {}),
     };
 }
 

@@ -8,11 +8,15 @@
  * Does NOT import account.js (which requires @socialproof/myso).
  *
  * For account management, import from "@socialproof/memory/account".
- * For manual (client-side MYDATA + File Storage), import from "@socialproof/memory/manual".
+ * For manual (client-side MYDATA + private R2 transport), import from "@socialproof/memory/manual".
  */
 
-// Core client (server-mode: server handles MYDATA + File Storage + embedding)
+// Core client (server-mode: server handles MYDATA + private R2 + embedding)
 export { Memory, AiCreditApprovalRequiredError } from "./memory.js";
+export { parseMySoKnowledgeGraph, searchMyDataGraph, getMyDataGraphItem } from "./knowledge-graph.js";
+export type { MySoKnowledgeGraph, MySoGraphNode, MySoGraphEdge, MySoGraphEdgeKind, MySoGraphEvidence, MySoGraphProvenance, MyDataGraphSearchRequest, MyDataGraphSearchResult, MyDataGraphItemRequest, MyDataGraphItemResult } from "./knowledge-graph.js";
+export { canonicalGraphJson, createMySoGraphPublication, decodeMySoGraphPublicationTags, encodeMySoGraphPublicationTags, graphManifestHashHex, parseMySoGraphManifest, verifyMySoGraphPublication, verifyMySoGraphPublicationMetadata } from "./graph-manifest.js";
+export type { GraphAuthorityVerifier, GraphOnchainQuoteTerms, GraphPublicationSigner, MySoGraphAuthorityProof, MySoGraphManifest, MySoGraphOfferTerms, MySoGraphPublication, MySoGraphPublicationDocument, MySoGraphSourceRight } from "./graph-manifest.js";
 
 // Delegate key utilities (no @socialproof/myso dependency)
 export { delegateKeyToMySoAddress, delegateKeyToPublicKey } from "./utils.js";
@@ -46,6 +50,10 @@ export {
 
 export type {
     MemoryConfig,
+    MyDataContentRequest,
+    MyDataContentPage,
+    MyDataCurrentAccessRequest,
+    MyDataCurrentAccessResult,
     RememberAcceptedResponse,
     RememberJobResult,
     RememberJobPollOptions,

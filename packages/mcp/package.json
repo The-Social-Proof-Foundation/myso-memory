@@ -4,20 +4,23 @@
   "description": "MCP server bridging Memory relayer tools for Cursor and other MCP clients",
   "type": "module",
   "bin": {
-    "memory-mcp": "./dist/bin/memory-mcp.js"
+    "memory-mcp": "./dist/bin/memory-mcp.js",
+    "memory-mcp-http": "./dist/bin/memory-mcp-http.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "tsc",
+    "start": "node dist/bin/memory-mcp-http.js",
     "typecheck": "tsc --noEmit",
     "test": "pnpm run build && node --test test/*.test.mjs",
     "pack:check": "pnpm run build && npm pack --dry-run"
   },
   "dependencies": {
-    "@socialproof/memory": "0.0.5",
+    "@socialproof/memory": "workspace:^",
     "@socialproof/myso": "0.0.4",
-    "@socialproof/sub-agents": "0.0.2",
+    "@socialproof/myso-messaging-stack": "link:../../../myso-messaging-stack/ts-sdks/packages/myso-messaging-stack",
+    "@socialproof/sub-agents": "workspace:^",
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
@@ -30,7 +33,10 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "engines": {
     "node": ">=22"
   },

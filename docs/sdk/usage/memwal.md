@@ -3,13 +3,13 @@ title: "Memory"
 description: "The recommended default client — relayer handles embeddings, MYDATA, and storage."
 ---
 
-The recommended default client. The relayer handles embeddings, MYDATA encryption, File Storage upload, and vector indexing.
+The recommended default client. The relayer handles embeddings, MYDATA encryption, private Cloudflare R2 storage, and vector indexing.
 
 ## How It Works
 
 1. The SDK signs each request with your delegate key
 2. The relayer verifies delegate access
-3. `remember` encrypts via MYDATA, uploads to File Storage, and indexes the vector embedding
+3. `remember` encrypts via MYDATA, stores ciphertext in private R2, and indexes the vector embedding
 4. `recall` searches by Memory Space and returns decrypted matches
 
 ```ts
@@ -45,7 +45,7 @@ await memory.health();
 ## Restore
 
 Rebuild missing indexed entries for one namespace. Incremental, namespace-scoped, and meant to
-repair PostgreSQL vector state from File Storage-backed memory.
+repair PostgreSQL vector state from private R2-backed memory.
 
 ```ts
 const result = await memory.restore("chatbot-prod", 50);

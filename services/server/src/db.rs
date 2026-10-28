@@ -52,6 +52,23 @@ impl VectorDb {
                 "015",
                 include_str!("../migrations/015_agent_custody_tiers.sql"),
             ),
+            ("016", include_str!("../migrations/016_work_journal.sql")),
+            ("017", include_str!("../migrations/017_work_turns.sql")),
+            ("018", include_str!("../migrations/018_chain_action_receipt_context.sql")),
+            ("019", include_str!("../migrations/019_task_deliverable_uploads.sql")),
+            ("020", include_str!("../migrations/020_action_approval_parameters.sql")),
+            ("020b", include_str!("../migrations/020_mydata_graph_publication_encryptions.sql")),
+            ("021", include_str!("../migrations/021_work_run_worker_credentials.sql")),
+            ("022", include_str!("../migrations/022_work_ai_spend_budget.sql")),
+            ("023", include_str!("../migrations/023_work_run_worker_private_consents.sql")),
+            ("024", include_str!("../migrations/024_work_run_cancellation.sql")),
+            ("025", include_str!("../migrations/025_work_operation_step_attribution.sql")),
+            ("026", include_str!("../migrations/026_yielded_work_turns.sql")),
+            ("027", include_str!("../migrations/027_yielded_work_runs.sql")),
+            ("028", include_str!("../migrations/028_work_operation_inputs.sql")),
+            ("029", include_str!("../migrations/029_work_run_worker_task_artifact_consent.sql")),
+            ("031", include_str!("../migrations/031_reenable_consented_hosted_graph_reads.sql")),
+            ("032", include_str!("../migrations/032_work_operation_gas_receipts.sql")),
         ] {
             sqlx::raw_sql(sql).execute(&pool).await.map_err(|e| {
                 AppError::Internal(format!("Failed to run migration {}: {}", name, e))
@@ -184,18 +201,23 @@ impl VectorDb {
     }
 
     /// Per-agent memory usage aggregates for the social-server stats push.
+    /// The account id comes from the newest cached sub-agent row for that agent.
     pub async fn memory_usage_summary(
         &self,
-    ) -> Result<Vec<(String, Option<String>, i64, i64, i64)>, AppError> {
-        let rows: Vec<(String, Option<String>, i64, i64, i64)> = sqlx::query_as(
-            "SELECT agent_object_id,
-                    MAX(organization_id) AS organization_id,
+    ) -> Result<Vec<(String, Option<String>, Option<String>, i64, i64, i64)>, AppError> {
+        let rows: Vec<(String, Option<String>, Option<String>, i64, i64, i64)> = sqlx::query_as(
+            "SELECT v.agent_object_id,
+                    MAX(v.organization_id) AS organization_id,
+                    (SELECT c.account_id FROM sub_agent_cache c
+                      WHERE c.agent_object_id = v.agent_object_id
+                      ORDER BY c.cached_at DESC
+                      LIMIT 1) AS account_id,
                     COUNT(*)::BIGINT AS entries,
-                    COALESCE(SUM(blob_size_bytes)::BIGINT, 0) AS bytes,
-                    COUNT(*) FILTER (WHERE visibility = 1)::BIGINT AS org_shared_entries
-             FROM vector_entries
-             WHERE tombstoned = FALSE AND agent_object_id IS NOT NULL
-             GROUP BY agent_object_id",
+                    COALESCE(SUM(v.blob_size_bytes)::BIGINT, 0) AS bytes,
+                    COUNT(*) FILTER (WHERE v.visibility = 1)::BIGINT AS org_shared_entries
+             FROM vector_entries v
+             WHERE v.tombstoned = FALSE AND v.agent_object_id IS NOT NULL
+             GROUP BY v.agent_object_id",
         )
         .fetch_all(&self.pool)
         .await
@@ -489,5 +511,73 @@ impl VectorDb {
         .await
         .map_err(|e| AppError::Internal(format!("Failed to save agent model: {}", e)))?;
         Ok(())
+    }
+
+    /// Reserve an idempotency identity before a paid task artifact upload.
+    /// Returns the existing completed URI; a matching pending identity must be
+    /// reconciled against the private R2 object before a caller can retry the side effect.
+    pub async fn reserve_task_deliverable_upload(
+        &self,
+        account_id: &str,
+        agent_id: &str,
+        task_id: &str,
+        idempotency_key: &str,
+        content_sha256: &str,
+        storage_namespace: &str,
+    ) -> Result<(String, Option<String>), AppError> {
+        let inserted = sqlx::query(
+            "INSERT INTO task_deliverable_uploads (account_id, agent_id, task_id, idempotency_key, content_sha256, storage_namespace, status) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending') ON CONFLICT DO NOTHING",
+        )
+        .bind(account_id).bind(agent_id).bind(task_id).bind(idempotency_key)
+        .bind(content_sha256).bind(storage_namespace).execute(&self.pool).await
+        .map_err(|_| AppError::Internal("task upload idempotency reservation failed".into()))?;
+        if inserted.rows_affected() == 1 { return Ok(("pending_new".into(), None)); }
+        let row: Option<(String, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT content_sha256, status, uri, storage_namespace FROM task_deliverable_uploads \
+             WHERE account_id=$1 AND agent_id=$2 AND task_id=$3 AND idempotency_key=$4",
+        ).bind(account_id).bind(agent_id).bind(task_id).bind(idempotency_key)
+         .fetch_optional(&self.pool).await
+         .map_err(|_| AppError::Internal("task upload idempotency lookup failed".into()))?;
+        let (prior_digest, status, uri, prior_namespace) = row.ok_or_else(|| AppError::Internal("task upload idempotency record disappeared".into()))?;
+        if prior_digest != content_sha256 || prior_namespace != storage_namespace {
+            return Err(AppError::Conflict("idempotency key was already used for different artifact bytes".into()));
+        }
+        Ok((status, uri))
+    }
+
+    pub async fn complete_task_deliverable_upload(
+        &self, account_id: &str, agent_id: &str, task_id: &str,
+        idempotency_key: &str, uri: &str,
+    ) -> Result<(), AppError> {
+        let result = sqlx::query(
+            "UPDATE task_deliverable_uploads SET status='uploaded', uri=$5, updated_at=NOW() \
+             WHERE account_id=$1 AND agent_id=$2 AND task_id=$3 AND idempotency_key=$4 \
+               AND status='pending' AND uri IS NULL",
+        ).bind(account_id).bind(agent_id).bind(task_id).bind(idempotency_key).bind(uri)
+         .execute(&self.pool).await
+         .map_err(|_| AppError::Internal("task upload completion record failed".into()))?;
+        if result.rows_affected() != 1 {
+            return Err(AppError::Conflict("task upload completion state changed; reconcile before retrying".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn task_deliverable_upload_matches(
+        &self, account_id: &str, agent_id: &str, task_id: &str, uri: &str, content_sha256: &str,
+    ) -> Result<bool, AppError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM task_deliverable_uploads WHERE account_id=$1 AND agent_id=$2 AND task_id=$3 AND uri=$4 AND content_sha256=$5 AND status='uploaded')",
+        ).bind(account_id).bind(agent_id).bind(task_id).bind(uri).bind(content_sha256)
+         .fetch_one(&self.pool).await
+         .map_err(|_| AppError::Internal("task artifact verification lookup failed".into()))
+    }
+
+    pub async fn get_task_deliverable_upload(
+        &self, account_id:&str, agent_id:&str, task_id:&str, idempotency_key:&str,
+    )->Result<Option<(String,String,Option<String>,String)>,AppError>{
+        sqlx::query_as("SELECT content_sha256,status,uri,storage_namespace FROM task_deliverable_uploads WHERE account_id=$1 AND agent_id=$2 AND task_id=$3 AND idempotency_key=$4")
+            .bind(account_id).bind(agent_id).bind(task_id).bind(idempotency_key).fetch_optional(&self.pool).await
+            .map_err(|_|AppError::Internal("task upload recovery lookup failed".into()))
     }
 }

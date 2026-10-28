@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::db::VectorDb;
@@ -13,8 +14,6 @@ pub struct AppState {
     pub db: VectorDb,
     pub config: Config,
     pub http_client: reqwest::Client,
-    /// Round-robin pool of MySo private keys for parallel File Storage uploads
-    pub key_pool: KeyPool,
     /// Redis multiplexed connection for rate limiting
     pub redis: redis::aio::MultiplexedConnection,
     /// In-memory token bucket fallback for when Redis is unavailable
@@ -30,11 +29,13 @@ pub struct AppState {
 /// A thread-safe round-robin pool of MySo private keys.
 /// Each call to `next()` returns the next key in the pool,
 /// allowing concurrent uploads to use different signer addresses.
+#[cfg(test)]
 pub struct KeyPool {
     keys: Vec<String>,
     counter: AtomicUsize,
 }
 
+#[cfg(test)]
 impl KeyPool {
     pub fn new(keys: Vec<String>) -> Self {
         Self {
@@ -74,7 +75,6 @@ impl KeyPool {
 /// Where encrypted memory ciphertext is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlobBackend {
-    FileStorage,
     R2,
 }
 
@@ -82,8 +82,8 @@ impl BlobBackend {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_lowercase().as_str() {
             "r2" | "cloudflare" | "cf" => Self::R2,
-            "file_storage" | "filestorage" | "file-storage" | "" => Self::FileStorage,
-            other => panic!("MEMORY_BLOB_BACKEND must be file_storage or r2, got {other}"),
+            "" => Self::R2,
+            other => panic!("MEMORY_BLOB_BACKEND must be r2, got {other}"),
         }
     }
 }
@@ -104,17 +104,17 @@ pub struct Config {
     /// Embeddings continue to use the independently configured OpenAI-compatible API.
     pub openrouter_api_key: Option<String>,
     pub openrouter_api_base: String,
-    pub file_storage_publisher_url: String,
-    pub file_storage_aggregator_url: String,
     /// Primary key (used for MYDATA decrypt / recall). Unchanged.
     pub myso_private_key: Option<String>,
-    /// Pool of keys for parallel File Storage uploads (parsed from SERVER_MYSO_PRIVATE_KEYS,
-    /// falls back to SERVER_MYSO_PRIVATE_KEY as a single-element list).
-    pub myso_private_keys: Vec<String>,
     pub package_id: String,
     /// Social server base URL for sub-agent index lookups
     pub social_server_url: String,
-    /// URL of the MYDATA/File Storage TS sidecar HTTP server
+    /// Optional Orderbook Indexer HTTP base for the public `/get_pools` market catalog.
+    /// Mainnet/testnet have fixed public defaults; localnet must be explicitly configured.
+    pub orderbook_indexer_url: Option<String>,
+    /// Explicit opt-in for registered SPT buy/sell actions.
+    pub spt_trading_enabled: bool,
+    /// URL of the MYDATA TS sidecar HTTP server
     pub sidecar_url: String,
     /// Shared secret for authenticating Rust→sidecar calls (X-Sidecar-Secret header)
     pub sidecar_secret: Option<String>,
@@ -129,6 +129,25 @@ pub struct Config {
     pub allowed_origins: String,
     /// Bootstrap shared objects for social_contracts::post PTBs
     pub social_chain: SocialChainConfig,
+    /// Opt in only after deploying the bounded MyData purchase entry point.
+    pub mydata_bounded_purchase_enabled: bool,
+    /// Opt in only after deploying the exact post-bound MyData purchase entry.
+    pub mydata_post_access_purchase_enabled: bool,
+    /// Explicit private-content disclosure; independent of enabling purchases.
+    pub mydata_listing_access_enabled: bool,
+    /// Enable only after deploying the subscription quote guards and toggle.
+    pub owner_agent_actions_enabled: bool,
+    pub token_transfers_enabled: bool,
+    pub subscription_actions_enabled: bool,
+    /// Opt in only after the deployed creator-vault claim ABI matches the MCP builder.
+    pub poc_vault_claims_enabled: bool,
+    /// Private PoC oracle endpoint and service credential for authenticated MCP transfer workflows.
+    pub poc_oracle_url: Option<String>,
+    pub poc_oracle_service_key: Option<String>,
+    pub poc_beneficiary_transfer_enabled: bool,
+    pub spot_payout_claims_enabled: bool,
+    pub spot_betting_enabled: bool,
+    pub spot_market_creation_enabled: bool,
     /// Emergency local-only compatibility switch. Production social execution is
     /// client-built/sponsored and never forwards a private key.
     pub allow_legacy_social_key_forwarding: bool,
@@ -145,7 +164,7 @@ pub struct Config {
     pub ai_credit_enabled: bool,
     /// Default LLM model id for analyze/ask when client omits model_id.
     pub default_llm_model: String,
-    /// Where encrypted memory ciphertext is stored. File Storage is the default.
+    /// Where encrypted memory ciphertext is stored. Cloudflare R2 is the only backend.
     pub blob_backend: BlobBackend,
     pub r2_bucket: Option<String>,
     pub r2_endpoint: Option<String>,
@@ -178,6 +197,10 @@ pub struct Config {
     /// The platform's default jury crank operator (`JURY_CRANK_OPERATOR_ID`): the one account whose
     /// jobs may sign cranks with the bridge's `operator:jury` key. Unset, no account may.
     pub jury_crank_operator_id: Option<String>,
+    /// Optional trusted jury-runner origin for assignment-bound verified case-bundle reads.
+    pub jury_bundle_runner_url: Option<String>,
+    /// Shared only with the jury runner; never returned through MCP or API responses.
+    pub jury_bundle_runner_token: Option<String>,
     /// GraphQL endpoint used to discover local shared-object IDs after regenesis.
     pub social_chain_graphql_url: Option<String>,
     /// Enables type-based discovery for missing social/messaging object IDs.
@@ -197,12 +220,20 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct SocialChainConfig {
     pub username_registry_id: String,
+    pub social_memory_registry_id: String,
     pub platform_registry_id: String,
     pub platform_object_id: String,
     pub block_list_registry_id: String,
     pub post_config_id: String,
     pub memory_config_id: String,
     pub mydata_registry_id: String,
+    pub mydata_config_id: String,
+    pub subscription_config_id: String,
+    pub poc_config_id: String,
+    pub spot_config_id: String,
+    pub spot_claim_registry_id: String,
+    pub spt_registry_id: String,
+    pub spt_config_id: String,
     pub social_graph_id: String,
     pub task_config_id: String,
     pub jury_config_id: String,
@@ -220,12 +251,20 @@ impl SocialChainConfig {
     pub fn from_env() -> Self {
         Self {
             username_registry_id: std::env::var("USERNAME_REGISTRY_ID").unwrap_or_default(),
+            social_memory_registry_id: std::env::var("SOCIAL_MEMORY_REGISTRY_ID").unwrap_or_default(),
             platform_registry_id: std::env::var("PLATFORM_REGISTRY_ID").unwrap_or_default(),
             platform_object_id: std::env::var("PLATFORM_OBJECT_ID").unwrap_or_default(),
             block_list_registry_id: std::env::var("BLOCK_LIST_REGISTRY_ID").unwrap_or_default(),
             post_config_id: std::env::var("POST_CONFIG_ID").unwrap_or_default(),
             memory_config_id: std::env::var("MEMORY_CONFIG_ID").unwrap_or_default(),
             mydata_registry_id: std::env::var("MYDATA_REGISTRY_ID").unwrap_or_default(),
+            mydata_config_id: std::env::var("MYDATA_CONFIG_ID").unwrap_or_default(),
+            subscription_config_id: std::env::var("SUBSCRIPTION_CONFIG_ID").unwrap_or_default(),
+            poc_config_id: std::env::var("POC_CONFIG_ID").unwrap_or_default(),
+            spot_config_id: std::env::var("SPOT_CONFIG_ID").unwrap_or_default(),
+            spot_claim_registry_id: std::env::var("SPOT_CLAIM_REGISTRY_ID").unwrap_or_default(),
+            spt_registry_id: std::env::var("SPT_REGISTRY_ID").unwrap_or_default(),
+            spt_config_id: std::env::var("SPT_CONFIG_ID").unwrap_or_default(),
             social_graph_id: std::env::var("SOCIAL_GRAPH_ID").unwrap_or_default(),
             task_config_id: std::env::var("TASK_CONFIG_ID").unwrap_or_default(),
             jury_config_id: std::env::var("JURY_CONFIG_ID").unwrap_or_default(),
@@ -252,15 +291,21 @@ impl SocialChainConfig {
             && !self.mydata_registry_id.is_empty()
     }
 
-    pub fn env_pairs(&self) -> [(&'static str, &str); 18] {
+    pub fn env_pairs(&self) -> [(&'static str, &str); 24] {
         [
             ("USERNAME_REGISTRY_ID", &self.username_registry_id),
+            ("SOCIAL_MEMORY_REGISTRY_ID", &self.social_memory_registry_id),
             ("PLATFORM_REGISTRY_ID", &self.platform_registry_id),
             ("PLATFORM_OBJECT_ID", &self.platform_object_id),
             ("BLOCK_LIST_REGISTRY_ID", &self.block_list_registry_id),
             ("POST_CONFIG_ID", &self.post_config_id),
             ("MEMORY_CONFIG_ID", &self.memory_config_id),
             ("MYDATA_REGISTRY_ID", &self.mydata_registry_id),
+            ("MYDATA_CONFIG_ID", &self.mydata_config_id),
+            ("SUBSCRIPTION_CONFIG_ID", &self.subscription_config_id),
+            ("POC_CONFIG_ID", &self.poc_config_id),
+            ("SPOT_CONFIG_ID", &self.spot_config_id),
+            ("SPOT_CLAIM_REGISTRY_ID", &self.spot_claim_registry_id),
             ("SOCIAL_GRAPH_ID", &self.social_graph_id),
             ("TASK_CONFIG_ID", &self.task_config_id),
             ("JURY_CONFIG_ID", &self.jury_config_id),
@@ -299,12 +344,16 @@ impl Config {
             panic!("AI_CREDIT_ORACLE_API_SECRET must be set when AI_CREDIT_ENABLED=true");
         }
         let blob_backend = BlobBackend::parse(
-            &std::env::var("MEMORY_BLOB_BACKEND").unwrap_or_else(|_| "file_storage".to_string()),
+            &std::env::var("MEMORY_BLOB_BACKEND").unwrap_or_else(|_| "r2".to_string()),
         );
         let r2_bucket = non_empty_env("R2_BUCKET");
         let r2_endpoint = non_empty_env("R2_ENDPOINT");
         let r2_access_key_id = non_empty_env("R2_ACCESS_KEY_ID");
         let r2_secret_access_key = non_empty_env("R2_SECRET_ACCESS_KEY");
+        let jury_bundle_runner_token = non_empty_env("JURY_BUNDLE_READ_TOKEN");
+        if jury_bundle_runner_token.as_ref().is_some_and(|value| value.len() < 32) {
+            panic!("JURY_BUNDLE_READ_TOKEN must be at least 32 characters when configured");
+        }
         if blob_backend == BlobBackend::R2
             && (r2_bucket.is_none()
                 || r2_endpoint.is_none()
@@ -343,30 +392,20 @@ impl Config {
             openrouter_api_key: non_empty_env("OPENROUTER_API_KEY"),
             openrouter_api_base: std::env::var("OPENROUTER_API_BASE")
                 .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string()),
-            file_storage_publisher_url: std::env::var("FILE_STORAGE_PUBLISHER_URL")
-                .unwrap_or_else(|_| "https://publisher.file-storage-mainnet.mysocial.network".to_string()),
-            file_storage_aggregator_url: std::env::var("FILE_STORAGE_AGGREGATOR_URL")
-                .unwrap_or_else(|_| "https://aggregator.file-storage-mainnet.mysocial.network".to_string()),
             myso_private_key: std::env::var("SERVER_MYSO_PRIVATE_KEY").ok(),
-            myso_private_keys: {
-                // SERVER_MYSO_PRIVATE_KEYS takes priority (comma-separated list).
-                // Falls back to SERVER_MYSO_PRIVATE_KEY as a single-element list.
-                let multi = std::env::var("SERVER_MYSO_PRIVATE_KEYS").ok().map(|s| {
-                    s.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(String::from)
-                        .collect::<Vec<_>>()
-                });
-                let single = std::env::var("SERVER_MYSO_PRIVATE_KEY").ok().map(|k| vec![k]);
-                multi.or(single).unwrap_or_default()
-            },
             package_id: crate::memory_contract::normalize_object_id(
                 &std::env::var("MEMORY_PACKAGE_ID")
                     .expect("MEMORY_PACKAGE_ID must be set"),
             ),
             social_server_url: std::env::var("SOCIAL_SERVER_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:9126".to_string()),
+            orderbook_indexer_url: std::env::var("ORDERBOOK_INDEXER_URL")
+                .ok()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .filter(|value| !value.is_empty()),
+            spt_trading_enabled: std::env::var("SPT_TRADING_ENABLED")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             sidecar_url: std::env::var("SIDECAR_URL")
                 .unwrap_or_else(|_| "http://localhost:9009".to_string()),
             sidecar_secret: std::env::var("SIDECAR_AUTH_TOKEN").ok(),
@@ -376,6 +415,22 @@ impl Config {
             allowed_origins: std::env::var("ALLOWED_ORIGINS")
                 .unwrap_or_default(),
             social_chain: SocialChainConfig::from_env(),
+            owner_agent_actions_enabled: std::env::var("OWNER_AGENT_ACTIONS_ENABLED").map(|v|v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            token_transfers_enabled: std::env::var("TOKEN_TRANSFERS_ENABLED").map(|v|v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            subscription_actions_enabled: std::env::var("SUBSCRIPTION_ACTIONS_ENABLED").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            poc_vault_claims_enabled: std::env::var("POC_VAULT_CLAIMS_ENABLED").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            poc_oracle_url: std::env::var("MYSO_POC_ORACLE_URL").ok().map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty()),
+            poc_oracle_service_key: std::env::var("MYSO_POC_MCP_SERVICE_SECRET").ok().filter(|v| !v.trim().is_empty()),
+            poc_beneficiary_transfer_enabled: std::env::var("POC_BENEFICIARY_TRANSFER_ENABLED").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            spot_payout_claims_enabled: std::env::var("SPOT_PAYOUT_CLAIMS_ENABLED").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            spot_betting_enabled: std::env::var("SPOT_BETTING_ENABLED").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            spot_market_creation_enabled: std::env::var("SPOT_MARKET_CREATION_ENABLED").map(|v| v=="1"||v.eq_ignore_ascii_case("true")).unwrap_or(false),
+            mydata_listing_access_enabled: std::env::var("MYDATA_LISTING_ACCESS_ENABLED")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true")).unwrap_or(false),
+            mydata_bounded_purchase_enabled: std::env::var("MYDATA_BOUNDED_PURCHASE_ENABLED")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true")).unwrap_or(false),
+            mydata_post_access_purchase_enabled: std::env::var("MYDATA_POST_ACCESS_PURCHASE_ENABLED")
+                .map(|value| value == "1" || value.eq_ignore_ascii_case("true")).unwrap_or(false),
             allow_legacy_social_key_forwarding: std::env::var(
                 "ALLOW_LEGACY_SOCIAL_KEY_FORWARDING",
             )
@@ -431,6 +486,9 @@ impl Config {
                 .ok()
                 .map(|id| id.trim().to_string())
                 .filter(|id| !id.is_empty()),
+            jury_bundle_runner_url: non_empty_env("JURY_BUNDLE_RUNNER_URL")
+                .map(|value| value.trim_end_matches('/').to_string()),
+            jury_bundle_runner_token,
             social_chain_graphql_url: std::env::var("SOCIAL_CHAIN_GRAPHQL_URL")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -615,7 +673,7 @@ impl SponsorRateLimitConfig {
 // ============================================================
 
 /// POST /api/remember
-/// Phase 2: Server handles everything — encrypt, upload File Storage, embed, store
+/// Phase 2: Server handles everything — encrypt, store in R2, embed, index
 /// Owner is derived from delegate key via onchain verification (auth middleware)
 #[derive(Debug, Deserialize)]
 pub struct RememberRequest {
@@ -803,13 +861,13 @@ pub struct AnalyzeResponse {
 
 /// POST /api/remember/manual
 /// Client sends MYDATA-encrypted data (base64) + pre-computed embedding vector.
-/// Server uploads to File Storage via sidecar, then stores the vector ↔ blobId mapping.
+/// Server stores the encrypted bytes in R2, then stores the vector ↔ blobId mapping.
 #[derive(Debug, Deserialize)]
 pub struct RememberManualRequest {
-    /// Pre-uploaded File Storage blob ID (client did encrypt + upload externally).
+    /// Existing R2 blob ID. New client-encrypted payloads should use `encrypted_data`.
     #[serde(default)]
     pub blob_id: Option<String>,
-    /// Base64 MYDATA-encrypted bytes — server uploads when `blob_id` is absent.
+    /// Base64 MYDATA-encrypted bytes — server uploads to R2 when `blob_id` is absent.
     #[serde(default)]
     pub encrypted_data: String,
     pub vector: Vec<f32>,
@@ -846,8 +904,16 @@ pub struct RecallManualRequest {
 
 #[derive(Debug, Serialize)]
 pub struct RecallManualResponse {
-    pub results: Vec<SearchHit>,
+    pub results: Vec<RecallManualEncryptedHit>,
     pub total: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecallManualEncryptedHit {
+    pub blob_id: String,
+    pub distance: f64,
+    /// Base64-encoded MYDATA ciphertext retrieved through the authenticated R2 path.
+    pub encrypted_data: String,
 }
 
 /// POST /api/ai-credit/record-inference — record LLM usage after external inference (e.g. chatbot).
@@ -939,7 +1005,7 @@ pub struct AskResponse {
 }
 
 /// POST /api/restore
-/// Restore a namespace: download blobs from File Storage, decrypt, re-embed, re-index
+/// Restore a namespace: download blobs from R2, decrypt, re-embed, re-index
 fn default_restore_limit() -> usize {
     50
 }
@@ -1004,12 +1070,28 @@ pub struct ConfigResponse {
 pub struct PublicSocialChainConfig {
     pub package_id: String,
     pub username_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub memory_registry_id: String,
     pub platform_registry_id: String,
     pub platform_object_id: String,
     pub block_list_registry_id: String,
     pub post_config_id: String,
     pub memory_config_id: String,
     pub mydata_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mydata_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subscription_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub poc_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spot_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spot_claim_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spt_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spt_config_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub social_graph_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -1088,6 +1170,7 @@ pub struct ActionApprovalRequest {
     pub idempotency_key: String,
     pub parameters: serde_json::Value,
     pub expires_in_seconds: Option<u64>,
+    pub signer_address: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1111,6 +1194,7 @@ pub struct ActionApprovalResponse {
     pub registry_version: String,
     pub idempotency_key: String,
     pub parameter_hash: String,
+    pub parameters: serde_json::Value,
     pub risk_tier: String,
     pub required_capability: u64,
     pub approval_intent: String,
@@ -1243,7 +1327,7 @@ pub enum AppError {
     #[allow(dead_code)]
     Unauthorized(String),
     Internal(String),
-    /// File Storage blob not found (expired or deleted) — triggers cleanup
+    /// R2 blob not found (deleted or missing) — triggers cleanup
     BlobNotFound(String),
     /// Rate limit exceeded (HTTP 429)
     #[allow(dead_code)]
@@ -1352,7 +1436,7 @@ impl axum::response::IntoResponse for AppError {
 }
 
 // ============================================================
-// Sidecar Types (shared by mydata.rs + file-storage.rs)
+// Sidecar Types (shared by MYDATA client)
 // ============================================================
 
 /// Error response from the TS sidecar HTTP server

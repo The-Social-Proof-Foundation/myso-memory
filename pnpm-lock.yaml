@@ -1006,14 +1006,17 @@ importers:
         specifier: ^1.0.0
         version: 1.29.0(zod@4.4.3)
       '@socialproof/memory':
-        specifier: 0.0.5
-        version: 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)
+        specifier: workspace:^
+        version: link:../sdk
       '@socialproof/myso':
         specifier: 0.0.4
         version: 0.0.4(typescript@5.9.3)
+      '@socialproof/myso-messaging-stack':
+        specifier: link:../../../myso-messaging-stack/ts-sdks/packages/myso-messaging-stack
+        version: link:../../../myso-messaging-stack/ts-sdks/packages/myso-messaging-stack
       '@socialproof/sub-agents':
-        specifier: 0.0.2
-        version: 0.0.2(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)
+        specifier: workspace:^
+        version: link:../sub-agents
     devDependencies:
       '@types/node':
         specifier: ^20.0.0
@@ -1057,9 +1060,6 @@ importers:
       '@socialproof/bcs':
         specifier: ^0.0.2
         version: 0.0.2
-      '@socialproof/file-storage':
-        specifier: '>=0.0.4'
-        version: 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
       '@socialproof/mydata':
         specifier: 0.0.4
         version: 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
@@ -1092,8 +1092,8 @@ importers:
         specifier: ^2.0.0
         version: 2.2.0
       '@socialproof/memory':
-        specifier: 0.0.5
-        version: 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)
+        specifier: workspace:*
+        version: link:../sdk
       '@socialproof/myso':
         specifier: 0.0.4
         version: 0.0.4(typescript@5.9.3)
@@ -1113,6 +1113,9 @@ importers:
       '@socialproof/memory':
         specifier: workspace:*
         version: link:../../packages/sdk
+      '@socialproof/memory-mcp':
+        specifier: workspace:*
+        version: link:../../packages/mcp
       '@socialproof/myso':
         specifier: 0.0.4
         version: 0.0.4(typescript@5.9.3)
@@ -1131,6 +1134,10 @@ importers:
         version: 5.9.3
 
   services/jury-runner:
+    dependencies:
+      '@socialproof/memory':
+        specifier: workspace:*
+        version: link:../../packages/sdk
     devDependencies:
       '@types/node':
         specifier: ^22.8.6
@@ -11764,14 +11771,6 @@ snapshots:
       '@vercel/oidc': 3.2.0
       zod: 3.25.76
 
-  '@ai-sdk/gateway@3.0.110(zod@4.4.3)':
-    dependencies:
-      '@ai-sdk/provider': 3.0.10
-      '@ai-sdk/provider-utils': 4.0.26(zod@4.4.3)
-      '@vercel/oidc': 3.2.0
-      zod: 4.4.3
-    optional: true
-
   '@ai-sdk/gateway@3.0.15(zod@3.25.76)':
     dependencies:
       '@ai-sdk/provider': 3.0.3
@@ -17064,17 +17063,6 @@ snapshots:
       ai: 6.0.175(zod@3.25.76)
       zod: 3.25.76
 
-  '@socialproof/memory@0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)':
-    dependencies:
-      '@noble/ed25519': 2.3.0
-      '@noble/hashes': 2.2.0
-      '@socialproof/mydata': 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
-      '@socialproof/myso': 0.0.4(typescript@5.9.3)
-    optionalDependencies:
-      '@socialproof/file-storage': 0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))
-      ai: 6.0.175(zod@4.4.3)
-      zod: 4.4.3
-
   '@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3))':
     dependencies:
       '@noble/curves': 2.2.0
@@ -17119,18 +17107,6 @@ snapshots:
       '@noble/ed25519': 2.3.0
       '@noble/hashes': 2.2.0
       '@socialproof/memory': 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@3.25.76))(zod@3.25.76)
-      '@socialproof/myso': 0.0.4(typescript@5.9.3)
-    transitivePeerDependencies:
-      - '@socialproof/file-storage'
-      - '@socialproof/mydata'
-      - ai
-      - zod
-
-  '@socialproof/sub-agents@0.0.2(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)':
-    dependencies:
-      '@noble/ed25519': 2.3.0
-      '@noble/hashes': 2.2.0
-      '@socialproof/memory': 0.0.5(@socialproof/file-storage@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/mydata@0.0.4(@socialproof/myso@0.0.4(typescript@5.9.3)))(@socialproof/myso@0.0.4(typescript@5.9.3))(ai@6.0.175(zod@4.4.3))(zod@4.4.3)
       '@socialproof/myso': 0.0.4(typescript@5.9.3)
     transitivePeerDependencies:
       - '@socialproof/file-storage'
@@ -18285,15 +18261,6 @@ snapshots:
       '@ai-sdk/provider-utils': 4.0.26(zod@3.25.76)
       '@opentelemetry/api': 1.9.0
       zod: 3.25.76
-
-  ai@6.0.175(zod@4.4.3):
-    dependencies:
-      '@ai-sdk/gateway': 3.0.110(zod@4.4.3)
-      '@ai-sdk/provider': 3.0.10
-      '@ai-sdk/provider-utils': 4.0.26(zod@4.4.3)
-      '@opentelemetry/api': 1.9.0
-      zod: 4.4.3
-    optional: true
 
   ai@6.0.37(zod@3.25.76):
     dependencies:
@@ -19843,7 +19810,7 @@ snapshots:
       eslint: 9.39.4(jiti@2.7.0)
       eslint-import-resolver-node: 0.3.10
       eslint-import-resolver-typescript: 3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0))
-      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0))
+      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.4(jiti@2.7.0))
       eslint-plugin-jsx-a11y: 6.10.2(eslint@9.39.4(jiti@2.7.0))
       eslint-plugin-react: 7.37.5(eslint@9.39.4(jiti@2.7.0))
       eslint-plugin-react-hooks: 7.1.1(eslint@9.39.4(jiti@2.7.0))
@@ -19876,7 +19843,7 @@ snapshots:
       tinyglobby: 0.2.16
       unrs-resolver: 1.11.1
     optionalDependencies:
-      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0))
+      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.4(jiti@2.7.0))
     transitivePeerDependencies:
       - supports-color
 
@@ -19890,7 +19857,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  eslint-plugin-import@2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)):
+  eslint-plugin-import@2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.4(jiti@2.7.0)):
     dependencies:
       '@rtsao/scc': 1.1.0
       array-includes: 3.1.9

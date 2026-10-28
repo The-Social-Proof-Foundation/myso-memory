@@ -583,7 +583,7 @@ describe("chain actions", () => {
     type Opened = {
         seedHex: string;
         agentObjectId: string;
-        delegateClass: "memory" | "task_worker" | "juror";
+        delegateClass: "memory" | "task_worker" | "juror" | "action_worker";
         allowedActionIds: string[];
     };
 

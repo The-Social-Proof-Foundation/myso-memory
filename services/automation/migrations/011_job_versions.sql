@@ -1,0 +1,2 @@
+ALTER TABLE automation_jobs
+    ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1;

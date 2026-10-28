@@ -2,7 +2,7 @@
  * memory — SDK Client
  *
  * Ed25519 sub-agent key client for the Memory Rust server (TEE).
- * Encryption, embedding, and File Storage happen server-side; the SDK
+ * Encryption, embedding, and private R2 storage happen server-side; the SDK
  * signs requests with a registered sub-agent key.
  *
  * The server resolves the sub-agent via social API + on-chain verification.
@@ -16,7 +16,7 @@
  *     accountId: process.env.MEMORY_ACCOUNT_ID, // MemoryAccount object ID
  * })
  *
- * // Remember — server: verify → embed → encrypt → File Storage → store
+ * // Remember — server: verify → embed → encrypt → R2 → index
  * await memory.remember("I'm allergic to peanuts")
  *
  * // Recall — server: verify → embed query → search → download → decrypt
@@ -27,12 +27,13 @@
 
 import type {
     MemoryConfig,
+    MyDataContentRequest,
+    MyDataContentPage,
     RememberAcceptedResponse,
     RememberJobResult,
     RememberJobPollOptions,
     RememberBulkAcceptedResponse,
     RememberBulkStatusItem,
-    RememberResult,
     RecallResult,
     RecallMemory,
     RecallOptions,
@@ -40,6 +41,9 @@ import type {
     MemoryVisibility,
     EmbedResult,
     AnalyzeResult,
+    GatewayInferenceResult,
+    GatewayChatRequest,
+    GatewayChatResult,
     HealthResult,
     RelayerVersionMetadata,
     RememberManualOptions,
@@ -54,7 +58,9 @@ import {
     MEMORY_TYPESCRIPT_COMPATIBILITY_VERSION,
 } from "./compatibility.js";
 import { AI_CREDIT_APPROVAL_REQUIRED_CODE } from "./contract.js";
-import { sha256hex, hexToBytes, bytesToHex, normalizeServerUrl, sanitizeServerError } from "./utils.js";
+import { sha256hex, hexToBytes, bytesToHex, normalizeServerUrl, sanitizeServerError, delegateKeyToMySoAddress } from "./utils.js";
+import { getMyDataGraphItem, searchMyDataGraph, type MyDataGraphItemRequest, type MyDataGraphItemResult, type MyDataGraphSearchRequest, type MyDataGraphSearchResult } from "./knowledge-graph.js";
+import { createMySoGraphPublication, decodeMySoGraphPublicationTags, encodeMySoGraphPublicationTags, verifyMySoGraphPublicationMetadata, type MySoGraphAuthorityProof, type MySoGraphManifest, type MySoGraphOfferTerms, type MySoGraphPublicationDocument } from "./graph-manifest.js";
 
 // ============================================================
 // Ed25519 Signing (lazy-loaded)
@@ -128,6 +134,9 @@ export class Memory {
     private relayerVersionMetadata: RelayerVersionMetadata | null = null;
     private compatibilityPromise: Promise<RelayerVersionMetadata> | null = null;
 
+    private abortController = new AbortController();
+    private detachAbort?: () => void;
+
     private constructor(config: MemoryConfig) {
         this.privateKey = typeof config.key === "string" ? hexToBytes(config.key) : config.key;
         this.accountId = config.accountId;
@@ -146,6 +155,13 @@ export class Memory {
                 : config.ownerCoSignKey)
             : null;
         this.accountId = config.accountId;
+        if (config.signal) {
+            const signal = config.signal;
+            const stop = () => this.destroy();
+            signal.addEventListener('abort', stop, {once: true});
+            this.detachAbort = () => signal.removeEventListener('abort', stop);
+            if (signal.aborted) this.destroy();
+        }
     }
 
     /**
@@ -163,6 +179,9 @@ export class Memory {
      * Prevents key extraction from V8 heap dumps.
      */
     destroy(): void {
+        this.abortController.abort();
+        this.detachAbort?.();
+        this.detachAbort = undefined;
         if (this.privateKey) {
             this.privateKey.fill(0);
         }
@@ -176,6 +195,9 @@ export class Memory {
         // instance must not leak authorization tokens either.
         this.sessionCache = null;
         this.serverConfig = null;
+        this.sessionBuildPromise = null;
+        this.compatibilityPromise = null;
+        this.relayerVersionMetadata = null;
     }
 
     // ============================================================
@@ -278,7 +300,7 @@ export class Memory {
 
     /**
      * Recall memories similar to a query — server handles:
-     * verify → embed query → search → File Storage download → decrypt → return plaintext
+     * verify → embed query → search → R2 download → decrypt → return plaintext
      *
      * @param query - Search query
      * @param limit - Max number of results (default: 10)
@@ -326,29 +348,28 @@ export class Memory {
     }
 
     // ============================================================
-    // Manual API (user handles MYDATA + embedding + FileStorage)
+    // Manual API (user handles MYDATA + embedding; server stores ciphertext in R2)
     // ============================================================
 
     /**
      * Remember (manual mode) — user handles MYDATA encrypt, embedding,
-     * and File Storage upload externally. Server only stores the vector ↔ blobId mapping.
+     * and submit encrypted bytes for private R2 storage. The server stores ciphertext and vector metadata.
      *
      * Trust boundary (ENG-1696): the delegate private key is NOT transmitted on
      * this request. Manual-mode handlers on the server never invoke MYDATA
      * decrypt, so the key stays client-side as the name implies.
      *
-     * @param opts.blobId - File Storage blob ID (user already uploaded encrypted data)
+     * @param opts.encryptedData - MYDATA-encrypted bytes (base64 or Uint8Array)
      * @param opts.vector - Embedding vector (user already generated, e.g. 1536-dim)
      * @returns RememberManualResult with id, blob_id, owner
      *
      * @example
      * ```typescript
-     * // 1. User encrypts + uploads + embeds on their own
-     * const blobId = await myFileStorageUpload(mydataEncryptedData)
+     * // 1. User encrypts and embeds on their own
      * const vector = await myEmbeddingModel.embed(text)
      *
-     * // 2. Register vector mapping with server
-     * const result = await memory.rememberManual({ blobId, vector })
+     * // 2. Upload encrypted bytes to private R2 through the server
+     * const result = await memory.rememberManual({ encryptedData: mydataEncryptedData, vector })
      * ```
      */
     async rememberManual(opts: RememberManualOptions): Promise<RememberManualResult> {
@@ -356,7 +377,9 @@ export class Memory {
             "POST",
             "/api/remember/manual",
             {
-                blob_id: opts.blobId,
+                encrypted_data: typeof opts.encryptedData === "string"
+                    ? opts.encryptedData
+                    : btoa(String.fromCharCode(...opts.encryptedData)),
                 vector: opts.vector,
                 ...this.scopeFields(opts.namespace ?? opts.subLabel),
                 ...this.visibilityField(opts.visibility),
@@ -391,7 +414,7 @@ export class Memory {
 
     /**
      * Analyze conversation text — server uses LLM to extract facts, then
-     * stores each one (embed → encrypt → File Storage → store).
+     * stores each one (embed → encrypt → R2 → index).
      *
      * @param text - Conversation text to analyze
      * @returns AnalyzeResult with extracted and stored facts
@@ -438,7 +461,74 @@ export class Memory {
     }
 
     /**
-     * Restore — re-index blobs for the authenticated agent from File Storage.
+     * One bounded chat completion paid from this agent's AI-credit balance. The relayer reserves the
+     * funds on-chain before it contacts the provider, and the same `idempotencyKey` always returns
+     * the same answer without charging twice. The agent needs the AI-spend capability.
+     */
+    async gatewayInference(params: {
+        modelId: string;
+        prompt: string;
+        systemPrompt?: string;
+        maxTokens?: number;
+        idempotencyKey?: string;
+    }): Promise<GatewayInferenceResult> {
+        await this.ensureCompatibleRelayer();
+        const raw = await this.signedRequest<{
+            content: string;
+            tokens_in: number;
+            tokens_out: number;
+            amount_mist: number;
+            billing_state: string;
+            reservation_nonce: number | null;
+            reserve_digest: string | null;
+            capture_digest: string | null;
+            provider_generation_id?: string | null;
+        }>("POST", "/api/ai-credit/inference", {
+            model_id: params.modelId,
+            prompt: params.prompt,
+            system_prompt: params.systemPrompt,
+            max_tokens: params.maxTokens,
+            idempotency_key: params.idempotencyKey,
+        });
+        return {
+            content: raw.content,
+            tokensIn: raw.tokens_in,
+            tokensOut: raw.tokens_out,
+            amountMist: raw.amount_mist,
+            billingState: raw.billing_state,
+            reservationNonce: raw.reservation_nonce ?? null,
+            reserveDigest: raw.reserve_digest ?? null,
+            captureDigest: raw.capture_digest ?? null,
+            providerGenerationId: raw.provider_generation_id ?? null,
+        };
+    }
+
+    /** Structured tool-calling inference bound to this client's authenticated agent. */
+    async gatewayChat(params: GatewayChatRequest): Promise<GatewayChatResult> {
+        if (!/^[A-Za-z0-9._:/-]{8,128}$/.test(params.idempotencyKey)) {
+            throw new TypeError("A stable 8-128 character idempotencyKey is required");
+        }
+        await this.ensureCompatibleRelayer();
+        const raw = await this.signedRequest<{
+            content: string; tokens_in: number; tokens_out: number; amount_mist: string;
+            billing_state: string; reservation_nonce?: string; reserve_digest?: string; capture_digest?: string;
+            provider_generation_id?: string; finish_reason?: string;
+            tool_calls?: Array<{ id: string; name: string; arguments: string }>;
+        }>("POST", "/api/ai-credit/chat", {
+            model_id: params.modelId, idempotency_key: params.idempotencyKey,
+            messages: params.messages, tools: params.tools, tool_choice: params.toolChoice, max_tokens: params.maxTokens,
+        });
+        return {
+            content: raw.content, tokensIn: raw.tokens_in, tokensOut: raw.tokens_out,
+            amountMist: raw.amount_mist, billingState: raw.billing_state,
+            reservationNonce: raw.reservation_nonce ?? null, reserveDigest: raw.reserve_digest ?? null,
+            captureDigest: raw.capture_digest ?? null, providerGenerationId: raw.provider_generation_id ?? null,
+            toolCalls: raw.tool_calls ?? [], finishReason: raw.finish_reason ?? null,
+        };
+    }
+
+    /**
+     * Restore — re-index encrypted blobs for the authenticated agent from R2.
      */
     async restore(limit: number = 50, subLabel?: string): Promise<RestoreResult> {
         return this.signedRequest<RestoreResult>("POST", "/api/restore", {
@@ -462,7 +552,7 @@ export class Memory {
             return await this.signedRequest<HealthResult>("GET", "/health", {});
         } catch (err) {
             // Fall back to a plain GET for servers that reject bodies on GET /health.
-            const res = await fetch(`${this.serverUrl}/health`);
+            const res = await fetch(`${this.serverUrl}/health`, {signal: this.abortController.signal});
             if (!res.ok) {
                 throw err instanceof Error
                     ? err
@@ -483,6 +573,41 @@ export class Memory {
     // ============================================================
     // Internal: Signed HTTP Requests
     // ============================================================
+
+    /** Public signed endpoint API for extensions; never forwards a signing seed. */
+    request<T>(method: string, path: string, body: object = {}): Promise<T> {
+        return this.signedRequest<T>(method, path, body);
+    }
+    ask(params: {
+        question: string;
+        namespace?: string;
+        scope?: string;
+        limit?: number;
+        /**
+         * Recall-on-demand. `false` answers from the model alone and skips the
+         * query embedding, vector search and MYDATA decrypts. Omit to keep the
+         * original always-recall behaviour.
+         */
+        recall?: boolean;
+        /**
+         * Stable key for gateway reserve/provider/capture idempotency. Send the
+         * same value when retrying one logical turn so a retry cannot bill or
+         * store twice.
+         */
+        idempotencyKey?: string;
+        modelId?: string;
+    }) {
+        const { idempotencyKey, modelId, ...rest } = params;
+        return this.signedRequest<{answer: string; memories_used: number; memories: RecallMemory[]; amount_mist?: number}>('POST', '/api/ask', {
+            namespace: this.namespace,
+            ...rest,
+            ...(idempotencyKey ? {idempotency_key: idempotencyKey} : {}),
+            ...(modelId ? {model_id: modelId} : {}),
+        });
+    }
+    listModels() { return this.signedRequest<{models: {id: string; display_name: string; context_length: number | null; input_usd_per_1m: number | null; output_usd_per_1m: number | null}[]}>('GET', '/api/models', {}); }
+    getAgentModel() { return this.signedRequest<{model_id: string; source: string}>('GET', '/api/agent/llm-model', {}); }
+    setAgentModel(modelId: string) { return this.signedRequest<{model_id: string; source: string}>('PUT', '/api/agent/llm-model', {model_id: modelId}); }
 
     private scopeFields(subLabel?: string): { namespace?: string } {
         const label = subLabel ?? this.subLabel;
@@ -536,7 +661,7 @@ export class Memory {
 
     private async fetchServerConfig(): Promise<ServerConfig> {
         if (this.serverConfig) return this.serverConfig;
-        const res = await fetch(`${this.serverUrl}/config`, { method: "GET" });
+        const res = await fetch(`${this.serverUrl}/config`, { method: "GET", signal: this.abortController.signal });
         if (!res.ok) {
             throw new Error(`GET /config returned ${res.status}`);
         }
@@ -585,8 +710,9 @@ export class Memory {
             );
         }
 
+        this.abortController.signal.throwIfAborted();
         const keypair = Ed25519Keypair.fromSecretKey(this.privateKey);
-        const mysoClient = new MySoClient({ url: cfg.mysoRpcUrl });
+        const mysoClient = new MySoClient({ url: cfg.mysoRpcUrl, network: cfg.network === "mainnet" ? "mainnet" : "testnet" });
 
         const session = await SessionKey.create({
             address: keypair.getPublicKey().toMySoAddress(),
@@ -628,6 +754,7 @@ export class Memory {
                 ? btoa(jsonStr)
                 : Buffer.from(jsonStr, "utf8").toString("base64");
 
+        this.abortController.signal.throwIfAborted();
         this.sessionCache = {
             bytes,
             expiresAt:
@@ -663,13 +790,13 @@ export class Memory {
     }
 
     private async fetchCompatibilityMetadata(): Promise<RelayerVersionMetadata> {
-        const versionRes = await fetch(`${this.serverUrl}/version`, { method: "GET" });
+        const versionRes = await fetch(`${this.serverUrl}/version`, { method: "GET", signal: this.abortController.signal });
         let body: Partial<RelayerVersionMetadata>;
 
         if (versionRes.ok) {
             body = (await versionRes.json()) as Partial<RelayerVersionMetadata>;
         } else {
-            const healthRes = await fetch(`${this.serverUrl}/health`, { method: "GET" });
+            const healthRes = await fetch(`${this.serverUrl}/health`, { method: "GET", signal: this.abortController.signal });
             if (!healthRes.ok) {
                 throw new Error(
                     `Memory compatibility check failed: GET /version returned ${versionRes.status}`,
@@ -709,6 +836,153 @@ export class Memory {
      * (5-min TTL, scoped to the server's `packageId`) so a wire capture has
      * a bounded blast radius. Requires `@socialproof/mydata` and `@socialproof/myso`.
      */
+    /** Disclose one bounded page using this caller's current MYDATA session.
+     * A receipt alone does not authorize key release or permanent copies. */
+    async readMyDataContent(request: MyDataContentRequest): Promise<MyDataContentPage> {
+        if (!/^0x[0-9a-fA-F]{1,64}$/.test(request.mydataId) || !/^[0-9a-f]{64}$/.test(request.encryptedDataDigestHex)
+            || !["utf8", "base64"].includes(request.format) || !Number.isInteger(request.offset) || request.offset < 0 || request.offset > 262144
+            || !Number.isInteger(request.limit) || request.limit < 1 || request.limit > 8000) throw new Error("Invalid named MyData content request");
+        return this.signedRequest("POST", "/api/mydata/read-content", request);
+    }
+
+    /** Search an encrypted MySocial typed graph using fresh, caller-bound MyData pages. */
+    async searchMyDataGraph(request: MyDataGraphSearchRequest, beforeEachPage?: () => Promise<void>): Promise<MyDataGraphSearchResult> {
+        return searchMyDataGraph((page) => this.readMyDataContent(page), request, beforeEachPage, (sellerAddress, proof) => this.verifyGraphSellerAuthority(sellerAddress, proof));
+    }
+
+    /** Read one typed private graph item and its bounded linked neighborhood. */
+    async getMyDataGraphItem(request: MyDataGraphItemRequest, beforeEachPage?: () => Promise<void>): Promise<MyDataGraphItemResult> {
+        return getMyDataGraphItem((page) => this.readMyDataContent(page), request, beforeEachPage, (sellerAddress, proof) => this.verifyGraphSellerAuthority(sellerAddress, proof));
+    }
+
+    private async verifyGraphSellerAuthority(sellerAddress: string, proof: MySoGraphAuthorityProof): Promise<boolean> {
+        const result = await this.signedRequest<{ authorized: boolean; kind: string }>("POST", "/api/mydata/graph/verify-seller", {
+            organizationId: proof.organizationId, sellerAddress,
+        });
+        return result.authorized === true && result.kind === proof.kind;
+    }
+
+    /**
+     * Validate and sign a GraphManifest publication with this authenticated
+     * agent key, then encode its public proof for MyData listing tags. This
+     * does not encrypt or publish the graph; callers must still use the
+     * MyData listing workflow and submit the resulting transaction.
+     */
+    async signMyDataGraphManifest(input: {
+        manifest: unknown;
+        authorityProof: MySoGraphAuthorityProof;
+        offerTerms: MySoGraphOfferTerms;
+        publishedAtMs?: number;
+    }): Promise<{ document: MySoGraphPublicationDocument; tags: string[] }> {
+        const publicKey = await this.getPublicKey();
+        const ed = await getEd();
+        const document = await createMySoGraphPublication(
+            input.manifest,
+            input.authorityProof,
+            input.offerTerms,
+            {
+                sellerAddress: await delegateKeyToMySoAddress(bytesToHex(this.privateKey)),
+                sellerPublicKeyHex: bytesToHex(publicKey),
+                sign: (message) => ed.signAsync(message, this.privateKey),
+            },
+            (sellerAddress, proof) => this.verifyGraphSellerAuthority(sellerAddress, proof),
+            input.publishedAtMs,
+        );
+        return { document, tags: encodeMySoGraphPublicationTags(document.publication) };
+    }
+
+    /** Verify a graph listing's public seller capsule and live quote before purchase. */
+    async verifyMyDataGraphOffer(mydataId: string): Promise<{ quote: { mydataId: string; mediaType: string; tags: string[]; purchaseParameters: { expectedSeller: string; accessKind: 2 | 3; priceMist: string; durationDays: string } }; publication: Awaited<ReturnType<typeof verifyMySoGraphPublicationMetadata>>; manifestHashHex: string; verification: "pre_purchase_seller_proof" }> {
+        if (!/^0x[0-9a-fA-F]{1,64}$/.test(mydataId)) throw new Error("Invalid MyData listing ID");
+        const quote = await this.signedRequest<{ mydataId: string; mediaType: string; tags: string[]; purchaseParameters: { expectedSeller: string; accessKind: 2 | 3; priceMist: string; durationDays: string } }>("GET", `/api/agent/read/mydata_quote?id=${encodeURIComponent(mydataId)}`, {});
+        if (quote.mydataId.toLowerCase() !== mydataId.toLowerCase() || quote.mediaType !== "application/vnd.mysocial.graph-manifest+json;version=1") throw new Error("The current MyData listing is not a GraphManifest offer");
+        const capsule = decodeMySoGraphPublicationTags(quote.tags, quote.purchaseParameters.expectedSeller);
+        const publication = await verifyMySoGraphPublicationMetadata(capsule, quote.purchaseParameters.expectedSeller, {
+            accessKind: quote.purchaseParameters.accessKind, priceMist: quote.purchaseParameters.priceMist, durationDays: quote.purchaseParameters.durationDays,
+        }, (sellerAddress, proof) => this.verifyGraphSellerAuthority(sellerAddress, proof));
+        return { quote, publication, manifestHashHex: publication.manifestHashHex, verification: "pre_purchase_seller_proof" };
+    }
+
+    async getAgentContext(): Promise<unknown> {
+        return this.signedRequest("GET", "/api/agent/context", {}, { includeDelegateKey: false });
+    }
+    /**
+     * Run a trusted in-process proxy operation with this agent's short-lived,
+     * package-scoped MyData SessionKey. The session is never returned by this
+     * method; callers must not log, persist, or forward it outside that proxy
+     * operation. This exists for the automation sidecar's run-bound journal
+     * bridge, where the delegate seed and session stay in one trusted process.
+     */
+    async withMyDataSession<T>(operation: (session: string) => Promise<T>): Promise<T> {
+        this.abortController.signal.throwIfAborted();
+        await this.ensureCompatibleRelayer();
+        this.abortController.signal.throwIfAborted();
+        return operation(await this.buildMyDataSession());
+    }
+    async createWorkRun(id: string, plan: object, taskId?: string): Promise<unknown> {
+        if (taskId !== undefined && !/^0x[0-9a-fA-F]{1,64}$/.test(taskId)) throw new Error("Invalid work task ID");
+        return this.signedRequest("POST", "/api/work/runs", { id, plan, ...(taskId ? { taskId } : {}) });
+    }
+    async getWorkRun(id: string): Promise<unknown> {
+        return this.signedRequest("GET", `/api/work/runs/${this.workRecordId(id)}`, {});
+    }
+    async refreshWorkTaskHistory(id: string): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/task-history/refresh`, {});
+    }
+    async listWorkRunOperations(id: string, limit = 100, offset = 0): Promise<unknown> {
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200 || !Number.isInteger(offset) || offset < 0 || offset > 100000) throw new Error("Invalid work operation pagination");
+        return this.signedRequest("GET", `/api/work/runs/${this.workRecordId(id)}/operations?limit=${limit}&offset=${offset}`, {});
+    }
+    async cancelWorkRun(id: string): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/cancel`, { confirmed: true });
+    }
+    async completeWorkRun(id: string): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/complete`, { confirmed: true });
+    }
+    async issueWorkRunWorkerCredential(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/worker-credential`, request);
+    }
+    async revokeWorkRunWorkerCredential(id: string): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/worker-credential/revoke`, {});
+    }
+    async listWorkRuns(limit = 20, offset = 0): Promise<unknown> {
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200 || !Number.isInteger(offset) || offset < 0 || offset > 100000) throw new Error("Invalid work pagination");
+        return this.signedRequest("GET", `/api/work/runs?limit=${limit}&offset=${offset}`, {});
+    }
+    async saveWorkPlan(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/plan`, request);
+    }
+    async reserveWorkOperation(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/operations`, request);
+    }
+    async settleWorkOperation(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/operations/${this.workRecordId(id)}`, request);
+    }
+    async reconcileWorkActionReceipt(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/operations/reconcile-action`, request);
+    }
+    async reconcileWorkTaskUpload(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/operations/reconcile-task-upload`, request);
+    }
+    async appendWorkActionReceipt(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/receipts`, request);
+    }
+    async appendWorkTaskArtifact(id: string, request: object): Promise<unknown> {
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/artifacts`, request);
+    }
+    async updateWorkStep(id: string, stepId: string, request: object): Promise<unknown> {
+        if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(stepId)) throw new Error("Invalid work step ID");
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/steps/${encodeURIComponent(stepId)}`, request);
+    }
+    async workTurn(id: string, action: "acquire" | "renew" | "checkpoint" | "finish", request: object): Promise<unknown> {
+        if (!["acquire", "renew", "checkpoint", "finish"].includes(action)) throw new Error("Invalid work turn action");
+        return this.signedRequest("POST", `/api/work/runs/${this.workRecordId(id)}/turns/${action}`, request);
+    }
+    private workRecordId(id: string): string {
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error("Invalid work record ID");
+        return id;
+    }
+
     private async signedRequest<T>(
         method: string,
         path: string,
@@ -719,7 +993,9 @@ export class Memory {
             acceptedStatuses?: number[];
         } = {},
     ): Promise<T> {
+        this.abortController.signal.throwIfAborted();
         await this.ensureCompatibleRelayer();
+        this.abortController.signal.throwIfAborted();
         const ed = await getEd();
 
         const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -750,6 +1026,7 @@ export class Memory {
         };
         if (this.platformId) {
             headers["x-platform-id"] = this.platformId;
+            headers["x-platform-signature"] = bytesToHex(await ed.signAsync(new TextEncoder().encode(`mysocial-request-platform-v1|${this.platformId}|${message}`), this.privateKey));
         }
         if (this.ownerCoSignKey && this.isWriteRoute(method, path)) {
             const ownerSig = await ed.signAsync(msgBytes, this.ownerCoSignKey);
@@ -764,11 +1041,12 @@ export class Memory {
         if (options.includeDelegateKey !== false) {
             headers["x-mydata-session"] = await this.buildMyDataSession();
         }
+        this.abortController.signal.throwIfAborted();
         const res = await fetch(url, {
             method,
             headers,
             body: method === "GET" ? undefined : bodyStr,
-            signal: options.signal,
+            signal: options.signal ? AbortSignal.any([options.signal, this.abortController.signal]) : this.abortController.signal,
         });
 
         const accepted = options.acceptedStatuses ?? [200];

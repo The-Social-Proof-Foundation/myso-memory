@@ -1,14 +1,15 @@
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use axum::{Extension, Json};
+use axum::routing::{get, post};
 use base64::Engine as _;
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
+use tower::ServiceExt;
 
 use crate::db::VectorDb;
-use crate::file_storage;
 use crate::jobs;
 use crate::mydata;
 use crate::observability;
@@ -38,6 +39,7 @@ pub struct AgentContextResponse {
     /// Absolute expiry (ms since epoch); `null` means the agent never lapses.
     pub expires_at_ms: Option<i64>,
     pub platform_scope: Option<String>,
+    pub platform_id: Option<String>,
     pub organization_id: Option<String>,
     pub network: String,
     pub rpc_url: String,
@@ -46,6 +48,7 @@ pub struct AgentContextResponse {
     pub permitted_registry_actions: Vec<&'static str>,
     pub chain: AgentContextChainTruth,
     pub indexer: AgentContextIndexerState,
+    pub indexers: AgentContextIndexers,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -53,12 +56,24 @@ pub struct AgentContextResponse {
 pub struct AgentContextSocialChain {
     pub package_id: String,
     pub username_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub memory_registry_id: String,
     pub platform_registry_id: String,
     pub platform_object_id: String,
     pub block_list_registry_id: String,
     pub post_config_id: String,
     pub memory_config_id: String,
     pub mydata_registry_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub mydata_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub subscription_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub poc_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spot_config_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub spot_claim_registry_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub social_graph_id: String,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -97,6 +112,12 @@ pub struct AgentContextIndexerState {
     pub source: &'static str,
     pub status: &'static str,
     pub organization_enrichment_present: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentContextIndexers {
+    pub orderbook: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -300,15 +321,77 @@ pub async fn agent_context(
     };
 
     let mut actions = Vec::new();
+    if state.config.social_chain.is_configured()
+        && !state.config.social_chain.social_memory_registry_id.is_empty()
+    {
+        // This is an owner-signed proposal action, not an agent capability spend.
+        actions.push("account.rotate_owner_key.v1");
+    }
     if has_cap(auth.capabilities, CAP_MEMORY_READ) {
         actions.extend(["memory.recall.v1", "memory.ask.v1"]);
+    }
+    // Availability only: each proxy invocation still checks its live identity and job/delegate.
+    if has_cap(auth.capabilities, CAP_MEMORY_READ)
+        && state.config.automation_engine_url.as_deref().is_some_and(|value| !value.trim().is_empty())
+        && state.config.automation_engine_secret.as_deref().is_some_and(|value| !value.is_empty()) {
+        actions.push("automation.access.v1");
     }
     if has_cap(auth.capabilities, CAP_MEMORY_WRITE) {
         actions.push("memory.remember.v1");
     }
     if has_cap(auth.capabilities, CAP_MYDATA_READ) {
-        actions.extend(["mydata.search.v1", "mydata.check_access.v1"]);
+        actions.extend(["mydata.search.v1", "mydata.check_access.v1", "access.revoke_mydata_share.v1"]);
+        if !state.config.social_chain.mydata_config_id.is_empty() { actions.push("access.share_mydata.v1"); }
+        if !state.config.social_chain.mydata_config_id.is_empty()
+            && !state.config.social_chain.mydata_registry_id.is_empty() {
+            actions.push("access.publish_mydata_graph.v1");
+        }
+        if state.config.mydata_listing_access_enabled
+            && !state.config.social_chain.memory_config_id.is_empty()
+            && !state.config.social_chain.block_list_registry_id.is_empty() {
+            actions.push("mydata.read_content.v1");
+        }
+        if state.config.mydata_bounded_purchase_enabled
+            && !state.config.social_chain.mydata_config_id.is_empty()
+            && !state.config.social_chain.ecosystem_treasury_id.is_empty() {
+            actions.push("access.purchase_mydata_access.v1");
+        }
+        if state.config.mydata_post_access_purchase_enabled
+            && !state.config.social_chain.mydata_config_id.is_empty()
+            && !state.config.social_chain.ecosystem_treasury_id.is_empty()
+            && !state.config.social_chain.memory_config_id.is_empty()
+            && !state.config.social_chain.block_list_registry_id.is_empty() {
+            actions.push("access.purchase_post_access.v1");
+        }
     }
+    if crate::owner_agents::can_read(auth.capabilities) && state.config.social_chain.is_configured(){
+        actions.push("agent.admin.read.v1");
+        if crate::owner_agents::configured(&state.config){
+            for action in crate::owner_agents::ACTIONS {if registered_action_policy(action).is_some_and(|(cap,_)|has_cap(auth.capabilities,cap)){actions.push(action);}}
+        }
+    }
+    if has_cap(auth.capabilities,crate::memory_contract::CAP_TRADE_EXECUTE) && state.config.social_chain.is_configured() {
+        actions.push("payments.read.v1");
+        if crate::payments::configured(&state.config) {actions.push(crate::payments::ACTION);}
+        if state.config.spt_trading_enabled && !state.config.social_chain.spt_registry_id.is_empty() && !state.config.social_chain.spt_config_id.is_empty() && !state.config.social_chain.ecosystem_treasury_id.is_empty() {
+            actions.extend([crate::spt::BUY_ACTION, crate::spt::SELL_ACTION]);
+        }
+    }
+    if has_cap(auth.capabilities,crate::memory_contract::CAP_TRADE_EXECUTE) && !state.config.social_chain.subscription_config_id.is_empty() {
+        actions.push("subscription.read.v1");
+        if crate::subscription_access::configured(&state.config) { actions.extend(crate::subscription_access::ACTIONS); }
+    }
+    if crate::poc_vault::configured(&state.config)
+        && has_cap(auth.capabilities, crate::memory_contract::CAP_TRADE_EXECUTE) {
+        actions.push(crate::poc_vault::ACTION);
+    }
+    if crate::poc_transfer::configured(&state.config)
+        && has_cap(auth.capabilities, crate::memory_contract::CAP_TRADE_EXECUTE) {
+        actions.push(crate::poc_transfer::feature_action());
+    }
+    if crate::spot_payout::configured(&state.config) && has_cap(auth.capabilities, crate::memory_contract::CAP_TRADE_EXECUTE) { actions.push(crate::spot_payout::ACTION); }
+    if crate::spot_payout::betting_configured(&state.config) && has_cap(auth.capabilities, crate::memory_contract::CAP_TRADE_EXECUTE) { actions.push(crate::spot_payout::BET_ACTION); }
+    if crate::spot_payout::market_creation_configured(&state.config) && has_cap(auth.capabilities, crate::memory_contract::CAP_TRADE_EXECUTE) { actions.push(crate::spot_payout::CREATE_MARKET_ACTION); }
     if has_cap(auth.capabilities, CAP_POST_PUBLISH) {
         actions.extend([
             "social.create_post.v1",
@@ -465,12 +548,18 @@ pub async fn agent_context(
         .then(|| AgentContextSocialChain {
             package_id: package_id.clone(),
             username_registry_id: state.config.social_chain.username_registry_id.clone(),
+            memory_registry_id: state.config.social_chain.social_memory_registry_id.clone(),
             platform_registry_id: state.config.social_chain.platform_registry_id.clone(),
             platform_object_id: state.config.social_chain.platform_object_id.clone(),
             block_list_registry_id: state.config.social_chain.block_list_registry_id.clone(),
             post_config_id: state.config.social_chain.post_config_id.clone(),
             memory_config_id: state.config.social_chain.memory_config_id.clone(),
             mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
+            mydata_config_id: state.config.social_chain.mydata_config_id.clone(),
+            subscription_config_id: state.config.social_chain.subscription_config_id.clone(),
+            poc_config_id: state.config.social_chain.poc_config_id.clone(),
+            spot_config_id: state.config.social_chain.spot_config_id.clone(),
+            spot_claim_registry_id: state.config.social_chain.spot_claim_registry_id.clone(),
             social_graph_id: state.config.social_chain.social_graph_id.clone(),
             task_config_id: state.config.social_chain.task_config_id.clone(),
             jury_config_id: state.config.social_chain.jury_config_id.clone(),
@@ -500,6 +589,7 @@ pub async fn agent_context(
         max_action_spend_mist: auth.max_action_spend,
         expires_at_ms: auth.expires_at_ms,
         platform_scope: auth.platform_scope,
+        platform_id: auth.platform_id,
         organization_id: auth.organization_id.clone(),
         network: state.config.myso_network.clone(),
         rpc_url: state.config.myso_rpc_url.clone(),
@@ -515,7 +605,825 @@ pub async fn agent_context(
             status: "available",
             organization_enrichment_present: auth.organization_id.is_some(),
         },
+        indexers: AgentContextIndexers {
+            orderbook: crate::platform_reads::orderbook_indexer_available(&state.config),
+        },
     })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalAgentContextRequest {
+    #[serde(alias = "account_id")]
+    account_id: String,
+    #[serde(alias = "agent_object_id")]
+    agent_object_id: String,
+}
+
+pub(crate) fn internal_secret_matches(provided: &str, expected: &str) -> bool {
+    let left = provided.as_bytes();
+    let right = expected.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+async fn internal_mcp_auth(
+    state: &Arc<AppState>,
+    account_hint: &str,
+    agent_hint: &str,
+) -> Result<AuthInfo, AppError> {
+    let account_id = crate::chain_reads::id(account_hint.trim())?;
+    let agent_object_id = crate::chain_reads::id(agent_hint.trim())?;
+    let agent = crate::myso::canonical_agent_by_object_id(
+        &state.http_client, &state.config.myso_rpc_url, &state.config.package_id, &agent_object_id,
+    ).await.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if !crate::memory_contract::addresses_equal(&agent.account_id, &account_id) {
+        return Err(AppError::Forbidden("The sub-agent does not belong to this account".into()));
+    }
+    if !agent.active { return Err(AppError::Forbidden("SubAgent is deactivated".into())); }
+    if agent.expires_at_ms.is_some_and(|expires| chrono::Utc::now().timestamp_millis() > expires) {
+        return Err(AppError::Forbidden("SubAgent has expired".into()));
+    }
+    let owner = crate::myso::fetch_memory_account_owner(
+        &state.http_client, &state.config.myso_rpc_url, &agent.account_id,
+    ).await.map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(AuthInfo {
+        public_key: String::new(), owner, account_id: agent.account_id,
+        agent_object_id: agent.agent_object_id, derived_address: agent.derived_address,
+        capabilities: u64::try_from(agent.capabilities).unwrap_or(0),
+        approval_required_caps: u64::try_from(agent.approval_required_caps).unwrap_or(0),
+        max_action_spend: agent.max_action_spend.and_then(|value| u64::try_from(value).ok()),
+        expires_at_ms: agent.expires_at_ms, platform_scope: agent.platform_scope,
+        organization_id: agent.organization_id, platform_id: None, label: agent.label,
+        sub_agent_key: None, mydata_session: None, owner_co_signed: false, owner_delegate_key: None,
+    })
+}
+
+/// Service-to-service context for a verified OAuth principal. The caller must
+/// already have checked the token. This route repeats the on-chain SubAgent
+/// check and never returns a delegate key.
+pub async fn internal_mcp_agent_context(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalAgentContextRequest>,
+) -> Result<Json<AgentContextResponse>, AppError> {
+    let Some(expected) = state.config.internal_sync_secret.as_deref() else {
+        return Err(AppError::Internal("internal sync secret is not configured".into()));
+    };
+    let provided = headers
+        .get("x-internal-sync-secret")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if expected.is_empty() || !internal_secret_matches(provided, expected) {
+        return Err(AppError::Unauthorized("unauthorized".into()));
+    }
+    let account_id = crate::chain_reads::id(body.account_id.trim())?;
+    let agent_object_id = crate::chain_reads::id(body.agent_object_id.trim())?;
+    let agent = crate::myso::canonical_agent_by_object_id(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        &state.config.package_id,
+        &agent_object_id,
+    )
+    .await
+    .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    if !crate::memory_contract::addresses_equal(&agent.account_id, &account_id) {
+        return Err(AppError::Forbidden(
+            "The sub-agent does not belong to this account".into(),
+        ));
+    }
+    if !agent.active {
+        return Err(AppError::Forbidden("SubAgent is deactivated".into()));
+    }
+    if let Some(expires_at_ms) = agent.expires_at_ms {
+        if chrono::Utc::now().timestamp_millis() > expires_at_ms {
+            return Err(AppError::Forbidden("SubAgent has expired".into()));
+        }
+    }
+    let owner = crate::myso::fetch_memory_account_owner(
+        &state.http_client,
+        &state.config.myso_rpc_url,
+        &agent.account_id,
+    )
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+    let capabilities = u64::try_from(agent.capabilities).unwrap_or(0);
+    let approval_required_caps = u64::try_from(agent.approval_required_caps).unwrap_or(0);
+    let auth = AuthInfo {
+        public_key: String::new(),
+        owner,
+        account_id: agent.account_id,
+        agent_object_id: agent.agent_object_id,
+        derived_address: agent.derived_address,
+        capabilities,
+        approval_required_caps,
+        max_action_spend: agent.max_action_spend.and_then(|value| u64::try_from(value).ok()),
+        expires_at_ms: agent.expires_at_ms,
+        platform_scope: agent.platform_scope,
+        organization_id: agent.organization_id,
+        platform_id: None,
+        label: agent.label,
+        sub_agent_key: None,
+        mydata_session: None,
+        owner_co_signed: false,
+        owner_delegate_key: None,
+    };
+    Ok(agent_context(State(state), Extension(auth)).await)
+}
+
+/// Fixed-operation bridge for hosted MCP's encrypted work journal. The hosted
+/// caller supplies only its OAuth-verified account/agent identity and a short
+/// MyData session minted by the local custody vault; on-chain identity is
+/// rebuilt here before any journal handler is invoked.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpWorkJournalRequest {
+    account_id: String,
+    agent_object_id: String,
+    #[serde(default)]
+    worker_agent_object_id: Option<String>,
+    operation: String,
+    params: serde_json::Value,
+}
+
+fn work_journal_request<T: serde::de::DeserializeOwned>(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<T, AppError> {
+    serde_json::from_value(params.get(key).cloned().ok_or_else(|| AppError::BadRequest("work journal request is missing".into()))?)
+        .map_err(|_| AppError::BadRequest("work journal request is invalid".into()))
+}
+
+fn work_journal_id(params: &serde_json::Value, key: &str) -> Result<String, AppError> {
+    params.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
+        .ok_or_else(|| AppError::BadRequest("work journal ID is missing".into()))
+}
+
+pub async fn internal_mcp_work_journal(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpWorkJournalRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(expected) = state.config.internal_sync_secret.as_deref() else {
+        return Err(AppError::Internal("internal sync secret is not configured".into()));
+    };
+    let provided = headers.get("x-internal-sync-secret").and_then(|value| value.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || !internal_secret_matches(provided, expected) {
+        return Err(AppError::Unauthorized("unauthorized".into()));
+    }
+    let mut auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    let session = headers.get("x-mydata-session").and_then(|value| value.to_str().ok()).filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Unauthorized("a short-lived MyData session is required for work journal access".into()))?;
+    if session.len() > 32_768 || !session.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')) {
+        return Err(AppError::BadRequest("MyData session is malformed or exceeds the size limit".into()));
+    }
+    if let Some(token) = headers.get("x-work-run-credential").and_then(|value| value.to_str().ok()) {
+        let worker_id = body.worker_agent_object_id.as_deref()
+            .ok_or_else(|| AppError::Unauthorized("worker identity is required with a run credential".into()))?;
+        let worker_id = crate::chain_reads::id(worker_id)?;
+        let run_id = work_runs::resolve_worker_run_id(&state, &auth, &body.operation, &body.params).await?;
+        if !work_runs::validate_worker_credential(&state, &auth, run_id, &worker_id, token).await? {
+            return Err(AppError::Unauthorized("work run credential is invalid, expired or revoked".into()));
+        }
+        let worker = crate::myso::canonical_agent_by_object_id(
+            &state.http_client, &state.config.myso_rpc_url, &state.config.package_id, &worker_id,
+        ).await.map_err(|_| AppError::Forbidden("the action_worker is no longer available".into()))?;
+        if !worker.active
+            || !crate::chain_reads::same(&worker.account_id, &auth.account_id)
+            || !worker.parent_object_id.as_deref().is_some_and(|parent| crate::chain_reads::same(parent, &auth.agent_object_id))
+            || u64::try_from(worker.capabilities).ok().is_none_or(|caps| caps & crate::memory_contract::CAP_MYDATA_READ == 0)
+            || worker.expires_at_ms.is_none_or(|expiry| expiry <= chrono::Utc::now().timestamp_millis())
+            || worker.max_action_spend.is_none_or(|limit| limit <= 0)
+        {
+            return Err(AppError::Forbidden("the action_worker lost its live MyData or spend authority".into()));
+        }
+    } else if body.worker_agent_object_id.is_some() {
+        return Err(AppError::Unauthorized("a run credential is required for worker identity".into()));
+    }
+    auth.mydata_session = Some(session.to_owned());
+    let state_arg = State(state.clone());
+    let auth_arg = Extension(auth.clone());
+    use crate::{work_runs, work_turns};
+    match body.operation.as_str() {
+        "work_run_create" => work_runs::create(state_arg, auth_arg, Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_list" => work_runs::list(state_arg, auth_arg, Query(serde_json::from_value::<work_runs::Page>(body.params.clone()).map_err(|_| AppError::BadRequest("work journal page is invalid".into()))?)).await,
+        "work_run_get" => work_runs::get(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?)).await,
+        "work_run_refresh_task_history" => work_runs::refresh_task_history(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?)).await,
+        "work_run_complete" => work_runs::complete(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_cancel" => work_runs::cancel(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_list_operations" => work_runs::list_operations(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Query(serde_json::from_value::<work_runs::OperationPage>(body.params.clone()).map_err(|_| AppError::BadRequest("work operation page is invalid".into()))?)).await,
+        "work_run_save_plan" => work_runs::save_plan(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_reserve_operation" => work_runs::reserve(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_settle_operation" => work_runs::settle(state_arg, auth_arg, Path(work_journal_id(&body.params, "operationId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_reconcile_action_receipt" => work_runs::reconcile_action_receipt(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_reconcile_task_upload" => work_runs::reconcile_task_upload(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_append_action_receipt" => work_runs::append_action_receipt(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_append_task_artifact" => work_runs::append_task_artifact(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_update_step" => work_runs::update_step(state_arg, auth_arg, Path((work_journal_id(&body.params, "runId")?, work_journal_id(&body.params, "stepId")?)), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_acquire_turn" => work_turns::acquire(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_renew_turn" => work_turns::renew(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_checkpoint" => work_turns::checkpoint(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_finish_turn" => work_turns::finish(state_arg, auth_arg, Path(work_journal_id(&body.params, "runId")?), Json(work_journal_request(&body.params, "request")?)).await,
+        "work_run_purge_revoked_listing" => work_runs::purge_revoked_listing(state_arg, auth_arg, Json(work_journal_request(&body.params, "request")?)).await,
+        _ => Err(AppError::BadRequest("unsupported work journal operation".into())),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpIssueWorkCredential {
+    account_id: String,
+    parent_agent_id: String,
+    run_id: String,
+    delegate_ref: String,
+    ttl_seconds: i64,
+    #[serde(default)]
+    allow_private_graph: bool,
+    #[serde(default)]
+    allow_private_task_artifacts: bool,
+    #[serde(default)]
+    allow_room_history: bool,
+    #[serde(default)]
+    allow_private_content_sharing: bool,
+}
+
+/// Just-in-time credential issuance for the trusted automation sidecar. The
+/// action-worker MyData session must decrypt this exact active run before a
+/// credential can be issued; the selected delegate is rechecked against live
+/// chain authority by the work-run service.
+pub async fn internal_mcp_issue_work_credential(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpIssueWorkCredential>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(expected)=state.config.internal_sync_secret.as_deref() else { return Err(AppError::Internal("internal sync secret is not configured".into())); };
+    let provided=headers.get("x-internal-sync-secret").and_then(|value|value.to_str().ok()).unwrap_or("");
+    if expected.is_empty()||!internal_secret_matches(provided,expected){return Err(AppError::Unauthorized("unauthorized".into()));}
+    let session=headers.get("x-mydata-session").and_then(|value|value.to_str().ok()).filter(|value|!value.is_empty())
+        .ok_or_else(||AppError::Unauthorized("a short-lived action-worker MyData session is required".into()))?;
+    if session.len()>32_768||!session.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'+'|b'/'|b'=')) {
+        return Err(AppError::BadRequest("MyData session is malformed or exceeds the size limit".into()));
+    }
+    let mut auth=internal_mcp_auth(&state,&body.account_id,&body.parent_agent_id).await?;
+    auth.mydata_session=Some(session.to_owned());
+    let run_id=uuid::Uuid::parse_str(&body.run_id).map_err(|_|AppError::BadRequest("invalid work record ID".into()))?;
+    let run=crate::work_runs::get(State(state.clone()),Extension(auth.clone()),axum::extract::Path(body.run_id.clone())).await?;
+    if run.0.get("id").and_then(serde_json::Value::as_str)!=Some(body.run_id.as_str()) {
+        return Err(AppError::Forbidden("worker session did not resolve the requested work run".into()));
+    }
+    let linked_task_id=run.0.get("taskId").and_then(serde_json::Value::as_str);
+    let result=crate::work_runs::issue_worker_credential_for_parent(&state,&auth,run_id,&body.delegate_ref,body.ttl_seconds,body.allow_private_graph,body.allow_private_task_artifacts,body.allow_room_history,body.allow_private_content_sharing,linked_task_id).await?;
+    Ok(Json(result))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpRevokeWorkCredential {
+    account_id: String,
+    parent_agent_id: String,
+    run_id: String,
+}
+
+pub async fn internal_mcp_revoke_work_credential(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpRevokeWorkCredential>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(expected)=state.config.internal_sync_secret.as_deref() else { return Err(AppError::Internal("internal sync secret is not configured".into())); };
+    let provided=headers.get("x-internal-sync-secret").and_then(|value|value.to_str().ok()).unwrap_or("");
+    if expected.is_empty()||!internal_secret_matches(provided,expected){return Err(AppError::Unauthorized("unauthorized".into()));}
+    let session=headers.get("x-mydata-session").and_then(|value|value.to_str().ok()).filter(|value|!value.is_empty())
+        .ok_or_else(||AppError::Unauthorized("a short-lived action-worker MyData session is required".into()))?;
+    if session.len()>32_768||!session.bytes().all(|byte|byte.is_ascii_alphanumeric()||matches!(byte,b'+'|b'/'|b'=')) {
+        return Err(AppError::BadRequest("MyData session is malformed or exceeds the size limit".into()));
+    }
+    let mut auth=internal_mcp_auth(&state,&body.account_id,&body.parent_agent_id).await?;
+    auth.mydata_session=Some(session.to_owned());
+    let _=crate::work_runs::get(State(state.clone()),Extension(auth.clone()),axum::extract::Path(body.run_id.clone())).await?;
+    crate::work_runs::revoke_worker_credential(State(state),Extension(auth),axum::extract::Path(body.run_id)).await
+}
+
+/// Validate a per-run action-worker bearer for hosted MCP. The returned parent
+/// and child identities come from the digest-bound credential row and current
+/// fullnode state, never from the HTTP caller. The MCP worker path uses this to
+/// avoid retaining an owner OAuth bearer in a durable queue.
+pub async fn internal_mcp_work_worker_context(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(expected) = state.config.internal_sync_secret.as_deref() else {
+        return Err(AppError::Internal("internal sync secret is not configured".into()));
+    };
+    let provided = headers.get("x-internal-sync-secret").and_then(|value| value.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || !internal_secret_matches(provided, expected) {
+        return Err(AppError::Unauthorized("unauthorized".into()));
+    }
+    let token = headers.get("x-work-run-credential").and_then(|value| value.to_str().ok()).filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Unauthorized("a work-run credential is required".into()))?;
+    let context = crate::work_runs::worker_credential_context(&state, token).await?
+        .ok_or_else(|| AppError::Unauthorized("work-run credential is invalid, expired or revoked".into()))?;
+    let account_id = context["accountId"].as_str().ok_or_else(|| AppError::Internal("invalid worker credential record".into()))?;
+    let parent_agent_id = context["parentAgentId"].as_str().ok_or_else(|| AppError::Internal("invalid worker credential record".into()))?;
+    let worker_agent_id = context["workerAgentId"].as_str().ok_or_else(|| AppError::Internal("invalid worker credential record".into()))?;
+    let parent = internal_mcp_auth(&state, account_id, parent_agent_id).await?;
+    let worker_id = crate::chain_reads::id(worker_agent_id)?;
+    let worker = crate::myso::canonical_agent_by_object_id(
+        &state.http_client, &state.config.myso_rpc_url, &state.config.package_id, &worker_id,
+    ).await.map_err(|_| AppError::Forbidden("the action_worker is no longer available".into()))?;
+    if !worker.active
+        || !crate::chain_reads::same(&worker.account_id, &parent.account_id)
+        || !worker.parent_object_id.as_deref().is_some_and(|id| crate::chain_reads::same(id, &parent.agent_object_id))
+        || u64::try_from(worker.capabilities).ok().is_none_or(|caps| caps & crate::memory_contract::CAP_MYDATA_READ == 0)
+        || worker.expires_at_ms.is_none_or(|expiry| expiry <= chrono::Utc::now().timestamp_millis())
+        || worker.max_action_spend.is_none_or(|limit| limit <= 0)
+    {
+        return Err(AppError::Forbidden("the action_worker lost its live MyData or spend authority".into()));
+    }
+    Ok(Json(serde_json::json!({
+        "runId": context["runId"],
+        "ownerAddress": context["ownerAddress"],
+        "accountId": parent.account_id,
+        "parentAgentId": parent.agent_object_id,
+        "delegateRef": context["delegateRef"],
+        "workerAgentId": worker.agent_object_id,
+        "workerCapabilities": worker.capabilities,
+        "workerMaxActionSpend": worker.max_action_spend,
+        "allowPrivateGraph": context["allowPrivateGraph"],
+        "allowRoomHistory": context["allowRoomHistory"],
+        "allowPrivateTaskArtifacts": context["allowPrivateTaskArtifacts"],
+        "taskId": context["taskId"],
+        "allowPrivateContentSharing": context["allowPrivateContentSharing"],
+        "expiresAt": context["expiresAt"],
+    })))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpWorkGraphContent {
+    account_id: String,
+    worker_agent_id: String,
+    request: crate::mydata_access::ReadContentRequest,
+}
+
+/// Release one bounded, exact-version MyData page to an explicitly consented
+/// action_worker. The worker credential, MyData session, live chain capability,
+/// immutable listing digest, and audience are checked on every page.
+pub async fn internal_mcp_work_graph_content(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpWorkGraphContent>,
+) -> Result<axum::response::Response, AppError> {
+    let context = internal_mcp_work_worker_context(State(state.clone()), headers.clone()).await?.0;
+    if context["allowPrivateGraph"] != true
+        || context["accountId"].as_str() != Some(body.account_id.as_str())
+        || context["workerAgentId"].as_str() != Some(body.worker_agent_id.as_str()) {
+        return Err(AppError::Forbidden("this action_worker run has no consented private-graph access".into()));
+    }
+    let session = headers.get("x-mydata-session").and_then(|value| value.to_str().ok()).filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::Unauthorized("a current action-worker MyData session is required".into()))?;
+    if session.len() > 32_768 || !session.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte)) {
+        return Err(AppError::BadRequest("MyData session is malformed or exceeds the size limit".into()));
+    }
+    let mut auth = internal_mcp_auth(&state, &body.account_id, &body.worker_agent_id).await?;
+    if auth.capabilities & crate::memory_contract::CAP_MYDATA_READ == 0 {
+        return Err(AppError::Forbidden("the action_worker lacks live MyData read authority".into()));
+    }
+    auth.mydata_session = Some(session.to_owned());
+    crate::mydata_access::read_content(State(state), Extension(auth), Json(body.request)).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpWorkGraphSeller {
+    account_id: String,
+    worker_agent_id: String,
+    request: crate::mydata_access::VerifyGraphSellerRequest,
+}
+
+/// Recheck seller authority against the fullnode while validating a purchased
+/// GraphManifest for an explicitly consented durable run.
+pub async fn internal_mcp_work_graph_seller(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpWorkGraphSeller>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let context = internal_mcp_work_worker_context(State(state.clone()), headers).await?.0;
+    if context["allowPrivateGraph"] != true
+        || context["accountId"].as_str() != Some(body.account_id.as_str())
+        || context["workerAgentId"].as_str() != Some(body.worker_agent_id.as_str()) {
+        return Err(AppError::Forbidden("this action_worker run has no consented private-graph access".into()));
+    }
+    let auth = internal_mcp_auth(&state, &body.account_id, &body.worker_agent_id).await?;
+    crate::mydata_access::verify_graph_seller(State(state), Extension(auth), Json(body.request)).await
+}
+
+/// Renew the same opaque worker credential during a long live turn. Renewal is
+/// denied as soon as cancellation is requested or the worker loses live authority.
+pub async fn internal_mcp_renew_work_worker_credential(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let token=headers.get("x-work-run-credential").and_then(|value|value.to_str().ok()).filter(|value|!value.is_empty())
+        .ok_or_else(||AppError::Unauthorized("a work-run credential is required".into()))?;
+    let context=internal_mcp_work_worker_context(State(state.clone()),headers.clone()).await?;
+    if context.0.get("cancelRequestedAt").is_some_and(|value|!value.is_null()) {
+        return Ok(Json(serde_json::json!({"renewed":false,"expiresAt":null})));
+    }
+    Ok(Json(crate::work_runs::renew_worker_credential(&state,token).await?))
+}
+
+/// Resolve current model options for a bounded action_worker run. This is
+/// intentionally read-only and requires the same live parent AI authority as
+/// the inference path; the worker credential remains bound to one run.
+pub async fn internal_mcp_work_models(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let Some(expected)=state.config.internal_sync_secret.as_deref() else { return Err(AppError::Internal("internal sync secret is not configured".into())); };
+    let provided=headers.get("x-internal-sync-secret").and_then(|value|value.to_str().ok()).unwrap_or("");
+    if expected.is_empty()||!internal_secret_matches(provided,expected){return Err(AppError::Unauthorized("unauthorized".into()));}
+    let token=headers.get("x-work-run-credential").and_then(|value|value.to_str().ok()).filter(|value|!value.is_empty())
+        .ok_or_else(||AppError::Unauthorized("a work-run credential is required".into()))?;
+    let context=crate::work_runs::worker_credential_context(&state,token).await?
+        .ok_or_else(||AppError::Unauthorized("work-run credential is invalid, expired or revoked".into()))?;
+    let account_id=context["accountId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let parent_id=context["parentAgentId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let delegate_ref=context["delegateRef"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let parent=internal_mcp_auth(&state,account_id,parent_id).await?;
+    let worker_id=crate::automation_proxy::verify_action_worker_for_run(&state,&parent,delegate_ref)
+        .await.map_err(|_|AppError::Forbidden("the action_worker lost its live authority".into()))?;
+    if !crate::chain_reads::same(&worker_id,context["workerAgentId"].as_str().unwrap_or(""))
+        || !crate::memory_contract::has_cap(parent.capabilities,crate::memory_contract::CAP_AI_SPEND) {
+        return Err(AppError::Forbidden("the work run no longer has live parent AI authority".into()));
+    }
+    let live_context=agent_context(State(state.clone()),Extension(parent.clone())).await;
+    if !live_context.permitted_registry_actions.contains(&"ai.run_inference.v1") {
+        return Err(AppError::Forbidden("AI inference is not enabled for the parent agent".into()));
+    }
+    let models=crate::llm_models::list_models(State(state),Extension(parent)).await?;
+    Ok(Json(serde_json::to_value(models.0).map_err(|_|AppError::Internal("model catalog serialization failed".into()))?))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all="camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpWorkTaskArtifact { task_id: String }
+
+/// Deliver only the task artifact pinned to a consented worker credential.
+/// The run link, parent participant identity and child authority are all
+/// reconstructed server-side; callers cannot widen the task read by ID.
+pub async fn internal_mcp_work_task_artifact(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpWorkTaskArtifact>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let expected=state.config.internal_sync_secret.as_deref().ok_or_else(||AppError::Internal("internal sync secret is not configured".into()))?;
+    let provided=headers.get("x-internal-sync-secret").and_then(|value|value.to_str().ok()).unwrap_or("");
+    if expected.is_empty()||!internal_secret_matches(provided,expected){return Err(AppError::Unauthorized("unauthorized".into()));}
+    let token=headers.get("x-work-run-credential").and_then(|value|value.to_str().ok()).filter(|value|!value.is_empty()).ok_or_else(||AppError::Unauthorized("a work-run credential is required".into()))?;
+    let binding=crate::work_runs::worker_credential_context(&state,token).await?.ok_or_else(||AppError::Unauthorized("work-run credential is invalid, expired or revoked".into()))?;
+    if binding["allowPrivateTaskArtifacts"].as_bool()!=Some(true)||binding["cancelRequestedAt"].as_str().is_some(){return Err(AppError::Forbidden("private task-artifact access was not approved or this run is stopping".into()));}
+    let linked=binding["taskId"].as_str().ok_or_else(||AppError::Forbidden("private task artifacts require a task-linked worker run".into()))?;
+    let asked=crate::chain_reads::id(&body.task_id)?;
+    if !crate::chain_reads::same(linked,&asked){return Err(AppError::Forbidden("task artifact is outside this worker run's linked task".into()));}
+    let account_id=binding["accountId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let parent_id=binding["parentAgentId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let delegate_ref=binding["delegateRef"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let worker_id=binding["workerAgentId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let parent=internal_mcp_auth(&state,account_id,parent_id).await?;
+    let current_worker=crate::automation_proxy::verify_action_worker_for_run(&state,&parent,delegate_ref).await.map_err(|_|AppError::Forbidden("the action_worker lost its live authority".into()))?;
+    if !crate::chain_reads::same(&current_worker,worker_id){return Err(AppError::Forbidden("the work credential is bound to another action_worker".into()));}
+    let worker=crate::myso::canonical_agent_by_object_id(&state.http_client,&state.config.myso_rpc_url,&state.config.package_id,&crate::chain_reads::id(worker_id)?)
+        .await.map_err(|_|AppError::Forbidden("the action_worker is no longer available".into()))?;
+    if !worker.active||!crate::chain_reads::same(&worker.account_id,account_id)||!worker.parent_object_id.as_deref().is_some_and(|id|crate::chain_reads::same(id,parent_id))||worker.expires_at_ms.is_none_or(|expiry|expiry<=chrono::Utc::now().timestamp_millis())||u64::try_from(worker.capabilities).ok().is_none_or(|caps|caps&crate::memory_contract::CAP_TASK_TRADE==0){return Err(AppError::Forbidden("the action_worker no longer has live task-read authority".into()));}
+    crate::auth::require_path_capability(&parent,"GET","/api/agent/read/task_deliverable")?;
+    crate::platform_reads::read(State(state),Extension(parent),axum::extract::Path("task_deliverable".into()),axum::extract::Query(crate::platform_reads::ReadQuery{id:Some(asked),..Default::default()})).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InternalMcpWorkInferenceRequest { pub request: crate::structured_inference::ChatRequest }
+
+/// Hosted action_worker inference is charged to its verified parent agent's
+/// AI-credit balance, while the worker credential remains the authority for
+/// the encrypted run and the journaled MIST ceiling is authoritative.
+pub async fn internal_mcp_work_inference(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpWorkInferenceRequest>,
+) -> Result<Json<crate::ai_spend::StructuredInferenceResponse>, AppError> {
+    let Some(expected)=state.config.internal_sync_secret.as_deref() else { return Err(AppError::Internal("internal sync secret is not configured".into())); };
+    let provided=headers.get("x-internal-sync-secret").and_then(|value|value.to_str().ok()).unwrap_or("");
+    if expected.is_empty()||!internal_secret_matches(provided,expected){return Err(AppError::Unauthorized("unauthorized".into()));}
+    let token=headers.get("x-work-run-credential").and_then(|value|value.to_str().ok()).filter(|value|!value.is_empty())
+        .ok_or_else(||AppError::Unauthorized("a work-run credential is required".into()))?;
+    let context=crate::work_runs::worker_credential_context(&state,token).await?
+        .ok_or_else(||AppError::Unauthorized("work-run credential is invalid, expired or revoked".into()))?;
+    let account_id=context["accountId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let parent_id=context["parentAgentId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let run_id=context["runId"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let delegate_ref=context["delegateRef"].as_str().ok_or_else(||AppError::Internal("invalid worker credential record".into()))?;
+    let parent=internal_mcp_auth(&state,account_id,parent_id).await?;
+    let worker_id=crate::automation_proxy::verify_action_worker_for_run(&state,&parent,delegate_ref)
+        .await.map_err(|_|AppError::Forbidden("the action_worker lost its live authority".into()))?;
+    if !crate::chain_reads::same(&worker_id,context["workerAgentId"].as_str().unwrap_or("")) {
+        return Err(AppError::Forbidden("the run credential no longer matches its action_worker".into()));
+    }
+    if !crate::memory_contract::has_cap(parent.capabilities,crate::memory_contract::CAP_AI_SPEND) {
+        return Err(AppError::Forbidden("the parent agent lacks live AI-credit spend authority".into()));
+    }
+    let live_context=agent_context(State(state.clone()),Extension(parent.clone())).await;
+    if !live_context.permitted_registry_actions.contains(&"ai.run_inference.v1") {
+        return Err(AppError::Forbidden("AI inference is not enabled for the parent agent".into()));
+    }
+    if body.request.work_run_id.as_deref()!=Some(run_id)
+        || body.request.work_operation_id.as_deref().is_none() {
+        return Err(AppError::BadRequest("worker inference must bind the run and pending operation".into()));
+    }
+    crate::structured_inference::chat(State(state),Extension(parent),Json(body.request)).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpPlatformReadRequest {
+    #[serde(alias = "account_id")]
+    account_id: String,
+    #[serde(alias = "agent_object_id")]
+    agent_object_id: String,
+    resource: String,
+    query: crate::platform_reads::ReadQuery,
+}
+
+/// Fixed-route service bridge for hosted MCP platform reads. Rebuilds identity
+/// from fullnode state on each call; the caller cannot supply owner/capability data.
+pub async fn internal_mcp_platform_read(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpPlatformReadRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let expected = state.config.internal_sync_secret.as_deref()
+        .ok_or_else(|| AppError::Internal("internal sync secret is not configured".into()))?;
+    let provided = headers.get("x-internal-sync-secret").and_then(|value| value.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || !internal_secret_matches(provided, expected) {
+        return Err(AppError::Unauthorized("unauthorized".into()));
+    }
+    if body.resource.is_empty() || body.resource.len() > 96
+        || !body.resource.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_') {
+        return Err(AppError::BadRequest("invalid fixed read resource".into()));
+    }
+    let auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    let route = format!("/api/agent/read/{}", body.resource);
+    crate::auth::require_path_capability(&auth, "GET", &route)?;
+    crate::platform_reads::read(State(state), Extension(auth), Path(body.resource), Query(body.query)).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpMyDataAccessCheck {
+    account_id: String,
+    agent_object_id: String,
+    request: crate::mydata_access::CheckCurrentAccessRequest,
+}
+
+/// Hosted MCP bridge for a no-plaintext MyData authorization check. The caller
+/// is rebuilt from chain state and the short-lived session is checked against
+/// that agent's derived address by the listing sidecar.
+pub async fn internal_mcp_mydata_access_check(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpMyDataAccessCheck>,
+) -> Result<axum::response::Response, AppError> {
+    let expected = state.config.internal_sync_secret.as_deref()
+        .ok_or_else(|| AppError::Internal("internal sync secret is not configured".into()))?;
+    let provided = headers.get("x-internal-sync-secret").and_then(|value| value.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || !internal_secret_matches(provided, expected) {
+        return Err(AppError::Unauthorized("unauthorized".into()));
+    }
+    let session = headers.get("x-mydata-session").and_then(|value| value.to_str().ok()).unwrap_or("");
+    if session.is_empty() || session.len() > 32_768 || !session.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte)) {
+        return Err(AppError::Unauthorized("A current MyData session is required".into()));
+    }
+    let mut auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    auth.mydata_session = Some(session.to_string());
+    crate::auth::require_path_capability(&auth, "POST", "/api/mydata/check-current-access")?;
+    crate::mydata_access::check_current_access(State(state), Extension(auth), Json(body.request)).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpAutomationToolRequest {
+    account_id: String,
+    agent_object_id: String,
+    tool_name: String,
+    arguments: serde_json::Value,
+}
+
+fn automation_argument<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Value, AppError> {
+    args.get(key).ok_or_else(|| AppError::BadRequest(format!("{key} is required")))
+}
+
+fn automation_string<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, AppError> {
+    automation_argument(args, key)?.as_str().filter(|value| !value.is_empty())
+        .ok_or_else(|| AppError::BadRequest(format!("{key} must be a non-empty string")))
+}
+
+fn automation_segment(args: &serde_json::Value, key: &str) -> Result<String, AppError> {
+    let value = automation_string(args, key)?;
+    if value.len() > 128 || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')) {
+        return Err(AppError::BadRequest(format!("{key} has an invalid path format")));
+    }
+    Ok(value.to_owned())
+}
+
+fn automation_query(args: &serde_json::Value, keys: &[&str]) -> Result<String, AppError> {
+    let mut fields = Vec::new();
+    for key in keys {
+        let Some(value) = args.get(*key) else { continue };
+        if value.is_null() { continue; }
+        let value = match value {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::Bool(value) => value.to_string(),
+            _ => return Err(AppError::BadRequest(format!("{key} must be a scalar query value"))),
+        };
+        let encoded = percent_encoding::utf8_percent_encode(&value, percent_encoding::NON_ALPHANUMERIC).to_string();
+        fields.push(format!("{key}={encoded}"));
+    }
+    Ok(if fields.is_empty() { String::new() } else { format!("?{}", fields.join("&")) })
+}
+
+fn automation_tool_route(args: &serde_json::Value, name: &str) -> Result<(Method, String, Option<serde_json::Value>), AppError> {
+    let request_body = || automation_argument(args, "request").cloned();
+    let job_id = || automation_segment(args, "jobId");
+    let (method, path, body) = match name {
+        "automation_health" => (Method::GET, "/api/automation/health".into(), None),
+        "automation_list_jobs" => (Method::GET, format!("/api/automation/jobs{}", automation_query(args, &["limit", "offset"])?), None),
+        "automation_create_job" => (Method::POST, "/api/automation/jobs".into(), Some(automation_argument(args, "job")?.clone())),
+        "automation_validate_job" => (Method::POST, "/api/automation/jobs/validate".into(), Some(automation_argument(args, "job")?.clone())),
+        "automation_get_job" => (Method::GET, format!("/api/automation/jobs/{}", job_id()?), None),
+        "automation_update_job" => (Method::PATCH, format!("/api/automation/jobs/{}", job_id()?), Some(request_body()?)),
+        "automation_update_job_configuration" => (Method::PATCH, format!("/api/automation/jobs/{}/configuration", job_id()?), Some(request_body()?)),
+        "automation_set_job_enabled" => (Method::POST, format!("/api/automation/jobs/{}", job_id()?), Some(request_body()?)),
+        "automation_archive_job" => (Method::POST, format!("/api/automation/jobs/{}/archive", job_id()?), Some(request_body()?)),
+        "automation_restore_job" => (Method::POST, format!("/api/automation/jobs/{}/restore", job_id()?), Some(request_body()?)),
+        "automation_delete_job" => (Method::DELETE, format!("/api/automation/jobs/{}", job_id()?), Some(request_body()?)),
+        "automation_cancel_job" => (Method::POST, format!("/api/automation/jobs/{}/cancel", job_id()?), Some(request_body()?)),
+        "automation_list_runs" => (Method::GET, format!("/api/automation/jobs/{}/runs{}", job_id()?, automation_query(args, &["limit", "offset"])?), None),
+        "automation_reconcile_orphan_run" => (Method::POST, format!("/api/automation/jobs/{}/runs/{}/reconcile", job_id()?, automation_segment(args, "runId")?), Some(request_body()?)),
+        "automation_run_job_now" => (Method::POST, format!("/api/automation/jobs/{}/run-now", job_id()?), Some(request_body()?)),
+        "automation_simulate_event" => (Method::POST, format!("/api/automation/jobs/{}/simulate-event", job_id()?), Some(request_body()?)),
+        "automation_list_deliveries" => (Method::GET, format!("/api/automation/jobs/{}/deliveries{}", job_id()?, automation_query(args, &["limit", "offset"])?), None),
+        "automation_reconcile_delivery" | "automation_cancel_delivery" => {
+            let operation = if name == "automation_reconcile_delivery" { "reconcile" } else { "cancel" };
+            (Method::POST, format!("/api/automation/deliveries/{}/{operation}", automation_segment(args, "deliveryId")?), Some(request_body()?))
+        },
+        "automation_list_delegates" => (Method::GET, format!("/api/automation/delegates{}", automation_query(args, &["limit", "cursor"])?), None),
+        "automation_list_delegate_key_events" => (Method::GET, format!("/api/automation/delegates/events{}", automation_query(args, &["limit", "cursor"])?), None),
+        "automation_get_delegate_status" => (Method::GET, format!("/api/automation/delegates/{}/status", automation_segment(args, "delegateRef")?), None),
+        "automation_get_delegate_keys" => (Method::GET, "/api/automation/delegates/keys".into(), None),
+        "automation_store_delegate" => (Method::PUT, format!("/api/automation/delegates/{}", automation_segment(args, "delegateRef")?), Some(automation_argument(args, "delegate")?.clone())),
+        "automation_delete_delegate" => (Method::DELETE, format!("/api/automation/delegates/{}", automation_segment(args, "delegateRef")?), None),
+        _ => return Err(AppError::BadRequest("unsupported automation MCP tool".into())),
+    };
+    Ok((method, path, body))
+}
+
+/// Hosted MCP automation uses the same owner-authenticated proxy handlers as the public API.
+/// The caller supplies a tool name and arguments, never an arbitrary URL or identity claims.
+pub async fn internal_mcp_automation_tool(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpAutomationToolRequest>,
+) -> Result<Response, AppError> {
+    verify_internal_sync(&state, &headers)?;
+    if body.arguments.is_null() || !body.arguments.is_object() {
+        return Err(AppError::BadRequest("automation arguments must be an object".into()));
+    }
+    let auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    let (method, path, payload) = automation_tool_route(&body.arguments, &body.tool_name)?;
+    crate::auth::require_path_capability(&auth, method.as_str(), &path.split('?').next().unwrap_or(&path))?;
+
+    let router = axum::Router::new()
+        .route("/api/automation/jobs", get(crate::automation_proxy::list_jobs).post(crate::automation_proxy::create_job))
+        .route("/api/automation/jobs/validate", post(crate::automation_proxy::validate_job))
+        .route("/api/automation/jobs/{id}/simulate-event", post(crate::automation_proxy::simulate_job_event))
+        .route("/api/automation/jobs/{id}/configuration", axum::routing::patch(crate::automation_proxy::update_job_configuration))
+        .route("/api/automation/jobs/{id}", get(crate::automation_proxy::get_job).post(crate::automation_proxy::set_job_enabled).patch(crate::automation_proxy::rename_job).delete(crate::automation_proxy::delete_job))
+        .route("/api/automation/jobs/{id}/archive", post(crate::automation_proxy::archive_job))
+        .route("/api/automation/jobs/{id}/restore", post(crate::automation_proxy::restore_job))
+        .route("/api/automation/jobs/{id}/runs", get(crate::automation_proxy::list_runs))
+        .route("/api/automation/jobs/{id}/run-now", post(crate::automation_proxy::run_job_now))
+        .route("/api/automation/jobs/{id}/cancel", post(crate::automation_proxy::cancel_job))
+        .route("/api/automation/delegates", get(crate::automation_proxy::list_delegates))
+        .route("/api/automation/delegates/events", get(crate::automation_proxy::list_delegate_key_events))
+        .route("/api/automation/delegates/{name}/status", get(crate::automation_proxy::get_delegate_status))
+        .route("/api/automation/delegates/keys", get(crate::automation_proxy::list_delegate_public_keys))
+        .route("/api/automation/delegates/{name}", axum::routing::put(crate::automation_proxy::put_delegate).delete(crate::automation_proxy::delete_delegate))
+        .route("/api/automation/deliveries/{id}/reconcile", post(crate::automation_proxy::resolve_event_delivery))
+        .route("/api/automation/deliveries/{id}/cancel", post(crate::automation_proxy::cancel_event_delivery))
+        .route("/api/automation/health", get(crate::automation_proxy::health))
+        .layer(Extension(auth))
+        .with_state(state);
+
+    let mut builder = Request::builder().method(method).uri(&path);
+    let bytes = if let Some(payload) = payload {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+        serde_json::to_vec(&payload).map_err(|error| AppError::Internal(error.to_string()))?
+    } else { Vec::new() };
+    let request = builder.body(Body::from(bytes)).map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let response = router.oneshot(request).await.map_err(|error| AppError::Internal(error.to_string()))?;
+    let (parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.map_err(|error| AppError::Internal(error.to_string()))?;
+    Ok(Response::from_parts(parts, Body::from(bytes)))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpActionApprovalRequest {
+    #[serde(alias = "account_id")]
+    account_id: String,
+    #[serde(alias = "agent_object_id")]
+    agent_object_id: String,
+    request: crate::types::ActionApprovalRequest,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpActionPrepareRequest {
+    #[serde(alias = "account_id")]
+    account_id: String,
+    #[serde(alias = "agent_object_id")]
+    agent_object_id: String,
+    request: crate::types::RegisteredActionPrepareRequest,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InternalMcpActionSubmitRequest {
+    #[serde(alias = "account_id")]
+    account_id: String,
+    #[serde(alias = "agent_object_id")]
+    agent_object_id: String,
+    request: crate::types::RegisteredActionSubmitRequest,
+}
+
+/// Hosted MCP owner-approval preparation uses the same live agent policy and registered
+/// action validators as the public signed API; the internal secret only authenticates the
+/// service hop and never supplies identity or spending authority.
+pub async fn internal_mcp_action_approval_request(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpActionApprovalRequest>,
+) -> Result<Json<crate::types::ActionApprovalResponse>, AppError> {
+    verify_internal_sync(&state, &headers)?;
+    let auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    request_action_approval(State(state), Extension(auth), Json(body.request)).await
+}
+
+pub async fn internal_mcp_action_approvals_list(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalAgentContextRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    verify_internal_sync(&state, &headers)?;
+    let auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    let rows = crate::action_approvals::list_for_agent(&state.db, &auth.account_id, &auth.agent_object_id, 100).await?;
+    Ok(Json(serde_json::json!({"items": rows.iter().map(approval_response).collect::<Vec<_>>() })))
+}
+
+pub async fn internal_mcp_action_prepare(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpActionPrepareRequest>,
+) -> Result<Json<crate::types::RegisteredActionPrepareResponse>, AppError> {
+    verify_internal_sync(&state, &headers)?;
+    let auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    prepare_registered_action(State(state), Extension(auth), Json(body.request)).await
+}
+
+pub async fn internal_mcp_action_submit(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<InternalMcpActionSubmitRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    verify_internal_sync(&state, &headers)?;
+    let auth = internal_mcp_auth(&state, &body.account_id, &body.agent_object_id).await?;
+    submit_registered_action(State(state), Extension(auth), Json(body.request)).await
+}
+
+fn verify_internal_sync(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), AppError> {
+    let expected = state.config.internal_sync_secret.as_deref()
+        .ok_or_else(|| AppError::Internal("internal sync secret is not configured".into()))?;
+    let provided = headers.get("x-internal-sync-secret").and_then(|value| value.to_str().ok()).unwrap_or("");
+    if expected.is_empty() || !internal_secret_matches(provided, expected) {
+        return Err(AppError::Unauthorized("unauthorized".into()));
+    }
+    Ok(())
 }
 
 fn is_openrouter_api_base(api_base: &str) -> bool {
@@ -949,7 +1857,6 @@ pub async fn recall(
             .iter()
             .map(|hit| {
                 let http_client = state.http_client.clone();
-                let aggregator_url = state.config.file_storage_aggregator_url.clone();
                 let r2 = state.r2.clone();
                 let sidecar_url = state.config.sidecar_url.clone();
                 let sidecar_secret = state.config.sidecar_secret.clone();
@@ -958,6 +1865,7 @@ pub async fn recall(
                 let score = hit.score;
                 let hit_visibility = hit.visibility;
                 let hit_source_agent = hit.source_agent_object_id.clone();
+                let blob_agent_id = hit_source_agent.clone().unwrap_or_else(|| auth.agent_object_id.clone());
                 let hit_importance = hit.importance;
                 let hit_created_at = hit.created_at;
                 let credential = credential.clone();
@@ -986,17 +1894,16 @@ pub async fn recall(
                     );
                     let encrypted_data =
                         match crate::blob_store::fetch_encrypted_blob(
-                            &http_client,
-                            &aggregator_url,
                             r2.as_ref(),
                             &owner_for_cleanup,
+                            &blob_agent_id,
                             &blob_id,
                         )
                             .await
                         {
                             Ok(data) => data,
                             Err(AppError::BlobNotFound(msg)) => {
-                                // Blob expired on File Storage — clean up from DB reactively
+                                // The private R2 object is missing; remove the stale vector row.
                                 tracing::warn!("Blob expired, cleaning up: {}", msg);
                                 cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
                                 return None;
@@ -1098,13 +2005,18 @@ pub async fn recall(
 /// Hybrid manual flow:
 /// - Client has already done: embed (OpenRouter) + MYDATA encrypt locally
 /// - Client sends {encrypted_data (base64), vector}
-/// - Server uploads encrypted bytes to File Storage via upload-relay sidecar → gets blob_id
+/// - Server stores encrypted bytes in the private Cloudflare R2 bucket → gets blob_id
 /// - Server stores {blob_id, vector} in Vector DB
 pub async fn remember_manual(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
     Json(body): Json<RememberManualRequest>,
 ) -> Result<Json<RememberManualResponse>, AppError> {
+    if body.blob_id.is_some() {
+        return Err(AppError::BadRequest(
+            "Client-supplied blob IDs are not supported in the R2-only service; submit MYDATA-encrypted bytes in encrypted_data".into(),
+        ));
+    }
     if body.vector.is_empty() {
         return Err(AppError::BadRequest("vector cannot be empty".into()));
     }
@@ -1128,49 +2040,25 @@ pub async fn remember_manual(
     let (visibility, org_id) =
         crate::org_perms::authorize_write_visibility(&state, &auth, &body.visibility).await?;
 
-    let (blob_id, blob_size) = if let Some(ref existing_blob_id) = body.blob_id {
-        if existing_blob_id.is_empty() {
-            return Err(AppError::BadRequest("blob_id cannot be empty".into()));
-        }
-        (existing_blob_id.clone(), 0_i64)
-    } else {
-        let encrypted_bytes = base64::engine::general_purpose::STANDARD
-            .decode(&body.encrypted_data)
-            .map_err(|e| {
-                AppError::BadRequest(format!("encrypted_data is not valid base64: {}", e))
-            })?;
-
-        rate_limit::check_storage_quota(&state, owner, encrypted_bytes.len() as i64).await?;
-
-        let key_index = state.key_pool.next_index().ok_or_else(|| {
-            AppError::Internal(
-                "No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)"
-                    .into(),
-            )
+    let encrypted_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&body.encrypted_data)
+        .map_err(|e| {
+            AppError::BadRequest(format!("encrypted_data is not valid base64: {}", e))
         })?;
+    if encrypted_bytes.is_empty() || encrypted_bytes.len() > 512 * 1024 {
+        return Err(AppError::BadRequest("encrypted_data must contain 1-512 KiB of ciphertext".into()));
+    }
+    rate_limit::check_storage_quota(&state, owner, encrypted_bytes.len() as i64).await?;
 
-        let upload = file_storage::upload_blob(
-            &state.http_client,
-            &state.config.sidecar_url,
-            state.config.sidecar_secret.as_deref(),
-            &encrypted_bytes,
-            50,
-            owner,
-            key_index,
-            agent_object_id,
-            &state.config.package_id,
-            Some(&auth.agent_object_id),
-            visibility,
-            org_id.as_deref(),
-        )
-        .await?;
-
-        tracing::info!(
-            "remember_manual: file storage upload ok blob_id={}",
-            upload.blob_id
-        );
-        (upload.blob_id, encrypted_bytes.len() as i64)
+    let metadata = crate::blob_store::MemoryBlobMetadata {
+        agent_object_id: agent_object_id.clone(),
+        package_id: state.config.package_id.clone(),
+        visibility,
+        organization_id: org_id.clone(),
     };
+    let blob_id = crate::blob_store::store_new_blob(&state, owner, &metadata, encrypted_bytes.clone()).await?;
+    tracing::info!("remember_manual: private R2 write ok blob_id={}", blob_id);
+    let blob_size = encrypted_bytes.len() as i64;
     let id = uuid::Uuid::new_v4().to_string();
     state
         .db
@@ -1224,7 +2112,7 @@ pub async fn remember_manual(
 ///
 /// Manual flow — user provides pre-computed query vector.
 /// Server searches Vector DB and returns {blob_id, distance}[].
-/// User downloads from File Storage + MYDATA decrypts on their own.
+/// User retrieves the private R2 ciphertext and MYDATA decrypts it on their own.
 pub async fn recall_manual(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
@@ -1265,6 +2153,31 @@ pub async fn recall_manual(
         .await?;
     let total = hits.len();
 
+    // The SDK decrypts locally, but it must not contact an unavailable public
+    // storage aggregator. Return only authenticated R2 ciphertext to this
+    // signed, owner-scoped request.
+    let r2 = state.r2.as_ref().ok_or_else(|| {
+        AppError::Internal("Cloudflare R2 is required for manual memory recall".into())
+    })?;
+    let authenticated_agent = auth.agent_object_id.clone();
+    let fetches = hits.into_iter().map(|hit| {
+        let blob_agent = hit.source_agent_object_id.clone().unwrap_or_else(|| authenticated_agent.clone());
+        async move {
+        let encrypted = r2.get(owner, &blob_agent, hit.blob_id.strip_prefix(crate::blob_store::R2_BLOB_PREFIX)
+            .ok_or_else(|| AppError::BlobNotFound("Legacy File Storage blob is unavailable in the R2-only deployment".into()))?).await?;
+        if encrypted.len() > 512 * 1024 {
+            return Err(AppError::BadRequest("Encrypted memory exceeds the 512 KiB manual recall limit".into()));
+        }
+        Ok(RecallManualEncryptedHit {
+            blob_id: hit.blob_id,
+            distance: hit.distance,
+            encrypted_data: base64::engine::general_purpose::STANDARD.encode(encrypted),
+        })
+    }});
+    let fetched: Vec<Result<RecallManualEncryptedHit, AppError>> =
+        futures::stream::iter(fetches).buffer_unordered(10).collect().await;
+    let results = fetched.into_iter().collect::<Result<Vec<_>, _>>()?;
+
     tracing::info!(
         "recall_manual complete: {} results for owner={} agent={}",
         total,
@@ -1273,7 +2186,7 @@ pub async fn recall_manual(
     );
 
     Ok(Json(RecallManualResponse {
-        results: hits,
+        results,
         total,
     }))
 }
@@ -1283,7 +2196,7 @@ pub async fn recall_manual(
 /// AI fact extraction flow:
 /// 1. Verify auth (middleware) → get owner
 /// 2. Call LLM to extract memorable facts from text
-/// 3. For each fact concurrently: embed + encrypt → File Storage upload → store
+/// 3. For each fact concurrently: embed + encrypt → private R2 write → store
 pub async fn analyze(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<AuthInfo>,
@@ -1371,9 +2284,7 @@ pub async fn analyze(
         .map(|f| estimate_tokens_from_chars(f.len()))
         .sum();
 
-    // Step 2: Process all facts concurrently (embed + encrypt → upload → store)
-    // Each fact gets its own key from the pool so sidecar can upload them in parallel
-    // (different signer addresses bypass the per-signer serialization lock).
+    // Step 2: Process all facts concurrently (embed + encrypt → private R2 → store).
     let auth_agent_id = auth.agent_object_id.clone();
     let sub_label_for_tasks = sub_label.clone();
     let write_visibility_for_tasks = write_visibility;
@@ -1382,17 +2293,11 @@ pub async fn analyze(
         let state = Arc::clone(&state);
         let owner = owner.clone();
         let fact_text = fact_text.clone();
-        let agent_id = auth_agent_id.clone();
         let agent_object_id = auth_agent_id.clone();
         let sub_label = sub_label_for_tasks.clone();
         let visibility = write_visibility_for_tasks;
         let organization_id = write_org_id_for_tasks.clone();
-        // Pick the next key in round-robin order at task construction time.
-        // Convert to owned String *before* async move so we don't borrow-then-move `state`.
-        let key_index: Result<usize, AppError> = state.key_pool.next_index()
-            .ok_or_else(|| AppError::Internal("No MySo keys configured (set SERVER_MYSO_PRIVATE_KEYS or SERVER_MYSO_PRIVATE_KEY)".into()));
         async move {
-            let key_index = key_index?;
             let embed_fut = generate_embedding(&state.http_client, &state.config, &fact_text);
             let encrypt_fut = mydata::mydata_encrypt(
                 &state.http_client, &state.config.sidecar_url,
@@ -1405,20 +2310,13 @@ pub async fn analyze(
             let vector = vector_result?;
             let encrypted = encrypted_result?;
 
-            let upload_result = file_storage::upload_blob(
-                &state.http_client,
-                &state.config.sidecar_url,
-                state.config.sidecar_secret.as_deref(),
-                &encrypted,
-                50,
-                &owner,
-                key_index,
-                &agent_object_id,
-                &state.config.package_id,
-                Some(&agent_id),
+            let metadata = crate::blob_store::MemoryBlobMetadata {
+                agent_object_id: agent_object_id.clone(),
+                package_id: state.config.package_id.clone(),
                 visibility,
-                organization_id.as_deref(),
-            ).await?;
+                organization_id: organization_id.clone(),
+            };
+            let blob_id = crate::blob_store::store_new_blob(&state, &owner, &metadata, encrypted.clone()).await?;
 
             let blob_size = encrypted.len() as i64;
             let id = uuid::Uuid::new_v4().to_string();
@@ -1427,7 +2325,7 @@ pub async fn analyze(
                 &owner,
                 &agent_object_id,
                 sub_label.as_deref(),
-                &upload_result.blob_id,
+                &blob_id,
                 &vector,
                 blob_size,
                 0.5,
@@ -1438,7 +2336,7 @@ pub async fn analyze(
             Ok::<AnalyzedFact, AppError>(AnalyzedFact {
                 text: fact_text,
                 id,
-                blob_id: upload_result.blob_id,
+                blob_id,
             })
         }
     }).collect();
@@ -1733,12 +2631,20 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ConfigRespon
         .then(|| PublicSocialChainConfig {
             package_id: package_id.clone(),
             username_registry_id: state.config.social_chain.username_registry_id.clone(),
+            memory_registry_id: state.config.social_chain.social_memory_registry_id.clone(),
             platform_registry_id: state.config.social_chain.platform_registry_id.clone(),
             platform_object_id: state.config.social_chain.platform_object_id.clone(),
             block_list_registry_id: state.config.social_chain.block_list_registry_id.clone(),
             post_config_id: state.config.social_chain.post_config_id.clone(),
             memory_config_id: state.config.social_chain.memory_config_id.clone(),
             mydata_registry_id: state.config.social_chain.mydata_registry_id.clone(),
+            mydata_config_id: state.config.social_chain.mydata_config_id.clone(),
+            subscription_config_id: state.config.social_chain.subscription_config_id.clone(),
+            poc_config_id: state.config.social_chain.poc_config_id.clone(),
+            spot_config_id: state.config.social_chain.spot_config_id.clone(),
+            spot_claim_registry_id: state.config.social_chain.spot_claim_registry_id.clone(),
+            spt_registry_id: state.config.social_chain.spt_registry_id.clone(),
+            spt_config_id: state.config.social_chain.spt_config_id.clone(),
             social_graph_id: state.config.social_chain.social_graph_id.clone(),
             task_config_id: state.config.social_chain.task_config_id.clone(),
             jury_config_id: state.config.social_chain.jury_config_id.clone(),
@@ -2247,7 +3153,6 @@ pub async fn ask(
             .iter()
             .map(|hit| {
                 let http_client = state.http_client.clone();
-                let aggregator_url = state.config.file_storage_aggregator_url.clone();
                 let r2 = state.r2.clone();
                 let sidecar_url = state.config.sidecar_url.clone();
                 let sidecar_secret = state.config.sidecar_secret.clone();
@@ -2256,6 +3161,7 @@ pub async fn ask(
                 let score = hit.score;
                 let hit_visibility = hit.visibility;
                 let hit_source_agent = hit.source_agent_object_id.clone();
+                let blob_agent_id = hit_source_agent.clone().unwrap_or_else(|| auth.agent_object_id.clone());
                 let hit_importance = hit.importance;
                 let hit_created_at = hit.created_at;
                 let credential = credential.clone();
@@ -2284,17 +3190,16 @@ pub async fn ask(
                     );
                     let encrypted_data =
                         match crate::blob_store::fetch_encrypted_blob(
-                            &http_client,
-                            &aggregator_url,
                             r2.as_ref(),
                             &owner_for_cleanup,
+                            &blob_agent_id,
                             &blob_id,
                         )
                             .await
                         {
                             Ok(data) => data,
                             Err(AppError::BlobNotFound(msg)) => {
-                                // Blob expired on File Storage — clean up from DB reactively
+                                // The private R2 object is missing; clean up the stale vector row.
                                 tracing::warn!("Blob expired, cleaning up: {}", msg);
                                 cleanup_expired_blob(db, &blob_id, &owner_for_cleanup).await;
                                 return None;
@@ -2562,7 +3467,7 @@ pub async fn record_inference_usage_route(
 // ============================================================
 
 /// Reactively delete an expired blob from the vector DB.
-/// Called when File Storage returns 404 (blob expired / not found).
+/// Called when the private R2 object is missing.
 /// Errors are logged but not propagated — cleanup is best-effort.
 ///
 /// LOW-10: `owner` is required so the DELETE is scoped to the caller's rows.
@@ -2596,9 +3501,9 @@ async fn cleanup_expired_blob(db: &VectorDb, blob_id: &str, owner: &str) {
 
 /// POST /api/restore
 ///
-/// Restore a namespace from File Storage:
-/// 1. Get all blob_ids for owner+namespace from DB
-/// 2. Download each blob from File Storage
+/// Restore a namespace from Cloudflare R2:
+/// 1. List the caller's R2 memory objects and filter to the authenticated agent
+/// 2. Download each encrypted object from the private bucket
 /// 3. MYDATA decrypt with delegate key
 /// 4. Re-embed decrypted text
 /// 5. Clear old vector entries and re-index
@@ -2631,40 +3536,27 @@ pub async fn restore(
         )
     })?;
 
-    // Step 1: Discover all blob_ids from on-chain (source of truth)
-    tracing::info!(
-        "restore: querying chain for blobs owner={} agent={}",
-        owner,
-        agent_object_id
-    );
-    let on_chain_blobs = file_storage::query_blobs_by_owner(
-        &state.http_client,
-        &state.config.sidecar_url,
-        state.config.sidecar_secret.as_deref(),
-        owner,
-        Some(agent_object_id),
-        Some(&state.config.package_id),
-    )
-    .await?;
-    let all_blob_ids: Vec<String> = on_chain_blobs.iter().map(|b| b.blob_id.clone()).collect();
+    // R2 is the storage source for Agents. Each private object carries the
+    // minimal recovery metadata needed to rebuild the index without File Storage.
+    let r2 = state.r2.as_ref().ok_or_else(|| AppError::Internal(
+        "Cloudflare R2 is required to restore agent memory".into(),
+    ))?;
+    let r2_blobs = r2.list_memory_blobs(owner, agent_object_id).await?;
+    let all_blob_ids: Vec<String> = r2_blobs.iter().map(|blob| blob.blob_id.clone()).collect();
     let total = all_blob_ids.len();
 
-    // Build blob_id → package_id lookup from on-chain metadata
-    // Each blob may have been encrypted with a different package_id (e.g. after contract upgrades)
-    let blob_package_ids: std::collections::HashMap<String, String> = on_chain_blobs
+    // Build blob metadata lookups from R2 object metadata. The package ID is
+    // captured at encryption time so restore remains valid across upgrades.
+    let blob_package_ids: std::collections::HashMap<String, String> = r2_blobs
         .iter()
-        .filter(|b| !b.package_id.is_empty())
-        .map(|b| (b.blob_id.clone(), b.package_id.clone()))
+        .filter(|blob| !blob.package_id.is_empty())
+        .map(|blob| (blob.blob_id.clone(), blob.package_id.clone()))
         .collect();
 
-    // Visibility metadata for restore — legacy blobs default to private.
-    let blob_visibility: std::collections::HashMap<String, (i16, Option<String>)> = on_chain_blobs
+    let blob_visibility: std::collections::HashMap<String, (i16, Option<String>)> = r2_blobs
         .iter()
-        .map(|b| {
-            let visibility = b
-                .memory_visibility
-                .unwrap_or(crate::types::VISIBILITY_PRIVATE);
-            (b.blob_id.clone(), (visibility, b.memory_org_id.clone()))
+        .map(|blob| {
+            (blob.blob_id.clone(), (blob.visibility, blob.organization_id.clone()))
         })
         .collect();
 
@@ -2700,7 +3592,7 @@ pub async fn restore(
         .filter(|id| !existing_set.contains(id.as_str()))
         .cloned()
         .collect();
-    // Apply limit — take the most recent N missing blobs (last N from chain query)
+    // Apply the caller's bounded restore limit to the indexed R2 objects.
     let missing_blob_ids: Vec<String> = if all_missing.len() > limit {
         all_missing[all_missing.len() - limit..].to_vec()
     } else {
@@ -2708,7 +3600,7 @@ pub async fn restore(
     };
     let skipped = total - missing_blob_ids.len();
     tracing::info!(
-        "restore: total={} on-chain, existing={}, missing={} (limited to {}) for agent={}",
+        "restore: total={} R2 objects, existing={}, missing={} (limited to {}) for agent={}",
         total,
         existing_blob_ids.len(),
         missing_blob_ids.len(),
@@ -2728,22 +3620,19 @@ pub async fn restore(
         }));
     }
 
-    // Step 3: Download all missing blobs from File Storage concurrently
+    // Step 3: Download all missing blobs from the private R2 bucket concurrently
     let db = &state.db;
     let download_tasks: Vec<_> = missing_blob_ids
         .iter()
         .map(|blob_id| {
-            let http_client = state.http_client.clone();
-            let aggregator_url = state.config.file_storage_aggregator_url.clone();
             let r2 = state.r2.clone();
             let blob_id = blob_id.clone();
             let owner_for_cleanup = owner.clone();
             async move {
                 match crate::blob_store::fetch_encrypted_blob(
-                    &http_client,
-                    &aggregator_url,
                     r2.as_ref(),
                     &owner_for_cleanup,
+                    agent_object_id,
                     &blob_id,
                 )
                 .await {
@@ -2959,15 +3848,74 @@ pub async fn restore(
 // Registry-only chain action prepare / submit
 // ============================================================
 
-const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.5.0";
+const SOCIAL_ACTION_REGISTRY_VERSION: &str = "1.33.0";
+
+fn registered_action_registry_version_supported(version:&str,action:&str)->bool {
+    if version==SOCIAL_ACTION_REGISTRY_VERSION { return true; }
+    if action=="account.rotate_owner_key.v1" { return matches!(version,"1.32.0"|"1.33.0"); }
+    if action=="agent.lower_spending_limit.v1" && version!="1.33.0" { return false; }
+    if action==crate::spt::BUY_ACTION || action==crate::spt::SELL_ACTION { return false; }
+    if action=="subscription.change_service_payment_recipient.v1" { return false; }
+    if action=="access.publish_mydata_graph.v1" { return false; }
+    if action=="access.purchase_post_access.v1" { return false; }
+    if action=="governance.vote.v1" { return false; }
+    if action=="governance.delegate_vote.v1" { return false; }
+    if action=="assets.transfer_object.v1" { return false; }
+    if action=="assets.burn_object.v1" { return false; }
+    if action=="spot.create_market.v1" { return false; }
+    let unsupported = match version {
+        "1.16.0" => action == "governance.vote.v1",
+        "1.15.0" => action == "governance.vote.v1",
+        "1.14.0" => matches!(action,"spot.place_bet.v1"),
+        "1.13.0" => matches!(action,"spot.claim_payout.v1"|"spot.place_bet.v1"),
+        "1.12.0" => matches!(action,"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1"),
+        "1.11.0" => matches!(action,"social.delete_post.v1"|"social.delete_comment.v1"|"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1"),
+        "1.10.0" => matches!(action,"payments.tip_post.v1"|"social.delete_post.v1"|"social.delete_comment.v1"|"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1"),
+        "1.9.0" => crate::owner_agents::is_action(action)||matches!(action,"payments.tip_post.v1"|"social.delete_post.v1"|"social.delete_comment.v1"|"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1"),
+        "1.8.0" => crate::owner_agents::is_action(action)||action==crate::payments::ACTION||matches!(action,"payments.tip_post.v1"|"social.delete_post.v1"|"social.delete_comment.v1"|"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1"),
+        "1.7.0" => crate::subscription_access::is_action(action)||crate::owner_agents::is_action(action)||action==crate::payments::ACTION||matches!(action,"payments.tip_post.v1"|"social.delete_post.v1"|"social.delete_comment.v1"|"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1"),
+        "1.6.0" => matches!(action,"access.share_mydata.v1"|"access.revoke_mydata_share.v1"|"payments.tip_post.v1"|"social.delete_post.v1"|"social.delete_comment.v1"|"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1")||crate::subscription_access::is_action(action)||crate::owner_agents::is_action(action)||action==crate::payments::ACTION,
+        "1.5.0" => matches!(action,"access.purchase_mydata_access.v1"|"access.share_mydata.v1"|"access.revoke_mydata_share.v1"|"payments.tip_post.v1"|"social.delete_post.v1"|"social.delete_comment.v1"|"poc.claim_creator_vault.v1"|"spot.claim_payout.v1"|"spot.place_bet.v1")||crate::subscription_access::is_action(action)||crate::owner_agents::is_action(action)||action==crate::payments::ACTION,
+        _ => true,
+    };
+    !unsupported
+}
 
 fn registered_action_policy(action: &str) -> Option<(u64, &'static str)> {
     use crate::memory_contract::{
         CAP_AGENT_REGISTER, CAP_AGENT_REVOKE, CAP_AGENT_UPDATE, CAP_COMMENT, CAP_JURY,
-        CAP_MEMORY_READ, CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT,
-        CAP_SOCIAL_GRAPH, CAP_TASK_TRADE,
+        CAP_BUDGET_MANAGE, CAP_MEMORY_READ, CAP_MYDATA_READ, CAP_MESSAGE_SEND, CAP_POST_PUBLISH, CAP_REACT,
+        CAP_SOCIAL_GRAPH, CAP_TASK_TRADE, CAP_TRADE_EXECUTE,
     };
     match action {
+        "agent.revoke_agent.v1" => Some((CAP_AGENT_REVOKE,"3")),
+        "agent.grant_capability.v1"|"agent.revoke_capability.v1" => Some((CAP_AGENT_UPDATE,"3")),
+        "agent.raise_spending_limit.v1" => Some((CAP_BUDGET_MANAGE,"3")),
+        "agent.lower_spending_limit.v1" => Some((CAP_BUDGET_MANAGE,"3")),
+        // Owner migration proposal is always owner-approved; it cannot be auto-spent by an agent.
+        "account.rotate_owner_key.v1" => Some((0,"3")),
+        "payments.send_token.v1" => Some((CAP_TRADE_EXECUTE,"2")),
+        "payments.tip_post.v1" => Some((CAP_TRADE_EXECUTE,"2")),
+        "poc.claim_creator_vault.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "spot.claim_payout.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "spot.place_bet.v1" => Some((CAP_TRADE_EXECUTE,"2")),
+        "spot.create_market.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "dex.swap.v1" => Some((CAP_TRADE_EXECUTE,"2")),
+        "spt.buy.v1"|"spt.sell.v1" => Some((CAP_TRADE_EXECUTE,"2")),
+        "governance.vote.v1" => Some((CAP_TRADE_EXECUTE,"2")),
+        "governance.delegate_vote.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "assets.transfer_object.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "assets.burn_object.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "organization.withdraw_treasury.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "organization.grant_treasury_access.v1" => Some((CAP_AGENT_UPDATE,"3")),
+        "organization.fund_treasury.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "platform.transfer_platform.v1" | "platform.update_fee_recipient.v1" => Some((0,"3")),
+        "subscription.subscribe_to_plan.v1"|"subscription.renew_subscription.v1"|"subscription.cancel_subscription.v1"|"subscription.enable_auto_renew.v1"|"subscription.disable_auto_renew.v1" => Some((CAP_TRADE_EXECUTE,"2")),
+        "subscription.change_service_payment_recipient.v1" => Some((CAP_TRADE_EXECUTE,"3")),
+        "access.purchase_mydata_access.v1" => Some((CAP_MYDATA_READ, "1B")),
+        "access.publish_mydata_graph.v1" => Some((CAP_MYDATA_READ, "1B")),
+        "access.purchase_post_access.v1" => Some((CAP_MYDATA_READ, "1B")),
+        "access.share_mydata.v1" | "access.revoke_mydata_share.v1" => Some((CAP_MYDATA_READ, "2")),
         "social.create_post.v1"
         | "social.edit_post.v1"
         | "social.create_repost.v1"
@@ -3152,17 +4100,46 @@ fn assert_registered_action_policy(
 ) -> Result<(u64, &'static str), AppError> {
     use crate::memory_contract::has_cap;
 
-    if registry_version != SOCIAL_ACTION_REGISTRY_VERSION {
+    if !registered_action_registry_version_supported(registry_version,action) {
         return Err(AppError::Conflict(
             "unsupported social action registry version".into(),
         ));
     }
     let policy = registered_action_policy(action)
         .ok_or_else(|| AppError::BadRequest("unsupported registered action".into()))?;
+    if crate::owner_agents::is_action(action) && !crate::owner_agents::configured(&state.config) {return Err(AppError::Forbidden("Owner agent actions are disabled for this deployment".into()));}
+    if action==crate::payments::ACTION && !crate::payments::configured(&state.config) {return Err(AppError::Forbidden("Token transfers are not enabled for this deployment".into()));}
+    if action==crate::poc_vault::ACTION && !crate::poc_vault::configured(&state.config) {return Err(AppError::Forbidden("Creator-vault claims are disabled for this deployment".into()));}
+    if action==crate::spot_payout::ACTION && !crate::spot_payout::configured(&state.config) {return Err(AppError::Forbidden("Spot payout claims are disabled for this deployment".into()));}
+    if action==crate::spot_payout::BET_ACTION && !crate::spot_payout::betting_configured(&state.config) {return Err(AppError::Forbidden("Spot betting is disabled for this deployment".into()));}
+    if action==crate::spot_payout::CREATE_MARKET_ACTION && !crate::spot_payout::market_creation_configured(&state.config) {return Err(AppError::Forbidden("Spot market creation is disabled for this deployment".into()));}
+    if crate::subscription_access::is_action(action) && !crate::subscription_access::configured(&state.config) {return Err(AppError::Forbidden("Subscription actions are not enabled for this deployment".into()));}
     if !state.config.social_chain.is_configured() {
         return Err(AppError::Internal(
             "social chain context is not configured".into(),
         ));
+    }
+    if action == "access.share_mydata.v1" && state.config.social_chain.mydata_config_id.is_empty() {
+        return Err(AppError::Forbidden("MyData grant configuration is unavailable".into()));
+    }
+    if action == "access.publish_mydata_graph.v1"
+        && (state.config.social_chain.mydata_config_id.is_empty()
+            || state.config.social_chain.mydata_registry_id.is_empty()) {
+        return Err(AppError::Forbidden("Graph listing configuration is unavailable".into()));
+    }
+    if action == "access.purchase_mydata_access.v1"
+        && (!state.config.mydata_bounded_purchase_enabled
+            || state.config.social_chain.mydata_config_id.is_empty()
+            || state.config.social_chain.ecosystem_treasury_id.is_empty()) {
+        return Err(AppError::Forbidden("bounded MyData purchases are not enabled for this deployment".into()));
+    }
+    if action == "access.purchase_post_access.v1"
+        && (!state.config.mydata_post_access_purchase_enabled
+            || state.config.social_chain.mydata_config_id.is_empty()
+            || state.config.social_chain.ecosystem_treasury_id.is_empty()
+            || state.config.social_chain.memory_config_id.is_empty()
+            || state.config.social_chain.block_list_registry_id.is_empty()) {
+        return Err(AppError::Forbidden("post-bound MyData purchases are not enabled for this deployment".into()));
     }
     if action.starts_with("messaging.")
         && (state.config.social_chain.messaging_package_id.is_empty()
@@ -3341,13 +4318,14 @@ async fn sponsor_registered_kind(
     sender: &str,
     transaction_kind_bytes: &str,
 ) -> Result<SponsoredTransactionResponse, AppError> {
+    let payload = serde_json::json!({
+        "sender": sender,
+        "transactionBlockKindBytes": transaction_kind_bytes,
+    });
     let sponsored: SponsoredTransactionResponse = sidecar_json(
         state,
         "/sponsor",
-        &serde_json::json!({
-            "sender": sender,
-            "transactionBlockKindBytes": transaction_kind_bytes,
-        }),
+        &payload,
     )
     .await?;
     if !validate_digest(&sponsored.digest) {
@@ -3487,6 +4465,7 @@ fn approval_response(row: &crate::action_approvals::ActionApprovalRow) -> Action
         registry_version: row.registry_version.clone(),
         idempotency_key: row.idempotency_key.clone(),
         parameter_hash: row.parameter_hash.clone(),
+        parameters: row.parameters.clone(),
         risk_tier: row.risk_tier.clone(),
         required_capability: row.required_capability as u64,
         approval_intent: row.approval_intent.clone(),
@@ -3507,6 +4486,17 @@ pub async fn request_action_approval(
         &request.registry_version,
         Some(&request.parameters),
     )?;
+    crate::mydata_access::validate_owner_change(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::subscription_access::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::payments::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::poc_vault::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::spot_payout::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::assets::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::owner_agents::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::dex::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::spt::validate_approval_request(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::organization_treasury::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
+    crate::platform_admin_actions::validate_action(&state,&auth,&request.registry_action,&request.parameters).await?;
     if !valid_chain_idempotency_key(&request.idempotency_key) {
         return Err(AppError::BadRequest("invalid idempotencyKey".into()));
     }
@@ -3521,9 +4511,25 @@ pub async fn request_action_approval(
         .checked_add((ttl_seconds as i64) * 1000)
         .ok_or_else(|| AppError::BadRequest("approval expiry overflow".into()))?;
     let parameter_hash = sha256_identifier(canonical_json(&request.parameters).as_bytes());
+    let approval_signer = request.signer_address.as_deref().unwrap_or(&auth.owner);
+    let approval_signer = crate::memory_contract::normalize_object_id(
+        &crate::chain_reads::id(approval_signer)
+            .map_err(|_| AppError::BadRequest("invalid signerAddress".into()))?,
+    );
+    if request.registry_action == "account.rotate_owner_key.v1" {
+        crate::owner_agents::validate_owner_rotation_signer(&state, &auth, &request.parameters, &approval_signer).await?;
+    } else {
+        crate::organization_treasury::validate_approval_signer(
+            &state,
+            &auth,
+            &request.registry_action,
+            &request.parameters,
+            &approval_signer,
+        ).await?;
+    }
     let approval_id = uuid::Uuid::new_v4().to_string();
     let approval_intent = format!(
-        "mysocial-action-approval-v1|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "mysocial-action-approval-v1|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         approval_id,
         auth.account_id,
         auth.agent_object_id,
@@ -3535,6 +4541,8 @@ pub async fn request_action_approval(
         risk_tier,
         auth.platform_id.as_deref().unwrap_or("unscoped"),
         expires_at_ms,
+        approval_signer,
+        request.parameters.get("organizationId").and_then(serde_json::Value::as_str).unwrap_or("unscoped"),
     );
     let row = crate::action_approvals::create_or_get(
         &state.db,
@@ -3546,9 +4554,10 @@ pub async fn request_action_approval(
             registry_version: &request.registry_version,
             idempotency_key: &request.idempotency_key,
             parameter_hash: &parameter_hash,
+            parameters: &request.parameters,
             required_capability,
             risk_tier,
-            owner_address: &auth.owner,
+            owner_address: &approval_signer,
             approval_intent: &approval_intent,
             expires_at_ms,
         },
@@ -3568,6 +4577,11 @@ pub async fn approve_action_request(
     let pending = crate::action_approvals::get(&state.db, &approval_id)
         .await?
         .ok_or_else(|| AppError::BadRequest("unknown approval request".into()))?;
+    // This endpoint is intentionally outside signed-agent middleware: the owner wallet
+    // signature is its authentication. Reconstruct the current agent/account authority
+    // from the stored approval identity so the handler never depends on absent extensions
+    // or on identity supplied by the public request.
+    let auth = internal_mcp_auth(&state, &pending.account_id, &pending.agent_object_id).await?;
     let current_owner = crate::myso::fetch_memory_account_owner(
         &state.http_client,
         &state.config.myso_rpc_url,
@@ -3575,10 +4589,33 @@ pub async fn approve_action_request(
     )
     .await
     .map_err(|error| AppError::Forbidden(format!("account owner verification failed: {error}")))?;
-    if !crate::memory_contract::addresses_equal(&current_owner, &pending.owner_address) {
+    if !crate::memory_contract::addresses_equal(&current_owner, &auth.owner) {
+        return Err(AppError::Conflict("account ownership changed after approval was requested".into()));
+    }
+    let owner_signing = crate::memory_contract::addresses_equal(&current_owner, &pending.owner_address);
+    if !owner_signing && !matches!(
+        pending.registry_action.as_str(),
+        crate::organization_treasury::GRANT_ACTION | crate::organization_treasury::WITHDRAW_ACTION
+    ) && pending.registry_action != "account.rotate_owner_key.v1" {
         return Err(AppError::Conflict(
             "account ownership changed after approval was requested".into(),
         ));
+    }
+    if pending.registry_action == "account.rotate_owner_key.v1" {
+        crate::owner_agents::validate_pending_owner_rotation_signer(&state, &auth, &pending.owner_address).await?;
+    } else if !owner_signing {
+        let organization_id = pending.approval_intent.split('|').nth(13)
+            .filter(|value| *value != "unscoped")
+            .ok_or_else(|| AppError::Forbidden("organization admin approval omitted its bound organization".into()))?;
+        let group_id = crate::org_chain::org_memory_group_id(&state.config.package_id, organization_id)
+            .ok_or_else(|| AppError::BadRequest("invalid organization scope in approval".into()))?;
+        crate::organization_treasury::validate_approval_signer(
+            &state,
+            &auth,
+            &pending.registry_action,
+            &serde_json::json!({"organizationId":organization_id,"orgMemoryGroupId":group_id}),
+            &pending.owner_address,
+        ).await?;
     }
     if request.wallet_signature.len() < 80 || request.wallet_signature.len() > 4096 {
         return Err(AppError::BadRequest(
@@ -3594,9 +4631,9 @@ pub async fn approve_action_request(
         }),
     )
     .await?;
-    if !crate::memory_contract::addresses_equal(&verified.signer_address, &current_owner) {
+    if !crate::memory_contract::addresses_equal(&verified.signer_address, &pending.owner_address) {
         return Err(AppError::Forbidden(
-            "wallet approval signer is not the current account owner".into(),
+            "wallet approval signer does not match the exact signer bound to this request".into(),
         ));
     }
     let row = crate::action_approvals::approve(
@@ -3630,6 +4667,28 @@ fn policy_requires_owner_approval(
         )
 }
 
+fn mydata_purchase_auto_eligible(
+    price_mist: Option<u64>,
+    agent_spend_limit_mist: Option<u64>,
+    audience_kind: Option<&str>,
+    organization_audience_id: Option<&str>,
+    authenticated_organization_id: Option<&str>,
+) -> bool {
+    let within_agent_limit = price_mist
+        .zip(agent_spend_limit_mist)
+        .is_some_and(|(price, limit)| price <= limit);
+    let audience_supported = match audience_kind {
+        Some("agent") => organization_audience_id.is_none(),
+        Some("organization") => organization_audience_id
+            .zip(authenticated_organization_id)
+            .is_some_and(|(selected, current)| {
+                crate::memory_contract::addresses_equal(selected, current)
+            }),
+        _ => false,
+    };
+    within_agent_limit && audience_supported
+}
+
 async fn authorize_registered_action(
     state: &Arc<AppState>,
     auth: &AuthInfo,
@@ -3647,14 +4706,63 @@ async fn authorize_registered_action(
         registry_version,
         parameters,
     )?;
-    let approval_required =
+    if let Some(parameters) = parameters { crate::mydata_access::validate_owner_change(state,auth,registry_action,parameters).await?; crate::mydata_access::validate_action(state,auth,registry_action,parameters).await?; crate::subscription_access::validate_action(state,auth,registry_action,parameters).await?; crate::payments::validate_action(state,auth,registry_action,parameters).await?; crate::poc_vault::validate_action(state,auth,registry_action,parameters).await?; crate::organization_treasury::validate_action(state,auth,registry_action,parameters).await?; crate::platform_admin_actions::validate_action(state,auth,registry_action,parameters).await?; crate::spot_payout::validate_action(state,auth,registry_action,parameters).await?; crate::assets::validate_action(state,auth,registry_action,parameters).await?; crate::owner_agents::validate_action(state,auth,registry_action,parameters).await?; crate::dex::validate_action(state,auth,registry_action,parameters).await?; if registry_action==crate::spt::BUY_ACTION||registry_action==crate::spt::SELL_ACTION { if approval_id.is_some() { crate::spt::validate_approval_request(state,auth,registry_action,parameters).await?; } else { crate::spt::validate_action(state,auth,registry_action,parameters).await?; } } }
+    let mut approval_required =
         policy_requires_owner_approval(risk_tier, auth.approval_required_caps, required_capability);
-    if !approval_required {
-        if approval_id.is_some() {
-            return Err(AppError::BadRequest(
-                "approvalId is not accepted for an automatic action".into(),
-            ));
+    if registry_action == crate::spt::BUY_ACTION {
+        let amount = parameters
+            .and_then(|value| value.get("paymentAmountBaseUnits"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty() && !value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|value| value.parse::<u64>().ok());
+        let automatic_agent_buy = amount
+            .zip(auth.max_action_spend.filter(|limit| *limit > 0))
+            .is_some_and(|(amount, limit)| amount > 0 && amount <= limit)
+            && !crate::memory_contract::cap_requires_approval(auth.approval_required_caps, required_capability);
+        if automatic_agent_buy {
+            // spt::validate_action has already required the exact MYSO coin to
+            // belong to the derived agent address and checked this same live
+            // on-chain spend cap. Work-run journal amounts are audit and
+            // reconciliation metadata, never an additional spending limit.
+            approval_required = false;
         }
+    }
+    if registry_action == "access.purchase_mydata_access.v1"
+        || registry_action == "access.purchase_post_access.v1"
+    {
+        let price = parameters.and_then(|p| p.get("priceMist")).and_then(|v| v.as_str()).and_then(|v| v.parse::<u64>().ok());
+        let is_post_purchase = registry_action == "access.purchase_post_access.v1";
+        let audience = if is_post_purchase {
+            Some("agent")
+        } else {
+            parameters.and_then(|p| p.get("audienceKind")).and_then(|v| v.as_str())
+        };
+        let organization_audience = if is_post_purchase {
+            None
+        } else {
+            parameters.and_then(|p| p.get("organizationAudienceId")).and_then(serde_json::Value::as_str)
+        };
+        let automatic_purchase_allowed = mydata_purchase_auto_eligible(
+            price,
+            auth.max_action_spend,
+            audience,
+            organization_audience,
+            auth.organization_id.as_deref(),
+        ) && !crate::memory_contract::cap_requires_approval(
+            auth.approval_required_caps,
+            required_capability,
+        );
+        // The owner explicitly approved agent-funded MyData and post purchases
+        // inside the live per-action cap. An organization audience is an access
+        // grant, not a separate payer; the agent's own address and coin fund
+        // the transaction. Post purchases are restricted to agent audience.
+        if risk_tier == "1B" {
+            approval_required = !automatic_purchase_allowed;
+        } else if !automatic_purchase_allowed {
+            approval_required = true;
+        }
+    }
+    if !approval_required && approval_id.is_none() {
         return Ok(RegisteredActionAuthorization {
             required_capability,
             risk_tier,
@@ -3690,9 +4798,20 @@ async fn authorize_registered_action(
     .await
     .map_err(|error| AppError::Forbidden(format!("account owner verification failed: {error}")))?;
     if !crate::memory_contract::addresses_equal(&current_owner, &approval.owner_address) {
-        return Err(AppError::Conflict(
-            "account ownership changed after approval".into(),
-        ));
+        let Some(parameters) = parameters else {
+            return Err(AppError::Forbidden("organization admin approval requires exact action parameters".into()));
+        };
+        if registry_action == "account.rotate_owner_key.v1" {
+            crate::owner_agents::validate_owner_rotation_signer(state, auth, parameters, &approval.owner_address).await?;
+        } else {
+            crate::organization_treasury::validate_approval_signer(
+                state,
+                auth,
+                registry_action,
+                parameters,
+                &approval.owner_address,
+            ).await?;
+        }
     }
     Ok(RegisteredActionAuthorization {
         required_capability,
@@ -3762,6 +4881,11 @@ pub async fn prepare_registered_action(
             )),
         };
     }
+    if request.registry_action == "access.purchase_mydata_access.v1"
+        || request.registry_action == "access.purchase_post_access.v1"
+    {
+        crate::mydata_access::validate_funding_coin(&state, &auth, &request.parameters, &authorization.sender).await?;
+    }
     enforce_sponsor_sender_limit(&state, &authorization.sender).await?;
 
     let prepared: SidecarPreparedAction = sidecar_json(
@@ -3778,7 +4902,7 @@ pub async fn prepare_registered_action(
     )
     .await?;
     if prepared.registry_action != request.registry_action
-        || prepared.registry_version != SOCIAL_ACTION_REGISTRY_VERSION
+        || prepared.registry_version != request.registry_version
         || prepared.required_capability != authorization.required_capability
         || prepared.risk_tier != authorization.risk_tier
         || !valid_sha256_identifier(&prepared.parameter_hash)
@@ -3816,6 +4940,7 @@ pub async fn prepare_registered_action(
     let scope =
         chain_action_idempotency_scope(&auth, &request.registry_action, &request.idempotency_key);
     let new_action = crate::chain_actions::NewChainAction {
+            receipt_context: if request.registry_action==crate::spt::BUY_ACTION||request.registry_action==crate::spt::SELL_ACTION {crate::spt::receipt_context(&request.registry_action,&request.parameters,&auth.owner,&authorization.sender,&state.config.social_chain.platform_object_id)?} else if request.registry_action==crate::dex::ACTION {Some(crate::dex::receipt_context(&request.parameters,&auth.owner)?)} else if crate::owner_agents::is_action(&request.registry_action) {crate::owner_agents::receipt_context(&request.registry_action,&request.parameters,&auth.account_id,&auth.owner,&authorization.sender,&state.config.social_chain.platform_object_id)?} else if request.registry_action==crate::payments::ACTION {crate::payments::receipt_context(&request.parameters,&auth.owner,&state.config.social_chain.platform_object_id)?} else if request.registry_action==crate::poc_vault::ACTION||request.registry_action==crate::poc_vault::ACCEPT_TRANSFER_ACTION {crate::poc_vault::receipt_context(&request.registry_action,&request.parameters,&auth.owner,&state.config.social_chain.platform_object_id)?} else if request.registry_action==crate::spot_payout::ACTION||request.registry_action==crate::spot_payout::BET_ACTION||request.registry_action==crate::spot_payout::CREATE_MARKET_ACTION {crate::spot_payout::receipt_context(&request.parameters,&auth.owner,&state.config.social_chain.platform_object_id)?} else if request.registry_action==crate::assets::ACTION||request.registry_action==crate::assets::BURN_ACTION {crate::assets::receipt_context(&request.parameters,&auth.owner,&state.config.social_chain.platform_object_id)?} else if request.registry_action=="governance.vote.v1" {crate::platform_reads::governance_vote_receipt_context(&request.parameters,&auth.owner,&state.config.social_chain.platform_object_id)?} else if request.registry_action=="governance.delegate_vote.v1" {crate::platform_reads::governance_delegate_vote_receipt_context(&request.parameters,&auth.owner,&state.config.social_chain.platform_object_id)?} else if matches!(request.registry_action.as_str(),"jury.accept.v1"|"jury.commit_vote.v1"|"jury.reveal_vote.v1"|"jury.claim_fee.v1"|"jury.select_jury.v1"|"jury.replace_no_shows.v1"|"jury.finalize_round.v1"|"jury.finalize_case.v1"|"jury.execute_task_verdict.v1"|"jury.start_neutral_resolution.v1"|"jury.execute_neutral_resolution.v1"|"jury.settle_dispute_fees.v1"|"jury.escalate_proposal.v1"|"jury.finalize_proposal.v1"|"jury.apply_proposal_decision.v1"|"jury.sweep_vote_refunds.v1"|"jury.sweep_case.v1"|"jury.refresh_roster_entry.v1"|"jury.evict_ineligible.v1") {crate::platform_reads::jury_receipt_context(&request.registry_action,&request.parameters,&auth.agent_object_id,&state.config.social_chain.platform_object_id)?} else if request.registry_action=="messaging.create_group.v1" {crate::platform_reads::messaging_group_creation_receipt_context(&request.parameters,&auth,&state.config.social_chain.platform_object_id,&authorization.sender)?} else if request.registry_action=="messaging.bind_room_to_task.v1" {crate::platform_reads::task_room_binding_receipt_context(&request.parameters,&auth,&state.config.social_chain.platform_object_id)?} else if request.registry_action.starts_with("task.") {crate::platform_reads::task_receipt_context(&request.registry_action,&request.parameters,&auth,&state.config.social_chain.platform_object_id)?} else if crate::organization_treasury::is_action(&request.registry_action) {crate::organization_treasury::receipt_context(&request.registry_action,&request.parameters,&auth.owner,&auth.account_id)?} else if crate::organization_actions::is_action(&request.registry_action) {crate::organization_actions::receipt_context(&request.registry_action,&request.parameters,&auth.owner,&auth.account_id)?} else if crate::platform_admin_actions::is_action(&request.registry_action) {crate::platform_admin_actions::receipt_context(&request.registry_action,&request.parameters,&auth.owner)?} else {crate::subscription_access::receipt_context(&request.registry_action,&request.parameters,&state.config.social_chain.platform_object_id)?},
         idempotency_scope: &scope,
         account_id: &auth.account_id,
         agent_object_id: &auth.agent_object_id,
@@ -4169,9 +5294,10 @@ pub async fn chain_action_status(
         .and_then(|v| v.get("status"))
         .and_then(|v| v.as_str());
     let status = match execution_status {
-        Some("success") => "finalized",
+        Some("success") if result.and_then(|value| value.get("checkpoint")).is_some_and(|value| !value.is_null()) => "finalized",
+        Some("success") => "executed",
         Some("failure") => "failed",
-        Some(_) => "finalized",
+        Some(_) => "unknown",
         None if result.is_some() => "submitted",
         None => "pending",
     };
@@ -4499,6 +5625,68 @@ pub async fn sponsor_execute_proxy(
 mod more_tests {
     use super::*;
 
+    #[test]
+    fn mydata_agent_funding_auto_policy_accepts_both_explicit_audiences_within_cap() {
+        assert!(mydata_purchase_auto_eligible(Some(100), Some(100), Some("agent"), None, None));
+        assert!(mydata_purchase_auto_eligible(
+            Some(100), Some(100), Some("organization"), Some("0x3"), Some("0x3"),
+        ));
+        assert!(!mydata_purchase_auto_eligible(
+            Some(101), Some(100), Some("organization"), Some("0x3"), Some("0x3"),
+        ));
+        assert!(!mydata_purchase_auto_eligible(
+            Some(100), Some(100), Some("organization"), Some("0x4"), Some("0x3"),
+        ));
+        assert!(!mydata_purchase_auto_eligible(
+            Some(100), Some(100), Some("organization"), None, Some("0x3"),
+        ));
+    }
+
+    #[test]
+    fn token_transfers_require_owner_trade_approval_and_registry_19(){
+        assert_eq!(registered_action_policy(crate::payments::ACTION),Some((crate::memory_contract::CAP_TRADE_EXECUTE,"2")));
+        for version in ["1.5.0","1.6.0","1.7.0","1.8.0"]{assert!(!registered_action_registry_version_supported(version,crate::payments::ACTION));}
+        assert!(registered_action_registry_version_supported("1.9.0",crate::payments::ACTION));
+    }
+    #[test]
+    fn post_tips_require_owner_trade_approval_and_registry_111(){
+        assert_eq!(registered_action_policy("payments.tip_post.v1"),Some((crate::memory_contract::CAP_TRADE_EXECUTE,"2")));
+        for version in ["1.5.0","1.6.0","1.7.0","1.8.0","1.9.0","1.10.0"]{
+            assert!(!registered_action_registry_version_supported(version,"payments.tip_post.v1"));
+        }
+        assert!(registered_action_registry_version_supported("1.11.0","payments.tip_post.v1"));
+        assert!(registered_action_registry_version_supported("1.10.0","payments.send_token.v1"));
+    }
+    #[test]
+    fn post_deletion_requires_owner_approval_and_registry_112(){
+        assert_eq!(registered_action_policy("social.delete_post.v1"),Some((crate::memory_contract::CAP_POST_PUBLISH,"3")));
+        assert_eq!(registered_action_policy("social.delete_comment.v1"),Some((crate::memory_contract::CAP_COMMENT,"3")));
+        for action in ["social.delete_post.v1","social.delete_comment.v1"] {
+            assert!(!registered_action_registry_version_supported("1.11.0",action));
+            assert!(registered_action_registry_version_supported("1.12.0",action));
+        }
+        assert!(registered_action_registry_version_supported("1.11.0","payments.tip_post.v1"));
+    }
+    #[test]
+    fn profile_subscription_actions_require_trade_and_registry_18(){
+        for action in crate::subscription_access::ACTIONS{
+            assert_eq!(registered_action_policy(action),Some((crate::memory_contract::CAP_TRADE_EXECUTE,"2")));
+            for version in ["1.5.0","1.6.0","1.7.0"]{assert!(!registered_action_registry_version_supported(version,action));}
+            assert!(registered_action_registry_version_supported("1.8.0",action));
+        }
+    }
+    #[test]
+    fn owner_access_actions_require_owner_approval_and_a_supported_registry() {
+        for action in ["access.share_mydata.v1","access.revoke_mydata_share.v1"] {
+            assert_eq!(registered_action_policy(action),Some((crate::memory_contract::CAP_MYDATA_READ,"2")));
+            assert!(!registered_action_registry_version_supported("1.5.0",action));
+            assert!(!registered_action_registry_version_supported("1.6.0",action));
+            assert!(registered_action_registry_version_supported("1.7.0",action));
+        }
+        assert!(registered_action_registry_version_supported("1.5.0","social.create_post.v1"));
+        assert!(registered_action_registry_version_supported("1.6.0","access.purchase_mydata_access.v1"));
+        assert!(!registered_action_registry_version_supported("1.5.0","access.purchase_mydata_access.v1"));
+    }
     #[test]
     fn registered_action_policy_has_no_arbitrary_move_escape_hatch() {
         assert_eq!(

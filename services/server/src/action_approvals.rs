@@ -13,6 +13,7 @@ pub struct ActionApprovalRow {
     pub registry_version: String,
     pub idempotency_key: String,
     pub parameter_hash: String,
+    pub parameters: serde_json::Value,
     pub required_capability: i64,
     pub risk_tier: String,
     pub owner_address: String,
@@ -30,6 +31,7 @@ pub struct NewActionApproval<'a> {
     pub registry_version: &'a str,
     pub idempotency_key: &'a str,
     pub parameter_hash: &'a str,
+    pub parameters: &'a serde_json::Value,
     pub required_capability: u64,
     pub risk_tier: &'a str,
     pub owner_address: &'a str,
@@ -44,9 +46,9 @@ pub async fn create_or_get(
     sqlx::query(
         "INSERT INTO chain_action_approvals (
             approval_id,account_id,agent_object_id,registry_action,registry_version,
-            idempotency_key,parameter_hash,required_capability,risk_tier,owner_address,
+            idempotency_key,parameter_hash,parameters,required_capability,risk_tier,owner_address,
             approval_intent,expires_at_ms
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
          ON CONFLICT (account_id,agent_object_id,registry_action,idempotency_key) DO NOTHING",
     )
     .bind(input.approval_id)
@@ -56,6 +58,7 @@ pub async fn create_or_get(
     .bind(input.registry_version)
     .bind(input.idempotency_key)
     .bind(input.parameter_hash)
+    .bind(input.parameters)
     .bind(
         i64::try_from(input.required_capability)
             .map_err(|_| AppError::BadRequest("capability exceeds BIGINT".into()))?,
@@ -79,6 +82,7 @@ pub async fn create_or_get(
     .ok_or_else(|| AppError::Internal("action approval disappeared".into()))?;
     if row.registry_version != input.registry_version
         || row.parameter_hash != input.parameter_hash
+        || row.parameters != *input.parameters
         || row.required_capability != input.required_capability as i64
         || row.risk_tier != input.risk_tier
         || !addresses_equal(&row.owner_address, input.owner_address)
@@ -93,7 +97,7 @@ pub async fn create_or_get(
 pub async fn get(db: &VectorDb, approval_id: &str) -> Result<Option<ActionApprovalRow>, AppError> {
     query_one(
         db,
-        "SELECT approval_id,account_id,agent_object_id,registry_action,registry_version,idempotency_key,parameter_hash,required_capability,risk_tier,owner_address,approval_intent,status,expires_at_ms,consumed_action_scope FROM chain_action_approvals WHERE approval_id=$1",
+        "SELECT approval_id,account_id,agent_object_id,registry_action,registry_version,idempotency_key,parameter_hash,parameters,required_capability,risk_tier,owner_address,approval_intent,status,expires_at_ms,consumed_action_scope FROM chain_action_approvals WHERE approval_id=$1",
         &[approval_id],
     )
     .await
@@ -107,7 +111,7 @@ async fn get_by_identity(
     idempotency_key: &str,
 ) -> Result<Option<ActionApprovalRow>, AppError> {
     sqlx::query_as::<_, ActionApprovalRow>(
-        "SELECT approval_id,account_id,agent_object_id,registry_action,registry_version,idempotency_key,parameter_hash,required_capability,risk_tier,owner_address,approval_intent,status,expires_at_ms,consumed_action_scope FROM chain_action_approvals WHERE account_id=$1 AND agent_object_id=$2 AND registry_action=$3 AND idempotency_key=$4",
+        "SELECT approval_id,account_id,agent_object_id,registry_action,registry_version,idempotency_key,parameter_hash,parameters,required_capability,risk_tier,owner_address,approval_intent,status,expires_at_ms,consumed_action_scope FROM chain_action_approvals WHERE account_id=$1 AND agent_object_id=$2 AND registry_action=$3 AND idempotency_key=$4",
     )
     .bind(account_id)
     .bind(agent_object_id)
@@ -116,6 +120,24 @@ async fn get_by_identity(
     .fetch_optional(db.pool())
     .await
     .map_err(|error| AppError::Internal(format!("read action approval: {error}")))
+}
+
+pub async fn list_for_agent(
+    db: &VectorDb,
+    account_id: &str,
+    agent_object_id: &str,
+    limit: u32,
+) -> Result<Vec<ActionApprovalRow>, AppError> {
+    sqlx::query_as::<_, ActionApprovalRow>(
+        "SELECT approval_id,account_id,agent_object_id,registry_action,registry_version,idempotency_key,parameter_hash,parameters,required_capability,risk_tier,owner_address,approval_intent,status,expires_at_ms,consumed_action_scope FROM chain_action_approvals WHERE account_id=$1 AND agent_object_id=$2 AND status='pending' AND expires_at_ms > $3 ORDER BY created_at DESC LIMIT $4",
+    )
+    .bind(account_id)
+    .bind(agent_object_id)
+    .bind(chrono::Utc::now().timestamp_millis())
+    .bind(limit.clamp(1, 100) as i64)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|error| AppError::Internal(format!("list action approvals: {error}")))
 }
 
 async fn query_one(
@@ -218,6 +240,7 @@ mod tests {
             registry_version: "1.0.0".into(),
             idempotency_key: "delete-1".into(),
             parameter_hash: "sha256:p".into(),
+            parameters: serde_json::json!({"postId":"0x1"}),
             required_capability: 16,
             risk_tier: "3".into(),
             owner_address: "0x1".into(),

@@ -7,6 +7,7 @@
 //! scheduled job from drifting apart.
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 use crate::Config;
 
@@ -117,6 +118,17 @@ struct ChainActRequest<'a> {
     idempotency_key: &'a str,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct WorkRunDispatchRequest<'a> {
+    key_ref: &'a str,
+    account_id: &'a str,
+    parent_agent_id: &'a str,
+    run_id: &'a str,
+    dispatch_id: &'a str,
+    turn: &'a serde_json::Value,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RecalledMemory {
     pub text: String,
@@ -162,6 +174,8 @@ pub enum BridgeError {
     Unavailable { message: String },
     /// Malformed job configuration. Retrying cannot help.
     Invalid { message: String },
+    /// A chain effect may have happened, but this worker must not retry it.
+    Uncertain { message: String },
 }
 
 impl BridgeError {
@@ -174,7 +188,8 @@ impl BridgeError {
         match self {
             Self::Rejected { message, .. }
             | Self::Unavailable { message }
-            | Self::Invalid { message } => message,
+            | Self::Invalid { message }
+            | Self::Uncertain { message } => message,
         }
     }
 }
@@ -187,6 +202,7 @@ impl std::fmt::Display for BridgeError {
             }
             Self::Unavailable { message } => write!(f, "bridge unavailable: {message}"),
             Self::Invalid { message } => write!(f, "invalid action config: {message}"),
+            Self::Uncertain { message } => write!(f, "reconciliation required: {message}"),
         }
     }
 }
@@ -275,26 +291,68 @@ impl MemoryBridgeClient {
         .await
     }
 
+    /// Dispatch one run through the sidecar. The request carries only the
+    /// encrypted-run identity and approved turn settings; the sidecar opens the
+    /// selected action_worker and mints a credential just before dispatch.
+    pub async fn dispatch_work_run(
+        &self,
+        key_ref: &str,
+        account_id: &str,
+        parent_agent_id: &str,
+        run_id: &str,
+        dispatch_id: &str,
+        turn: &serde_json::Value,
+    ) -> Result<serde_json::Value, BridgeError> {
+        self.post_timeout(
+            "/internal/work/dispatch",
+            &WorkRunDispatchRequest {
+                key_ref,
+                account_id,
+                parent_agent_id,
+                run_id,
+                dispatch_id,
+                turn,
+            },
+            Some(Duration::from_secs(26 * 60)),
+        )
+        .await
+    }
+
     async fn post<B: Serialize, T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         body: &B,
     ) -> Result<T, BridgeError> {
-        let response = self
+        self.post_timeout(path, body, None).await
+    }
+
+    async fn post_timeout<B: Serialize, T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Option<Duration>,
+    ) -> Result<T, BridgeError> {
+        let request = self
             .http
             .post(format!("{}{path}", self.base_url))
             .header("x-internal-sync-secret", &self.secret)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| BridgeError::Unavailable {
-                message: format!("cannot reach memory bridge at {}{path}: {e}", self.base_url),
-            })?;
+            .json(body);
+        let request = if let Some(timeout) = timeout {
+            request.timeout(timeout)
+        } else {
+            request
+        };
+        let response = request.send().await.map_err(|e| BridgeError::Unavailable {
+            message: format!("cannot reach memory bridge at {}{path}: {e}", self.base_url),
+        })?;
 
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|e| BridgeError::Unavailable {
-            message: format!("reading bridge response failed: {e}"),
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| BridgeError::Unavailable {
+                message: format!("reading bridge response failed: {e}"),
+            })?;
 
         if !status.is_success() {
             let detail = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -355,22 +413,22 @@ pub async fn execute_memory_action(
     memory_scope_namespace: Option<&str>,
     config_value: &serde_json::Value,
 ) -> Result<MemoryActionOutcome, BridgeError> {
-    let config = parse_action_config(config_value).map_err(|message| BridgeError::Invalid { message })?;
+    let config =
+        parse_action_config(config_value).map_err(|message| BridgeError::Invalid { message })?;
     validate_action_config(&config).map_err(|message| BridgeError::Invalid { message })?;
 
     // The action may point at a different agent than the job's default target.
     let key_ref = config.key_ref.as_deref().unwrap_or(job_key_ref);
     // An explicit action namespace wins; otherwise fall back to the job's
     // memory_scope so the chat-app and the job read the same scope.
-    let namespace = config
-        .namespace
-        .as_deref()
-        .or(memory_scope_namespace);
+    let namespace = config.namespace.as_deref().or(memory_scope_namespace);
 
     match config.operation {
         MemoryOperation::Recall => {
             let query = config.query.as_deref().unwrap_or_default();
-            let response = client.recall(key_ref, account_id, query, config.limit, namespace).await?;
+            let response = client
+                .recall(key_ref, account_id, query, config.limit, namespace)
+                .await?;
             Ok(outcome_from_recall(response, None))
         }
         MemoryOperation::Remember => {
@@ -393,7 +451,9 @@ pub async fn execute_memory_action(
         }
         MemoryOperation::RecallThenRemember => {
             let query = config.query.as_deref().unwrap_or_default();
-            let response = client.recall(key_ref, account_id, query, config.limit, namespace).await?;
+            let response = client
+                .recall(key_ref, account_id, query, config.limit, namespace)
+                .await?;
             let digest = build_digest(config.remember_prefix.as_deref(), &response.results);
             if digest.trim().is_empty() {
                 // Nothing recalled: writing an empty digest would pollute later
@@ -494,8 +554,7 @@ mod tests {
 
     #[test]
     fn remember_requires_text() {
-        let config =
-            parse_action_config(&serde_json::json!({ "operation": "remember" })).unwrap();
+        let config = parse_action_config(&serde_json::json!({ "operation": "remember" })).unwrap();
         let err = validate_action_config(&config).unwrap_err();
         assert!(err.contains("text"), "{err}");
     }

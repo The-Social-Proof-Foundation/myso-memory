@@ -1,4 +1,10 @@
+import type {OwnerAgentIdentityParams,OwnerChangeCapabilityParams,OwnerRaiseSpendingLimitParams,OwnerLowerSpendingLimitParams} from "./types.js";
+import type {SendTokenParams} from "./types.js";
+import type {SubscribeToPlanParams,RenewSubscriptionParams,CancelSubscriptionParams,SubscriptionRenewalPreferenceParams} from "./types.js";
+import type { ShareMyDataParams, RevokeMyDataShareParams } from "./types.js";
 import type {
+    PurchaseMyDataAccessParams,
+    PurchasePostAccessParams,
     CreateCommentParams,
     CreatePostParams,
     CreateRepostParams,
@@ -13,6 +19,7 @@ import type {
     ProfileRelationParams,
     SendMessageParams,
     CreateMessagingGroupParams,
+    BindAgentRoomToTaskParams,
     CreateOrganizationParams,
     UpdateOrganizationMetadataParams,
     UpdateOrganizationCategoryParams,
@@ -122,10 +129,15 @@ function assertAuthenticatedDeployment(
     }
     for (const field of [
         "socialGraphId",
+        "mydataConfigId",
+        "subscriptionConfigId",
         "taskConfigId",
         "juryConfigId",
         "jurorRosterId",
         "ecosystemTreasuryId",
+        "pocConfigId",
+        "spotConfigId",
+        "spotClaimRegistryId",
         "messagingPackageId",
         "messagingVersionId",
         "messagingConfigId",
@@ -237,6 +249,14 @@ export class SocialClient {
         return this.executeRegistered("social.react_to_post.v1", params, options);
     }
 
+    async purchaseMyDataAccess(params: PurchaseMyDataAccessParams, options?: SocialActionOptions): Promise<SocialActionResult> {
+        return this.executeRegistered("access.purchase_mydata_access.v1", params, options);
+    }
+
+    async purchasePostAccess(params: PurchasePostAccessParams, options?: SocialActionOptions): Promise<SocialActionResult> {
+        return this.executeRegistered("access.purchase_post_access.v1", params, options);
+    }
+
     async reactToComment(
         params: ReactToCommentParams,
         options?: SocialActionOptions,
@@ -293,6 +313,10 @@ export class SocialClient {
 
     async createMessagingGroup(params: CreateMessagingGroupParams, options?: SocialActionOptions) {
         return this.executeRegistered("messaging.create_group.v1", params, options);
+    }
+
+    async bindAgentRoomToTask(params: BindAgentRoomToTaskParams, options?: SocialActionOptions) {
+        return this.executeRegistered("messaging.bind_room_to_task.v1", params, options);
     }
 
     async createOrganization(params: CreateOrganizationParams, options?: SocialActionOptions) {
@@ -436,6 +460,23 @@ export class SocialClient {
         return this.executeOwnerApproved("social.delete_post.v1", { postId }, options);
     }
 
+    async revokeAgent(params:OwnerAgentIdentityParams,options?:SocialActionOptions){return this.executeRegistered("agent.revoke_agent.v1",params,options);}
+    async grantCapability(params:OwnerChangeCapabilityParams,options?:SocialActionOptions){return this.executeRegistered("agent.grant_capability.v1",params,options);}
+    async revokeCapability(params:OwnerChangeCapabilityParams,options?:SocialActionOptions){return this.executeRegistered("agent.revoke_capability.v1",params,options);}
+    async raiseSpendingLimit(params:OwnerRaiseSpendingLimitParams,options?:SocialActionOptions){return this.executeRegistered("agent.raise_spending_limit.v1",params,options);}
+    async lowerSpendingLimit(params:OwnerLowerSpendingLimitParams,options?:SocialActionOptions){return this.executeRegistered("agent.lower_spending_limit.v1",params,options);}
+
+    async sendToken(params:SendTokenParams,options?:SocialActionOptions){return this.executeRegistered("payments.send_token.v1",params,options);}
+
+    async subscribeToPlan(params:SubscribeToPlanParams,options?:SocialActionOptions){return this.executeRegistered("subscription.subscribe_to_plan.v1",params,options);}
+    async renewSubscription(params:RenewSubscriptionParams,options?:SocialActionOptions){return this.executeRegistered("subscription.renew_subscription.v1",params,options);}
+    async cancelSubscription(params:CancelSubscriptionParams,options?:SocialActionOptions){return this.executeRegistered("subscription.cancel_subscription.v1",params,options);}
+    async enableAutoRenew(params:SubscriptionRenewalPreferenceParams,options?:SocialActionOptions){return this.executeRegistered("subscription.enable_auto_renew.v1",params,options);}
+    async disableAutoRenew(params:SubscriptionRenewalPreferenceParams,options?:SocialActionOptions){return this.executeRegistered("subscription.disable_auto_renew.v1",params,options);}
+
+    async shareMyData(params:ShareMyDataParams,options?:SocialActionOptions){return this.executeRegistered("access.share_mydata.v1",params,options);}
+    async revokeMyDataShare(params:RevokeMyDataShareParams,options?:SocialActionOptions){return this.executeRegistered("access.revoke_mydata_share.v1",params,options);}
+
     async deleteComment(
         params: DeleteCommentParams,
         options?: SocialActionOptions,
@@ -461,6 +502,12 @@ export class SocialClient {
             throw new Error("Authenticated agent context does not match accountId");
         }
         assertAuthenticatedDeployment(deployment, context);
+        if(["agent.revoke_agent.v1","agent.grant_capability.v1","agent.revoke_capability.v1","agent.raise_spending_limit.v1","agent.lower_spending_limit.v1"].includes(actionId)&&!context.permittedRegistryActions?.includes(actionId))throw new Error("Owner agent actions require explicit authenticated deployment availability");
+        if(actionId==="payments.send_token.v1"&&!context.permittedRegistryActions?.includes(actionId))throw new Error("Coin transfers require explicit authenticated deployment availability");
+        if ((actionId === "access.purchase_mydata_access.v1" || actionId === "access.purchase_post_access.v1") && !context.permittedRegistryActions?.includes(actionId)) {
+            throw new Error("Bounded MyData purchases require explicit authenticated deployment availability");
+        }
+
 
         const descriptor = getSocialActionDescriptor(actionId);
         const capability = BigInt(descriptor.requiredCapability);
@@ -642,7 +689,7 @@ export class SocialClient {
         if (executed.digest !== prepared.digest) {
             throw new Error("Approved sponsored execution returned an unexpected digest");
         }
-        return { digest: prepared.digest, deleted: descriptor.riskTier === "3" };
+        return { digest: prepared.digest, ...(["social.delete_post.v1","social.delete_comment.v1"].includes(actionId)?{deleted:true}:{}) };
     }
 
     private async fetchDeploymentConfig(): Promise<DeploymentConfig> {

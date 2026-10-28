@@ -155,10 +155,7 @@ impl WorkflowClient {
         window: &str,
     ) -> Result<(), String> {
         let idempotency_key = format!("automation:due:{}:{window}", job.id);
-        let body = format!(
-            "Recurring task is due for {}",
-            job.target_agent_object_id
-        );
+        let body = format!("Recurring task is due for {}", job.target_agent_object_id);
         let payload = serde_json::json!({
             "idempotency_key": idempotency_key,
             "recipient_address": if job.owner_address.trim().is_empty() { &job.account_id } else { &job.owner_address },

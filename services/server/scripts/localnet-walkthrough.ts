@@ -148,7 +148,7 @@ async function main(): Promise<void> {
         const mysoPrivateKey = keyJson.exportedPrivateKey as string;
 
         const { MySoJsonRpcClient } = await import("@socialproof/myso/jsonRpc");
-        const mysoClient = new MySoJsonRpcClient({ url: RPC_URL });
+        const mysoClient = new MySoJsonRpcClient({ url: RPC_URL, network: process.env.MYSO_NETWORK ?? "localnet" });
 
         if (!MEMORY_CONFIG) {
             throw new Error("MEMORY_CONFIG_ID must be set for organization and sub-agent setup");
@@ -211,24 +211,24 @@ async function main(): Promise<void> {
 
     // Mock 1536-dim vector (server has no /api/embed route; matches mock embedding dim).
     const vector = Array.from({ length: 1536 }, (_, i) => ((i * 17) % 1000) / 1000);
-    const blobId = `localnet-walkthrough-${Date.now()}`;
-    console.log("[test] rememberManual (agent-scoped vector registration)...");
-    const remembered = await memory.rememberManual({ blobId, vector });
+    const encryptedData = new TextEncoder().encode(`opaque walkthrough ciphertext ${Date.now()}`);
+    console.log("[test] rememberManual (R2 ciphertext upload + agent-scoped vector registration)...");
+    const remembered = await memory.rememberManual({ encryptedData, vector });
     console.log(`  id=${remembered.id} namespace=${remembered.namespace}`);
 
     console.log("[test] recallManual...");
     const recalled = await memory.recallManual({ vector, limit: 5 });
-    const hit = recalled.results.find((r) => r.blob_id === blobId);
+    const hit = recalled.results.find((r: {blob_id:string}) => r.blob_id === remembered.blob_id);
     if (!hit) {
         throw new Error(
-            `Manual recall missed blob. Results: ${JSON.stringify(recalled.results)}`,
+            `Manual recall missed blob ${remembered.blob_id}. Results: ${JSON.stringify(recalled.results)}`,
         );
     }
     console.log(`  recalled blob=${hit.blob_id} distance=${hit.distance}`);
 
     if (process.env.FULL_E2E === "1") {
         const fact = `Walkthrough fact: favorite color is ultramarine (${Date.now()})`;
-        console.log("[test] remember (full relayer + File Storage, async job)...");
+        console.log("[test] remember (full relayer + private R2, async job)...");
         const accepted = await memory.remember(fact);
         console.log(`  job_id=${accepted.job_id} status=${accepted.status}`);
         const full = await memory.waitForRememberJob(accepted.job_id);
@@ -236,13 +236,13 @@ async function main(): Promise<void> {
 
         console.log("[test] recall (full decrypt path)...");
         const fullRecall = await memory.recall("favorite color ultramarine", 5);
-        const fullHit = fullRecall.results.find((r) => r.text.includes("ultramarine"));
+        const fullHit = fullRecall.results.find((r: {text:string}) => r.text.includes("ultramarine"));
         if (!fullHit) {
             throw new Error(`Full recall missed fact: ${JSON.stringify(fullRecall.results)}`);
         }
         console.log(`  recalled: "${fullHit.text.slice(0, 80)}..."`);
     } else {
-        console.log("[test] skipping full relayer path (set FULL_E2E=1 when File Storage is configured)");
+        console.log("[test] skipping full relayer path (set FULL_E2E=1 when private R2 is configured)");
     }
 
     if (process.env.SOCIAL_WALKTHROUGH === "1") {

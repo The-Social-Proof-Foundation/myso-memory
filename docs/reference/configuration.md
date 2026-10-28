@@ -45,15 +45,14 @@ MySo signer fields:
 | `walletSigner` | one of two | Use a connected browser wallet instead |
 | `mysoClient` | no | Optional pre-configured MySo client |
 
-File Storage and network fields:
+MYDATA and network fields:
 
 | Field | Required | Notes |
 | --- | --- | --- |
 | `mysoNetwork` | no | `testnet` or `mainnet`. Default: `mainnet` |
 | `mydataKeyServers` | no | Override built-in MYDATA key server object IDs for the selected network |
-| `fileStorageEpochs` | no | Default: `50` |
-| `fileStorageAggregatorUrl` | no | File Storage download endpoint. Defaults follow `mysoNetwork` |
-| `fileStoragePublisherUrl` | no | File Storage upload endpoint. Defaults follow `mysoNetwork` |
+
+Memory blob storage is server-side Cloudflare R2. Configure `R2_BUCKET`, `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` on the relayer; the SDK does not upload blobs directly and does not require File Storage credentials.
 
 ## `WithMemoryOptions`
 

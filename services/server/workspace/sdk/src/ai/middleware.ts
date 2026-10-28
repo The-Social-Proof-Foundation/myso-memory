@@ -63,7 +63,7 @@ export interface WithMemoryOptions extends MemoryConfig {
  * - Injects relevant memories into the system prompt
  *
  * AFTER each LLM call:
- * - Analyzes and saves important facts (server: LLM extract → embed → encrypt → File Storage → store)
+ * - Analyzes and saves important facts (server: LLM extract → embed → encrypt → private R2 → store)
  * - Fire-and-forget — does not block the response
  */
 export function withMemory(

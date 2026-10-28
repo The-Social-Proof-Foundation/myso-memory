@@ -6,7 +6,13 @@ export interface SocialChainConfig {
     blockListRegistryId: string;
     postConfigId: string;
     memoryConfigId: string;
+    /** MySocial MemoryRegistry used by owner-key migration. */
+    memoryRegistryId?: string;
     mydataRegistryId: string;
+    /** Shared MyDataConfig for bounded direct P2P purchases. */
+    mydataConfigId?: string;
+    /** Shared SubscriptionConfig; used only by the deployment-gated subscription adapters. */
+    subscriptionConfigId?: string;
     socialGraphId?: string;
     /** Shared `agent_task::TaskConfig`; required by the `task.*` actions. */
     taskConfigId?: string;
@@ -16,6 +22,15 @@ export interface SocialChainConfig {
     jurorRosterId?: string;
     /** Shared `profile::EcosystemTreasury`; required by global governance jury actions. */
     ecosystemTreasuryId?: string;
+    /** Shared `proof_of_creativity::PoCConfig`; used by owner-approved creator-vault claims. */
+    pocConfigId?: string;
+    /** Shared `social_proof_of_truth::SpotConfig`; used by owner-approved payout claims. */
+    spotConfigId?: string;
+    /** Shared `social_proof_of_truth::SpotClaimRegistry`; required for betting. */
+    spotClaimRegistryId?: string;
+    /** Shared social_proof_tokens registry/config used by SPT trade builders. */
+    sptRegistryId?: string;
+    sptConfigId?: string;
     messagingPackageId?: string;
     messagingVersionId?: string;
     messagingConfigId?: string;
@@ -153,6 +168,12 @@ export interface CreateMessagingGroupParams {
     roomTaskId?: string;
 }
 
+export interface BindAgentRoomToTaskParams {
+    groupId: string;
+    taskId: string;
+    platformObjectId?: string;
+}
+
 export interface CreateOrganizationParams {
     orgType: number;
     name?: string;
@@ -172,6 +193,39 @@ export interface UpdateOrganizationCategoryParams {
 
 export interface OrganizationObjectParams {
     organizationId: string;
+}
+
+export interface OrganizationTreasuryAccessParams {
+    organizationId: string;
+    orgMemoryGroupId: string;
+    recipient: string;
+    hasAccess: boolean;
+}
+
+export interface OrganizationTreasuryWithdrawParams {
+    organizationId: string;
+    orgMemoryGroupId: string;
+    recipient: string;
+    amountBaseUnits: string;
+    coinType: string;
+}
+
+export interface OrganizationTreasuryFundParams {
+    organizationId: string;
+    paymentCoinId: string;
+    amountBaseUnits: string;
+    coinType: string;
+}
+
+export interface PlatformDeveloperTransferParams {
+    platformId: string;
+    platformAdminCapId: string;
+    newDeveloper: string;
+}
+
+export interface PlatformFeeRecipientUpdateParams {
+    platformAdminCapId: string;
+    newRecipient: string;
 }
 
 export interface OrganizationRoleParams {
@@ -271,6 +325,113 @@ export interface DeleteCommentParams {
 
 export interface DeletePostParams {
     postId: string;
+}
+
+/** Terms pinned from the exact on-chain MyData listing. Monetary values stay decimal u64 strings. */
+export interface PurchaseMyDataAccessParams {
+    mydataId: string;
+    paymentCoinId: string;
+    expectedSeller: string;
+    /** Existing MyData access codes: 2 = one-time, 3 = recurring. */
+    accessKind: 2 | 3;
+    audienceKind: "agent" | "organization";
+    priceMist: string;
+    /** Zero for one-time; exact purchased period for recurring access. */
+    durationDays: string;
+    encryptionIdHex: string;
+    /** sha256 of the listing's ciphertext, not a hash of private plaintext. */
+    encryptedDataDigestHex: string;
+    expectedListingPlatformId?: string;
+    platformObjectId?: string;
+    /** Optional audience for a graph purchase. The memory group ID is derived on-chain-compatible from this organization ID. */
+    organizationAudienceId?: string;
+    /** Seller-signed immutable GraphManifest identity, included only for graph listings. */
+    graphId?: string;
+    graphVersion?: string;
+    manifestHashHex?: string;
+    publicationSignatureHex?: string;
+}
+
+/** Owner-approved purchase of a MyData record explicitly linked to a gated post. */
+export interface PurchasePostAccessParams extends Omit<PurchaseMyDataAccessParams, "accessKind" | "durationDays" | "audienceKind" | "organizationAudienceId"> { postId: string; }
+
+/** Signed GraphManifest ciphertext and public seller proof for a direct P2P MyData listing. */
+export interface PublishMyDataGraphParams {
+    mediaType: "application/vnd.mysocial.graph-manifest+json;version=1";
+    tags: string[];
+    timestampStart: string;
+    encryptedDataHex: string;
+    encryptionIdHex: string;
+    accessKind: 2 | 3;
+    priceMist: string;
+    durationDays: string;
+    platformObjectId?: string;
+}
+
+/** Exact-input Orderbook v3 swap. The server resolves the selected pool from the
+ * configured /get_pools catalog and rechecks pool/coin types against fullnode state. */
+export interface DexSwapParams {
+    poolId: string;
+    poolName: string;
+    orderbookPackageId: string;
+    baseAssetType: string;
+    quoteAssetType: string;
+    direction: "sell_base" | "buy_base";
+    inputCoinId: string;
+    amountInBaseUnits: string;
+    minAmountOutBaseUnits: string;
+    recipientAddress: string;
+}
+
+/** Vaults are supplied from a fresh, authenticated quote and are rechecked on chain. */
+export interface SptBeneficiaryVault {
+    vaultId: string;
+    minDepositBaseUnits: string;
+}
+export interface SptBuyParams {
+    poolId: string;
+    paymentCoinId: string;
+    paymentAmountBaseUnits: string;
+    minTokensBaseUnits: string;
+    beneficiaryVaults: SptBeneficiaryVault[];
+}
+export interface SptSellParams {
+    poolId: string;
+    tokenObjectId: string;
+    amountBaseUnits: string;
+    minReceiveBaseUnits: string;
+    beneficiaryVaults: SptBeneficiaryVault[];
+}
+
+/** Owner-wallet quadratic community vote. The exact payment coin is selected
+ * by the approving wallet; native governance computes and consumes the cost. */
+export interface GovernanceVoteParams {
+    registryId: string;
+    proposalId: string;
+    paymentCoinId: string;
+    voteCount: string;
+    approve: boolean;
+}
+
+/** Delegate-council review action. The owner wallet must itself be a registered delegate. */
+export interface GovernanceDelegateVoteParams {
+    registryId: string;
+    proposalId: string;
+    route: "ecosystem" | "platform";
+    approve: boolean;
+    reason?: string;
+}
+
+export interface TransferOwnedObjectParams {
+    objectId: string;
+    recipient: string;
+    objectType: string;
+}
+
+/** Owner-approved destruction of one directly owned, zero-value framework Coin<T>. */
+export interface BurnZeroCoinParams {
+    coinObjectId: string;
+    coinType: string;
 }
 
 /** Fields shared by task actions. The acting account is always `BuildTxContext.memoryAccountId`. */
@@ -519,7 +680,56 @@ export interface SocialActionResult {
     messageSeq?: number;
 }
 
+export interface ShareMyDataParams {
+    mydataId: string;
+    recipient: string;
+    /** Native owner-grant kind: 0=one-time, 1=subscription. */
+    accessType: 0 | 1;
+    /** Explicit positive decimal u64 days, required only for subscription grants. */
+    subscriptionDays?: string;
+}
+export interface RevokeMyDataShareParams {
+    mydataId: string;
+    recipient: string;
+    /** Native revoke kind: 0=one-time, 1=subscription, 2=both. */
+    accessType: 0 | 1 | 2;
+}
+
 export type SocialExecuteAction =
+    | "rotate_owner_key"
+    | "spt_buy"
+    | "spt_sell"
+    | "spt_buy"
+    | "spt_sell"
+    | "dex_swap"
+    | "revoke_agent"
+    | "grant_capability"
+    | "revoke_capability"
+    | "raise_spending_limit"
+    | "lower_spending_limit"
+    | "tip_post"
+    | "claim_creator_vault"
+    | "accept_beneficiary_transfer"
+    | "claim_spot_payout"
+    | "place_spot_bet"
+    | "create_spot_market"
+    | "governance_vote"
+    | "governance_delegate_vote"
+    | "transfer_object"
+    | "burn_object"
+    | "claim_spot_payout"
+    | "send_token"
+    | "subscribe_to_plan"
+    | "renew_subscription"
+    | "cancel_subscription"
+    | "enable_auto_renew"
+    | "disable_auto_renew"
+    | "change_service_payment_recipient"
+    | "purchase_mydata_access"
+    | "publish_mydata_graph"
+    | "purchase_post_access"
+    | "share_mydata"
+    | "revoke_mydata_share"
     | "create_post"
     | "edit_post"
     | "create_comment"
@@ -536,11 +746,17 @@ export type SocialExecuteAction =
     | "unblock_profile"
     | "send_message"
     | "create_messaging_group"
+    | "bind_agent_room_to_task"
     | "create_organization"
     | "update_organization_metadata"
     | "update_organization_category"
     | "deactivate_organization"
     | "ensure_organization_memory_group"
+    | "grant_organization_treasury_access"
+    | "withdraw_organization_treasury"
+    | "fund_organization_treasury"
+    | "transfer_platform"
+    | "update_fee_recipient"
     | "define_organization_role"
     | "assign_organization_role"
     | "revoke_organization_role"
@@ -595,3 +811,56 @@ export type SocialExecuteAction =
     | "jury_sweep_vote_refunds"
     | "jury_refresh_roster_entry"
     | "jury_evict_ineligible";
+
+/** Exact plan identity and terms. Prices are base units of the explicit coin type. */
+export interface SubscriptionPlanTerms {
+    planId:string;expectedProfileOwner:string;coinType:string;priceBaseUnits:string;
+    durationMs:string;tierLevel?:string;planPlatformId?:string;
+}
+export interface SubscribeToPlanParams {
+    serviceId:string;paymentCoinId:string;terms:SubscriptionPlanTerms;
+    autoRenew:boolean;renewalPeriods:string;platformObjectId?:string;
+}
+export interface RenewSubscriptionParams {
+    serviceId:string;subscriptionId:string;paymentCoinId:string;terms:SubscriptionPlanTerms;platformObjectId?:string;
+}
+export interface CancelSubscriptionParams { serviceId:string;subscriptionId:string;coinType:string }
+export interface SubscriptionRenewalPreferenceParams {serviceId:string;subscriptionId:string}
+export interface ChangeServicePaymentRecipientParams {serviceId:string;newRecipient:string}
+
+/** Coin-denominated base units, not implicitly MIST. Funding belongs to the approving wallet. */
+export interface SendTokenParams {
+    paymentCoinId: string;
+    recipient: string;
+    coinType: string;
+    amountBaseUnits: string;
+}
+
+/** One explicit post-tip ABI path. Vault mode is selected by the caller and guarded by Move. */
+export interface TipPostParams {
+    postId: string;
+    paymentCoinId: string;
+    coinType: string;
+    amountBaseUnits: string;
+    mode: "simple" | "beneficiary-vault";
+    beneficiaryVaultId?: string;
+    minVaultDepositAmount?: string;
+}
+export interface ClaimCreatorVaultParams { vaultId: string; coinType: string }
+export interface AcceptBeneficiaryTransferParams { beneficiaryId: string }
+export interface ClaimSpotPayoutParams { marketId: string; postId: string }
+export interface PlaceSpotBetParams { marketId: string; postId: string; paymentCoinId: string; amountBaseUnits: string; optionId: number; referrerPostId?: string }
+export interface CreateSpotMarketParams { postId: string; spotOracleAdminCapId: string; semanticClaimHashHex: string; marketKeyHashHex: string; resolutionPolicyHashHex: string; bettingOptions: string[]; resolutionAtMs: string; maxResolutionWindowMs?: string }
+
+/** Snapshot identity/scope from the owned-agent quote. "global" explicitly means no platform scope. */
+export interface OwnerAgentIdentityParams { agentObjectId:string; expectedDerivedAddress:string; expectedPlatformScope:string; }
+export interface OwnerRotationProposalParams { profileId:string; newOwner:string; agentObjectIds:string[]; organizationObjectIds:string[]; stage?:"propose"; }
+export type OwnerRotationActionParams =
+    | OwnerRotationProposalParams
+    | { stage:"accept"; profileId:string; newOwner:string; agentObjectIds:string[]; organizationObjectIds:string[]; finalize:boolean }
+    | { stage:"rollback"; newOwner:string; agentObjectIds:string[]; organizationObjectIds:string[] }
+    | { stage:"cancel" };
+export interface OwnerChangeCapabilityParams extends OwnerAgentIdentityParams { expectedCapabilities:string; capabilityMask:string; }
+/** Finite per-action MIST limit; "unlimited" explicitly removes the ceiling. No cumulative budget is implied. */
+export interface OwnerRaiseSpendingLimitParams extends OwnerAgentIdentityParams { expectedLimitMist:string; newLimitMist:string; }
+export interface OwnerLowerSpendingLimitParams extends OwnerAgentIdentityParams { expectedLimitMist:string; newLimitMist:string; }

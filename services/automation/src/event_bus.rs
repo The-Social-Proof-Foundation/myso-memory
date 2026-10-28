@@ -48,7 +48,11 @@ impl EventBus {
     pub fn with_capacity(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let (tx, _) = broadcast::channel(capacity);
-        Self { tx, capacity, counters: Arc::new(Counters::default()) }
+        Self {
+            tx,
+            capacity,
+            counters: Arc::new(Counters::default()),
+        }
     }
 
     pub fn publish(&self, event: PlatformEvent) {
@@ -110,6 +114,7 @@ mod tests {
             source_event_id: "e1".into(),
             deduplication_key: "d1".into(),
             source_service: "workflow_relayer".into(),
+            target_job_id: None,
         };
         bus.publish(event.clone());
         let got = rx.recv().await.unwrap();
@@ -132,6 +137,7 @@ mod tests {
             source_event_id: id.into(),
             deduplication_key: id.into(),
             source_service: "social_server".into(),
+            target_job_id: None,
         };
         for id in ["a", "b", "c", "d"] {
             bus.publish(event(id));
@@ -140,7 +146,10 @@ mod tests {
         bus.record_consumed();
         bus.record_lagged(2);
         let stats = bus.stats();
-        assert_eq!((stats.published, stats.consumed, stats.lagged, stats.queued), (4, 1, 2, 1));
+        assert_eq!(
+            (stats.published, stats.consumed, stats.lagged, stats.queued),
+            (4, 1, 2, 1)
+        );
         // A capacity of zero would make the channel panic, so it is raised to one.
         assert_eq!(EventBus::with_capacity(0).stats().capacity, 1);
     }

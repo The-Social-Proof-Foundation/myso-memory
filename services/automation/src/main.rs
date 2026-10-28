@@ -7,12 +7,12 @@ use axum::{
 };
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
-use uuid::Uuid;
 
 use myso_automation::config::Config;
 use myso_automation::event_bus::EventBus;
 use myso_automation::handlers::{self, AppState};
 use myso_automation::store::{memory_store, postgres_store};
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() {
@@ -61,7 +61,7 @@ async fn main() {
             store.clone(),
             config.event_concurrency,
         );
-        spawn_tick_loop(config.tick_interval_secs, run_ctx.clone(), store.clone());
+        spawn_tick_loop(config.tick_interval_secs, bus.clone(), store.clone());
         tracing::info!(
             tick_interval_secs = config.tick_interval_secs,
             "automation execution enabled"
@@ -88,8 +88,55 @@ async fn main() {
             "/v1/automation/jobs",
             post(handlers::create_job).get(handlers::list_jobs),
         )
-        .route("/v1/automation/jobs/{id}", get(handlers::get_job))
+        .route("/v1/automation/jobs/validate", post(handlers::validate_job))
+        .route(
+            "/v1/automation/jobs/{id}/simulate-event",
+            axum::routing::post(handlers::simulate_job_event),
+        )
+        .route(
+            "/v1/automation/jobs/{id}",
+            get(handlers::get_job)
+                .post(handlers::set_job_enabled)
+                .patch(handlers::rename_job)
+                .delete(handlers::delete_job),
+        )
+        .route(
+            "/v1/automation/jobs/{id}/configuration",
+            axum::routing::patch(handlers::update_job_configuration),
+        )
+        .route(
+            "/v1/automation/jobs/{id}/archive",
+            post(handlers::archive_job),
+        )
+        .route(
+            "/v1/automation/jobs/{id}/restore",
+            post(handlers::restore_job),
+        )
         .route("/v1/automation/jobs/{id}/runs", get(handlers::list_runs))
+        .route(
+            "/v1/automation/jobs/{job_id}/runs/{run_id}/reconcile",
+            axum::routing::post(handlers::resolve_orphan_run),
+        )
+        .route(
+            "/v1/automation/jobs/{id}/run-now",
+            axum::routing::post(handlers::run_job_now),
+        )
+        .route(
+            "/v1/automation/jobs/{id}/cancel",
+            axum::routing::post(handlers::cancel_job),
+        )
+        .route(
+            "/v1/automation/jobs/{id}/deliveries",
+            get(handlers::list_event_deliveries),
+        )
+        .route(
+            "/v1/automation/deliveries/{id}/reconcile",
+            axum::routing::post(handlers::resolve_event_delivery),
+        )
+        .route(
+            "/v1/automation/deliveries/{id}/cancel",
+            axum::routing::post(handlers::cancel_event_delivery),
+        )
         .route("/internal/automation/events", post(handlers::ingest_event))
         .route(
             "/v1/automation/delegates",
@@ -98,8 +145,16 @@ async fn main() {
                 .delete(handlers::delete_delegate),
         )
         .route(
+            "/v1/automation/delegates/events",
+            get(handlers::list_delegate_key_events),
+        )
+        .route(
             "/v1/automation/delegates/key",
             get(handlers::get_delegate_key),
+        )
+        .route(
+            "/v1/automation/delegates/summary",
+            get(handlers::get_delegate_summary),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -122,10 +177,8 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-/// Evaluates each event against the enabled jobs, up to `concurrency` at a time. Events used to be
-/// handled one by one, so a single slow webhook (a juror's runner can take its full 15 seconds)
-/// held every event behind it until the bus overflowed and dropped them. When every slot is busy the
-/// consumer waits for one, and the bus buffers meanwhile; anything it still has to drop is counted.
+/// Claim persisted job/event deliveries with bounded concurrency. Broadcast messages only wake
+/// this poller; acknowledgement, lease expiry and uncertain outcomes live in the store.
 fn spawn_event_consumer(
     mut rx: tokio::sync::broadcast::Receiver<myso_automation::PlatformEvent>,
     bus: EventBus,
@@ -133,39 +186,135 @@ fn spawn_event_consumer(
     store: Arc<dyn myso_automation::AutomationStore>,
     concurrency: usize,
 ) {
+    enum DeliveryFailure {
+        SafeToRetry(String),
+        Reconcile(String),
+    }
     tokio::spawn(async move {
         let slots = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    bus.record_consumed();
-                    let Ok(permit) = slots.clone().acquire_owned().await else { break };
+            let Ok(permit) = slots.clone().acquire_owned().await else {
+                break;
+            };
+            match store.claim_event_delivery().await {
+                Ok(Some(claim)) => {
                     let run_ctx = run_ctx.clone();
                     let store = store.clone();
                     tokio::spawn(async move {
-                        match store.list_enabled_jobs().await {
-                            Ok(jobs) => {
-                                if let Err(e) = run_ctx.evaluate_event_for_jobs(&event, &jobs).await {
-                                    tracing::warn!(
-                                        source_event_id = %event.source_event_id,
-                                        "event evaluation error: {e}"
-                                    );
+                        let execute = async {
+                            let job = store
+                                .get_job(claim.job_id)
+                                .await
+                                .map_err(|e| DeliveryFailure::SafeToRetry(e.to_string()))?
+                                .ok_or_else(|| {
+                                    DeliveryFailure::Reconcile(
+                                        "Delivery job no longer exists; reconcile this delivery"
+                                            .to_string(),
+                                    )
+                                })?;
+                            if !job.enabled {
+                                return if store
+                                    .defer_event_delivery(claim.id, claim.token)
+                                    .await
+                                    .map_err(|e| DeliveryFailure::Reconcile(e.to_string()))?
+                                {
+                                    Ok(false)
+                                } else {
+                                    Err(DeliveryFailure::Reconcile(
+                                        "Delivery lease lost while deferring paused work".into(),
+                                    ))
+                                };
+                            }
+                            if !store
+                                .begin_event_delivery_dispatch(claim.id, claim.token)
+                                .await
+                                .map_err(|e| DeliveryFailure::SafeToRetry(e.to_string()))?
+                            {
+                                return if store
+                                    .defer_event_delivery(claim.id, claim.token)
+                                    .await
+                                    .map_err(|e| DeliveryFailure::Reconcile(e.to_string()))?
+                                {
+                                    Ok(false)
+                                } else {
+                                    Err(DeliveryFailure::Reconcile(
+                                        "Delivery lease lost before dispatch could be fenced"
+                                            .into(),
+                                    ))
+                                };
+                            }
+                            run_ctx.evaluate_event_for_jobs(&claim.event, &[job]).await.map_err(|error| match error {
+                                    myso_automation::executor::EventEvaluationError::SafeToRetry(message) => DeliveryFailure::SafeToRetry(message),
+                                    myso_automation::executor::EventEvaluationError::Reconcile(message) => DeliveryFailure::Reconcile(message),
+                                })?;
+                            Ok::<bool, DeliveryFailure>(true)
+                        };
+                        tokio::pin!(execute);
+                        let mut heartbeat =
+                            tokio::time::interval(std::time::Duration::from_secs(30));
+                        let outcome = loop {
+                            tokio::select! {
+                                result = &mut execute => break result,
+                                _ = heartbeat.tick() => {
+                                    match store.renew_event_delivery(claim.id, claim.token).await {
+                                        Ok(true) => {},
+                                        _ => break Err(DeliveryFailure::Reconcile("Delivery lease lost; external outcome needs reconciliation".into())),
+                                    }
                                 }
                             }
-                            Err(e) => tracing::warn!("cannot list jobs for event evaluation: {e}"),
+                        };
+                        match outcome {
+                            Ok(false) => {
+                                tracing::debug!(delivery_id=%claim.id, "paused job delivery returned to the pending queue")
+                            }
+                            Ok(true) => {
+                                let result = store
+                                    .finish_event_delivery(claim.id, claim.token, None)
+                                    .await;
+                                if !matches!(result, Ok(true)) {
+                                    tracing::warn!(delivery_id=%claim.id, "delivery settlement uncertain; persisted lease recovery will reconcile it");
+                                }
+                            }
+                            Err(DeliveryFailure::SafeToRetry(error)) => {
+                                match store
+                                    .retry_event_delivery(claim.id, claim.token, &error)
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        tracing::warn!(delivery_id=%claim.id, "safe pre-dispatch failure scheduled for bounded retry: {error}")
+                                    }
+                                    _ => {
+                                        tracing::warn!(delivery_id=%claim.id, "could not safely requeue pre-dispatch failure; lease recovery will reconcile it")
+                                    }
+                                }
+                            }
+                            Err(DeliveryFailure::Reconcile(error)) => {
+                                let result = store
+                                    .finish_event_delivery(claim.id, claim.token, Some(error))
+                                    .await;
+                                if !matches!(result, Ok(true)) {
+                                    tracing::warn!(delivery_id=%claim.id, "delivery settlement uncertain; persisted lease recovery will reconcile it");
+                                }
+                            }
                         }
                         drop(permit);
                     });
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    bus.record_lagged(n);
-                    tracing::warn!(
-                        dropped = n,
-                        "event bus lagged: events were dropped after being acknowledged; \
-                         raise AUTOMATION_EVENT_BUS_CAPACITY or AUTOMATION_EVENT_CONCURRENCY"
-                    );
+                result => {
+                    drop(permit);
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "cannot claim durable event delivery");
+                    }
+                    // The broadcast is only a wake hint. A lost hint cannot lose persisted work.
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+                        notification = rx.recv() => match notification {
+                            Ok(_) => bus.record_consumed(),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => bus.record_lagged(n),
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {},
+                        }
+                    }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -173,7 +322,7 @@ fn spawn_event_consumer(
 
 fn spawn_tick_loop(
     interval_secs: u64,
-    run_ctx: Arc<myso_automation::executor::RunContext>,
+    bus: EventBus,
     store: Arc<dyn myso_automation::AutomationStore>,
 ) {
     tokio::spawn(async move {
@@ -181,34 +330,96 @@ fn spawn_tick_loop(
             tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
         loop {
             interval.tick().await;
-            let tick = myso_automation::PlatformEvent {
-                event_version: 1,
-                event_family: "automation".into(),
-                event_type: "tick".into(),
-                organization_id: None,
-                account_id: None,
-                agent_object_id: None,
-                payload: serde_json::json!({}),
-                occurred_at_ms: chrono::Utc::now().timestamp_millis(),
-                source_event_id: Uuid::new_v4().to_string(),
-                deduplication_key: format!("tick:{}", chrono::Utc::now().timestamp()),
-                source_service: "automation_engine".into(),
-            };
-            if let Ok(jobs) = store.list_enabled_jobs().await {
+            let token = Uuid::new_v4();
+            let lease_secs = interval_secs.max(60).saturating_mul(2).min(3600);
+            match store.acquire_scheduler_lease(token, lease_secs).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot acquire automation scheduler lease");
+                    continue;
+                }
+            }
+            let scheduled = if let Ok(jobs) = store.list_enabled_jobs().await {
                 let now = chrono::Utc::now();
                 for job in jobs {
-                    // Due-ness is measured from the last *attempt*, not the last
-                    // success: a skipped or failing job otherwise re-ran, alerted
-                    // and called the oracle on every tick until it succeeded.
-                    let last_attempt = store.latest_run_started_at(job.id).await.ok().flatten();
-                    if myso_automation::trigger_eval::due_window(&job.trigger_set, last_attempt, now)
-                        .is_some()
-                    {
-                        if let Err(e) = run_ctx.run_job(&job, Some(&tick)).await {
-                            tracing::warn!(job_id = %job.id, "scheduled run error: {e}");
+                    // A stale replica stops scanning as soon as it no longer owns
+                    // the renewable leader lease. Stable slot IDs below remain the
+                    // final deduplication barrier across lease expiry/reacquisition.
+                    match store.renew_scheduler_lease(token, lease_secs).await {
+                        Ok(true) => {}
+                        _ => {
+                            tracing::warn!(%token, "automation scheduler lease lost; stopping this tick");
+                            break;
+                        }
+                    }
+                    // Advance cron/interval only from prior scheduled attempts. A manual
+                    // run or event-triggered run must not skip an older missed cron slot.
+                    // Counting failed scheduled attempts avoids retrying the same slot on
+                    // every tick; stable schedule-event IDs remain the enqueue dedup guard.
+                    let last_cursor = match store.latest_scheduled_run_cursor(job.id).await {
+                        Ok(value) => value,
+                        Err(error) => {
+                            tracing::warn!(job_id=%job.id, %error, "cannot read the last scheduled automation attempt");
+                            continue;
+                        }
+                    };
+                    let last_window = last_cursor.as_ref().map(|(window, _)| window.as_str());
+                    let last_attempt = last_cursor.as_ref().map(|(_, started_at)| *started_at);
+                    let Some(window) = myso_automation::trigger_eval::due_window_from_cursor(
+                        &job.trigger_set,
+                        last_window,
+                        last_attempt,
+                        now,
+                    ) else {
+                        continue;
+                    };
+                    // Persist one targeted schedule delivery per job/window. Multiple replicas
+                    // may observe the same due slot; the inbox deduplicates the stable key and
+                    // the normal lease/fencing worker owns dispatch and reconciliation.
+                    let key = format!("automation:schedule:{}:{}", job.id, window);
+                    let scheduled = myso_automation::PlatformEvent {
+                        event_version: 1,
+                        event_family: "automation".into(),
+                        event_type: "scheduled_run".into(),
+                        organization_id: Some(job.organization_id.clone()),
+                        account_id: Some(job.account_id.clone()),
+                        agent_object_id: Some(job.target_agent_object_id.clone()),
+                        payload: serde_json::json!({"window": window}),
+                        occurred_at_ms: now.timestamp_millis(),
+                        source_event_id: key.clone(),
+                        deduplication_key: key,
+                        source_service: "automation_scheduler".into(),
+                        target_job_id: Some(job.id),
+                    };
+                    // Refresh once more immediately before the persisted slot is
+                    // created so a replica that lost leadership does not continue
+                    // enqueueing a large schedule scan.
+                    match store.renew_scheduler_lease(token, lease_secs).await {
+                        Ok(true) => {}
+                        _ => {
+                            tracing::warn!(%token, "automation scheduler lease lost before slot enqueue");
+                            break;
+                        }
+                    }
+                    match store.ingest_scheduled_event(&scheduled, token).await {
+                        Ok(true) => bus.publish(scheduled),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(job_id=%job.id, %error, "cannot persist scheduled automation delivery")
                         }
                     }
                 }
+                true
+            } else {
+                tracing::warn!("cannot list enabled jobs during scheduler tick");
+                false
+            };
+            if !scheduled {
+                tracing::debug!(%token, "scheduler tick ended without a complete job scan");
+            }
+            if let Err(error) = store.release_scheduler_lease(token).await {
+                tracing::warn!(%token, %error, "cannot release automation scheduler lease");
             }
         }
     });

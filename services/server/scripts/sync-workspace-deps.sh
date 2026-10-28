@@ -7,15 +7,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 WS="$ROOT/services/server/workspace"
 
-rm -rf "$WS/sdk" "$WS/social"
-mkdir -p "$WS"
+mkdir -p "$WS/sdk" "$WS/social"
 
-rsync -a \
+rsync -a --delete \
   --exclude node_modules \
   --exclude dist \
   "$ROOT/packages/sdk/" "$WS/sdk/"
 
-rsync -a \
+rsync -a --delete \
   --exclude node_modules \
   --exclude dist \
   --exclude '*.test.ts' \

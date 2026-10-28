@@ -16,6 +16,7 @@ import { DirectiveEngine, type EngineRequest } from "./directives.js";
 import type { Metrics } from "./metrics.js";
 import { checkSignature } from "./signature.js";
 import type { JudgmentStore } from "./store.js";
+import { buildBundle, type BundleDeps } from "./bundle.js";
 
 export interface ServerDeps {
     webhookSecret: string;
@@ -26,6 +27,9 @@ export interface ServerDeps {
     metrics?: Metrics;
     /** Bearer token that unlocks `/metrics`. Without one the route does not exist. */
     metricsToken?: string;
+    /** Shared only with the authenticated MySo Agents server; enables verified bundle reads. */
+    bundleReadToken?: string;
+    bundle?: BundleDeps;
     now?: () => number;
     log?: (message: string, detail?: unknown) => void;
 }
@@ -85,6 +89,23 @@ export function createJurorServer(deps: ServerDeps): Server {
                 return send(res, 401, { error: "unauthorized" });
             }
             return send(res, 200, deps.metrics.render(), "text/plain; version=0.0.4; charset=utf-8");
+        }
+        if (req.method === "GET" && url.pathname === "/case-bundle" && deps.bundle && deps.bundleReadToken) {
+            if (header(req, "authorization") !== `Bearer ${deps.bundleReadToken}`) {
+                return send(res, 401, { error: "unauthorized" });
+            }
+            const caseId = url.searchParams.get("caseId") ?? "";
+            const round = Number(url.searchParams.get("round"));
+            if (!/^0x[0-9a-fA-F]{1,64}$/.test(caseId) || !Number.isSafeInteger(round) || round < 0) {
+                return send(res, 400, { error: "invalid_request" });
+            }
+            try {
+                const result = await buildBundle(deps.bundle, caseId, round);
+                return send(res, 200, { bundle: result.bundle, digestHex: result.digestHex });
+            } catch (error) {
+                deps.log?.("case bundle unavailable", String(error));
+                return send(res, 404, { error: "bundle_unavailable" });
+            }
         }
         if (req.method === "GET" && url.pathname.startsWith("/rationales/")) {
             const digest = url.pathname.slice("/rationales/".length).toLowerCase();

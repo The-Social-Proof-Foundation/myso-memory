@@ -15,13 +15,15 @@
 import { createHash } from "node:crypto";
 
 import { Memory } from "@socialproof/memory";
-import { SOCIAL_ACTION_IDS, SocialClient } from "@socialproof/sub-agents";
+import { CAP_MESSAGE_READ, CAP_MESSAGE_SEND, SOCIAL_ACTION_IDS, SocialClient, getProductionActionDescriptor } from "@socialproof/sub-agents";
+import { LocalEd25519Signer, SponsoredSocialGateway } from "@socialproof/memory-mcp";
 
 import { BridgeError } from "./bridge-error.js";
 import { normalizeObjectId } from "./ids.js";
 import { DELEGATE_REF_PREFIX, type DelegateSource } from "./delegates.js";
 import type { AgentKeyStore, ResolvedAgentKey } from "./keys.js";
 import {
+    CAP_MYDATA_READ,
     CAP_JURY,
     CAP_TASK_TRADE,
     NEEDS_RECALL,
@@ -85,6 +87,83 @@ export interface ProbeRequest {
     account_id: string;
 }
 
+/** One operation on a previously issued per-run worker credential. */
+export interface WorkRunJournalRequest {
+    key_ref: string;
+    account_id: string;
+    parent_agent_id: string;
+    worker_agent_id: string;
+    run_id: string;
+    credential: string;
+    operation: string;
+    params: Record<string, unknown>;
+}
+
+/** Proxy one MCP JSON-RPC request while keeping the action-worker seed/session in the sidecar. */
+export interface WorkRunMcpRequest extends Omit<WorkRunJournalRequest, "operation" | "params"> {
+    request: Record<string, unknown>;
+}
+
+/** One consented encrypted-room history read for an unattended worker run. */
+export interface WorkRoomHistoryRequest extends Omit<WorkRunJournalRequest, "operation" | "params"> {
+    tool_name: "messaging_get_room_history" | "messaging_get_room_attachment";
+    request: Record<string, unknown>;
+}
+
+/** Caller-bound, explicitly confirmed room administration through the hosted MCP. */
+export interface RoomManagementRequest {
+    key_ref: string;
+    account_id: string;
+    agent_object_id: string;
+    operation: "set_name" | "archive";
+    request: Record<string, unknown>;
+}
+
+/** Execute one allowlisted, caller-bound room MCP tool through the shared room client. */
+export interface RoomToolRequest {
+    key_ref: string;
+    account_id: string;
+    agent_object_id: string;
+    tool_name: string;
+    arguments: Record<string, unknown>;
+}
+
+const ROOM_TOOL_METHODS: Readonly<Record<string, string>> = Object.freeze({
+    messaging_list_inbox: "listInbox",
+    messaging_list_rooms: "listRoomConversations",
+    messaging_get_room_history: "getRoomHistory",
+    messaging_get_room_attachment: "getRoomAttachment",
+    messaging_send_room_message: "sendRoomMessage",
+    messaging_list_reactions: "listRoomReactions",
+    messaging_add_reaction: "changeRoomReaction",
+    messaging_remove_reaction: "changeRoomReaction",
+    messaging_get_room_receipts: "getRoomReceipts",
+    messaging_update_room_receipts: "updateRoomReceipts",
+    messaging_edit_message: "editRoomMessage",
+    messaging_delete_message: "deleteRoomMessage",
+    messaging_remove_members_rotate_key: "removeRoomMembersAndRotateKey",
+    messaging_add_room_members: "addRoomMembers",
+    messaging_leave_group: "leaveRoom",
+    messaging_set_room_name: "setRoomName",
+    messaging_archive_group: "archiveRoom",
+    messaging_get_read_state: "getRoomReadState",
+    messaging_update_read_state: "updateRoomReadState",
+    messaging_get_unread_counts: "getRoomUnreadCounts",
+    messaging_wait_for_message: "waitForMessage",
+});
+const ROOM_ADMIN_TOOLS = new Set(["messaging_remove_members_rotate_key", "messaging_add_room_members", "messaging_leave_group", "messaging_set_room_name", "messaging_archive_group"]);
+const ROOM_READ_TOOLS = new Set(["messaging_list_inbox", "messaging_list_rooms", "messaging_get_room_history", "messaging_get_room_attachment", "messaging_list_reactions", "messaging_get_room_receipts", "messaging_get_read_state", "messaging_get_unread_counts", "messaging_wait_for_message"]);
+
+/** Owner-approved harness configuration queued by automation; never contains OAuth or key material. */
+export interface WorkRunDispatchRequest {
+    key_ref: string;
+    account_id: string;
+    parent_agent_id: string;
+    run_id: string;
+    dispatch_id: string;
+    turn: Record<string, unknown>;
+}
+
 export interface ProbeResponse {
     status: string;
     version: string;
@@ -114,6 +193,23 @@ export const CRANK_ACTION_IDS: ReadonlySet<string> = new Set(
     SOCIAL_ACTION_IDS.filter((id) => id.startsWith("jury.") && !JUROR_ACTION_IDS.has(id)),
 );
 
+/**
+ * Curated owner-selectable action-worker set. Keep aligned with the app's
+ * ACTION_WORKER_ACTIONS and the automation engine/Memory storage allowlists.
+ */
+const ACTION_WORKER_ACTION_IDS = [
+    "access.publish_mydata_graph.v1", "access.purchase_mydata_access.v1", "access.purchase_post_access.v1",
+    "task.create.v1", "spt.buy.v1",
+    "social.react_to_post.v1", "social.remove_post_reaction.v1", "social.react_to_comment.v1",
+    "social.remove_comment_reaction.v1", "social.create_post.v1", "social.edit_post.v1",
+    "social.create_comment.v1", "social.edit_comment.v1", "social.create_repost.v1",
+    "social.remove_repost.v1", "social.follow_profile.v1", "social.unfollow_profile.v1",
+    "social.block_profile.v1", "social.unblock_profile.v1", "messaging.send_message.v1",
+    "messaging.create_group.v1", "messaging.bind_room_to_task.v1", "organization.accept_invitation.v1",
+    "organization.decline_invitation.v1", "agent.register_child.v1", "agent.update_child.v1",
+    "agent.deactivate_child.v1", "agent.revoke_child.v1",
+] as const;
+
 /** The key ref a crank job names to sign with {@link MemoryBridgeOptions.crankSigner}. */
 export const OPERATOR_KEY_REF = "operator:jury";
 
@@ -121,15 +217,20 @@ export const OPERATOR_KEY_REF = "operator:jury";
 export const CHAIN_CLASS_ACTIONS: Readonly<Record<ChainDelegateClass, ReadonlySet<string>>> = Object.freeze({
     task_worker: TASK_ACTION_IDS,
     juror: JUROR_ACTION_IDS,
+    action_worker: new Set(ACTION_WORKER_ACTION_IDS.filter((id) => {
+        const descriptor = getProductionActionDescriptor(id);
+        return descriptor?.availability === "enabled" && descriptor.approval === "agent-capability" && descriptor.requiredCapability !== null;
+    })),
 });
 export const CHAIN_CLASS_NEEDS: Readonly<Record<ChainDelegateClass, number>> = Object.freeze({
     task_worker: CAP_TASK_TRADE,
     juror: CAP_JURY,
+    action_worker: 0,
 });
 
 /** The one class that may run an action, or `undefined` if no delegate class may. */
 export function classForAction(actionId: string): ChainDelegateClass | undefined {
-    for (const delegateClass of Object.keys(CHAIN_CLASS_ACTIONS) as ChainDelegateClass[]) {
+    for (const delegateClass of ["task_worker", "juror", "action_worker"] as const) {
         if (CHAIN_CLASS_ACTIONS[delegateClass].has(actionId)) return delegateClass;
     }
     return undefined;
@@ -137,6 +238,7 @@ export function classForAction(actionId: string): ChainDelegateClass | undefined
 
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:/-]{8,128}$/;
 const MAX_ACTION_PARAMS_BYTES = 32 * 1024;
+const MAX_WORK_MCP_REQUEST_BYTES = 256 * 1024;
 
 export interface ChainActRequest {
     key_ref: string;
@@ -211,6 +313,15 @@ export interface MemoryBridgeOptions {
     eventsUrl?: string;
     /** Secret for the event sink. Falls back to the bridge's own shared secret. */
     eventsSecret?: string;
+    /** Shared secret for the fixed internal Memory work-journal endpoint. */
+    internalSyncSecret?: string;
+    /** Hosted MCP endpoint used only for an action-worker's scoped run calls. */
+    workMcpUrl?: string;
+    /** Messaging relayer used only for explicitly consented run-scoped history reads. */
+    messagingRelayerUrl?: string;
+    /** MySo Agents app origin and dispatch secret. */
+    workDispatchUrl?: string;
+    workDispatchSecret?: string;
     /** Injectable for tests. */
     createClient?: (agent: ResolvedAgentKey) => Memory;
     /** Injectable for tests. Built per call and never cached: a chain client holds the signing key. */
@@ -554,7 +665,9 @@ export class MemoryBridge {
             serverUrl: delegateDefaults.serverUrl,
             accountId: req.account_id,
             agentObjectId: opened.agentObjectId,
-            needs: CHAIN_CLASS_NEEDS[requiredClass],
+            needs: requiredClass === "action_worker"
+                ? getProductionActionDescriptor(req.action_id)?.requiredCapability ?? Number.MAX_SAFE_INTEGER
+                : CHAIN_CLASS_NEEDS[requiredClass],
             delegateClass: requiredClass,
         });
 
@@ -684,6 +797,438 @@ export class MemoryBridge {
         } catch (err) {
             throw wrapSdkError(err, "probe");
         }
+    }
+
+    /**
+     * Execute one already-authorized run-journal operation as its action_worker.
+     * The delegate seed and exported short-lived MyData SessionKey stay inside
+     * this sidecar; the worker credential is forwarded only to Memory's fixed
+     * internal endpoint and is never persisted here.
+     */
+    async workJournal(req: WorkRunJournalRequest): Promise<unknown> {
+        const allowed = new Set([
+            "work_run_get", "work_run_list_operations", "work_run_save_plan",
+            "work_run_reserve_operation", "work_run_settle_operation",
+            "work_run_append_action_receipt", "work_run_append_task_artifact",
+            "work_run_update_step", "work_run_acquire_turn", "work_run_renew_turn",
+            "work_run_checkpoint", "work_run_finish_turn", "work_run_complete",
+        ]);
+        if (!allowed.has(req.operation) || req.operation === "work_run_create" || req.operation === "work_run_list") {
+            throw new BridgeError("operation is unavailable to a run worker", 403, "work_operation_not_allowed");
+        }
+        if (!/^delegate:[A-Za-z0-9._-]{1,64}$/.test(req.key_ref)
+            || !/^[0-9a-f-]{36}$/i.test(req.run_id)
+            || !/^mwr1\.[0-9a-f-]{36}\.[0-9a-f-]{36}$/i.test(req.credential)
+            || Buffer.byteLength(JSON.stringify(req.params)) > MAX_ACTION_PARAMS_BYTES) {
+            throw new BridgeError("invalid worker journal request", 400, "invalid_request");
+        }
+        if (["work_run_get", "work_run_list_operations", "work_run_save_plan", "work_run_reserve_operation",
+            "work_run_append_action_receipt", "work_run_append_task_artifact", "work_run_update_step",
+            "work_run_acquire_turn", "work_run_renew_turn", "work_run_checkpoint", "work_run_finish_turn", "work_run_complete"]
+            .includes(req.operation) && req.params.runId !== req.run_id) {
+            throw new BridgeError("worker operation must name its bound run", 403, "work_run_scope_mismatch");
+        }
+        if (!this.opts.internalSyncSecret) {
+            throw new BridgeError("run worker journal bridge is not configured", 503, "work_journal_unavailable");
+        }
+        const { delegates, verifier, delegateDefaults } = this.opts;
+        if (!delegates || !verifier || !delegateDefaults?.serverUrl) {
+            throw new BridgeError("encrypted action-worker keys are unavailable", 503, "delegate_store_unavailable");
+        }
+        const ref = req.key_ref.slice(DELEGATE_REF_PREFIX.length);
+        const opened = await delegates.open(req.account_id, ref);
+        if (opened.delegateClass !== "action_worker"
+            || normalizeObjectId(opened.agentObjectId) !== normalizeObjectId(req.worker_agent_id)) {
+            throw new BridgeError("credential is not bound to this action_worker", 403, "delegate_mismatch");
+        }
+        await verifier.verify({
+            seedHex: opened.seedHex,
+            serverUrl: delegateDefaults.serverUrl,
+            accountId: req.account_id,
+            agentObjectId: opened.agentObjectId,
+            needs: CAP_MYDATA_READ,
+            delegateClass: "action_worker",
+        });
+        const agent: ResolvedAgentKey = {
+            key: opened.seedHex,
+            accountId: req.account_id,
+            serverUrl: delegateDefaults.serverUrl,
+            namespace: delegateDefaults.namespace,
+        };
+        const client = this.client(agent, req.key_ref, agent.namespace);
+        const target = `${agent.serverUrl.replace(/\/+$/, "")}/internal/mcp/work-journal`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.opts.requestTimeoutMs);
+        try {
+            return await client.withMyDataSession(async (session) => {
+                const response = await this.fetchImpl(target, {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json",
+                        "x-internal-sync-secret": this.opts.internalSyncSecret!,
+                        "x-mydata-session": session,
+                        "x-work-run-credential": req.credential,
+                    },
+                    body: JSON.stringify({
+                        accountId: req.account_id,
+                        agentObjectId: req.parent_agent_id,
+                        workerAgentObjectId: opened.agentObjectId,
+                        operation: req.operation,
+                        params: req.params,
+                    }),
+                    signal: controller.signal,
+                });
+                const raw = await response.text();
+                if (!response.ok) {
+                    const code = response.status === 401 || response.status === 403 ? "work_credential_rejected"
+                        : response.status === 409 ? "work_operation_conflict"
+                            : response.status === 404 ? "work_record_unavailable" : "work_journal_unavailable";
+                    throw new BridgeError(`work journal rejected the worker request (${response.status})`, response.status, code);
+                }
+                try { return JSON.parse(raw) as unknown; }
+                catch { throw new BridgeError("work journal returned invalid JSON", 502, "work_journal_unavailable"); }
+            });
+        } catch (err) {
+            if (err instanceof BridgeError) throw err;
+            throw new BridgeError("work journal request failed", 502, "work_journal_unavailable");
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async workMcp(req: WorkRunMcpRequest): Promise<unknown> {
+        const rpc = req.request;
+        if (!/^delegate:[A-Za-z0-9._-]{1,64}$/.test(req.key_ref)
+            || !/^[0-9a-f-]{36}$/i.test(req.run_id)
+            || !/^mwr1\.[0-9a-f-]{36}\.[0-9a-f-]{36}$/i.test(req.credential)
+            || rpc.jsonrpc !== "2.0" || !["tools/list", "tools/call"].includes(String(rpc.method))
+            || !["string", "number"].includes(typeof rpc.id)
+            || Buffer.byteLength(JSON.stringify(rpc)) > MAX_WORK_MCP_REQUEST_BYTES) {
+            throw new BridgeError("invalid worker MCP request", 400, "invalid_request");
+        }
+        if (rpc.method === "tools/call") {
+            const params = rpc.params;
+            if (!params || typeof params !== "object" || Array.isArray(params)
+                || typeof (params as Record<string, unknown>).name !== "string"
+                || ["work_run_issue_worker_credential", "work_run_revoke_worker_credential"].includes((params as Record<string, unknown>).name as string)) {
+                throw new BridgeError("worker MCP operation is unavailable", 403, "work_operation_not_allowed");
+            }
+        }
+        if (!this.opts.workMcpUrl) throw new BridgeError("run worker MCP proxy is not configured", 503, "work_mcp_unavailable");
+        const { delegates, verifier, delegateDefaults } = this.opts;
+        if (!delegates || !verifier || !delegateDefaults?.serverUrl) throw new BridgeError("encrypted action-worker keys are unavailable", 503, "delegate_store_unavailable");
+        const opened = await delegates.open(req.account_id, req.key_ref.slice(DELEGATE_REF_PREFIX.length));
+        if (opened.delegateClass !== "action_worker" || normalizeObjectId(opened.agentObjectId) !== normalizeObjectId(req.worker_agent_id)) {
+            throw new BridgeError("credential is not bound to this action_worker", 403, "delegate_mismatch");
+        }
+        await verifier.verify({ seedHex: opened.seedHex, serverUrl: delegateDefaults.serverUrl, accountId: req.account_id, agentObjectId: opened.agentObjectId, needs: CAP_MYDATA_READ, delegateClass: "action_worker" });
+        const agent: ResolvedAgentKey = { key: opened.seedHex, accountId: req.account_id, serverUrl: delegateDefaults.serverUrl, namespace: delegateDefaults.namespace };
+        const client = this.client(agent, req.key_ref, agent.namespace);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.opts.requestTimeoutMs);
+        try {
+            return await client.withMyDataSession(async (session) => {
+                const response = await this.fetchImpl(this.opts.workMcpUrl!, {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json",
+                        "accept": "application/json, text/event-stream",
+                        "MCP-Protocol-Version": "2025-03-26",
+                        "authorization": `Bearer ${req.credential}`,
+                        "x-mydata-session": session,
+                    },
+                    body: JSON.stringify(rpc),
+                    redirect: "error",
+                    signal: controller.signal,
+                });
+                const raw = await response.text();
+                if (!response.ok) throw new BridgeError(`hosted MCP rejected the run worker (${response.status})`, response.status, response.status === 401 || response.status === 403 ? "work_credential_rejected" : "work_mcp_unavailable");
+                if (Buffer.byteLength(raw) > 2 * 1024 * 1024) throw new BridgeError("hosted MCP response exceeds 2 MiB", 502, "payload_too_large");
+                try { return JSON.parse(raw) as unknown; }
+                catch { throw new BridgeError("hosted MCP returned invalid JSON", 502, "work_mcp_unavailable"); }
+            });
+        } catch (err) {
+            if (err instanceof BridgeError) throw err;
+            throw new BridgeError("hosted MCP worker proxy failed", 502, "work_mcp_unavailable");
+        } finally { clearTimeout(timer); }
+    }
+
+    /** Read encrypted room history as the live action_worker, after per-run consent. */
+    async workRoomHistory(req: WorkRoomHistoryRequest): Promise<unknown> {
+        if (!this.opts.messagingRelayerUrl || !this.opts.internalSyncSecret) {
+            throw new BridgeError("run worker room history is not configured", 503, "room_history_unavailable");
+        }
+        if ((req.tool_name !== "messaging_get_room_history" && req.tool_name !== "messaging_get_room_attachment")
+            || !/^delegate:[A-Za-z0-9._-]{1,64}$/.test(req.key_ref)
+            || !/^0x[0-9a-fA-F]{1,64}$/.test(req.account_id)
+            || !/^0x[0-9a-fA-F]{1,64}$/.test(req.parent_agent_id)
+            || !/^0x[0-9a-fA-F]{1,64}$/.test(req.worker_agent_id)
+            || !/^[0-9a-f-]{36}$/i.test(req.run_id)
+            || !/^mwr1\.[0-9a-f-]{36}\.[0-9a-f-]{36}$/i.test(req.credential)
+            || Buffer.byteLength(JSON.stringify(req.request)) > 64 * 1024) {
+            throw new BridgeError("invalid worker room-history request", 400, "invalid_request");
+        }
+        const { delegates, verifier, delegateDefaults } = this.opts;
+        if (!delegates || !verifier || !delegateDefaults?.serverUrl) {
+            throw new BridgeError("encrypted action-worker keys are unavailable", 503, "delegate_store_unavailable");
+        }
+        const ref = req.key_ref.slice(DELEGATE_REF_PREFIX.length);
+        const opened = await delegates.open(req.account_id, ref);
+        if (opened.delegateClass !== "action_worker"
+            || normalizeObjectId(opened.agentObjectId) !== normalizeObjectId(req.worker_agent_id)) {
+            throw new BridgeError("credential is not bound to this action_worker", 403, "delegate_mismatch");
+        }
+        await verifier.verify({
+            seedHex: opened.seedHex,
+            serverUrl: delegateDefaults.serverUrl,
+            accountId: req.account_id,
+            agentObjectId: opened.agentObjectId,
+            needs: CAP_MYDATA_READ | CAP_MESSAGE_READ,
+            delegateClass: "action_worker",
+        });
+        const agent: ResolvedAgentKey = {
+            key: opened.seedHex,
+            accountId: req.account_id,
+            serverUrl: delegateDefaults.serverUrl,
+            namespace: delegateDefaults.namespace,
+        };
+        const contextUrl = `${agent.serverUrl.replace(/\/+$/, "")}/internal/mcp/work-worker-context`;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.opts.requestTimeoutMs);
+        const signer = new LocalEd25519Signer("development-file", req.key_ref, Buffer.from(opened.seedHex, "hex"));
+        try {
+            const contextResponse = await this.fetchImpl(contextUrl, {
+                method: "POST",
+                headers: {
+                    "x-internal-sync-secret": this.opts.internalSyncSecret,
+                    "x-work-run-credential": req.credential,
+                },
+                redirect: "error",
+                signal: controller.signal,
+            });
+            if (!contextResponse.ok) throw new BridgeError("Memory rejected the room-history worker credential", contextResponse.status, "work_credential_rejected");
+            const context = await contextResponse.json() as Record<string, unknown>;
+            if (context.runId !== req.run_id
+                || normalizeObjectId(String(context.accountId)) !== normalizeObjectId(req.account_id)
+                || normalizeObjectId(String(context.parentAgentId)) !== normalizeObjectId(req.parent_agent_id)
+                || normalizeObjectId(String(context.workerAgentId)) !== normalizeObjectId(opened.agentObjectId)
+                || context.delegateRef !== ref
+                || context.allowRoomHistory !== true
+                || context.cancelRequestedAt !== null
+                || !Number.isSafeInteger(context.workerCapabilities)
+                || !((context.workerCapabilities as number) & CAP_MESSAGE_READ)) {
+                throw new BridgeError("room-history run consent or live worker authority is missing", 403, "room_history_consent_required");
+            }
+            const gateway = new SponsoredSocialGateway({
+                signer,
+                accountId: req.account_id,
+                serverUrl: agent.serverUrl,
+                messagingRelayerUrl: this.opts.messagingRelayerUrl,
+            });
+            return req.tool_name === "messaging_get_room_attachment"
+                ? await gateway.getRoomAttachment(req.request as never)
+                : await gateway.getRoomHistory(req.request as never);
+        } catch (err) {
+            if (err instanceof BridgeError) throw err;
+            throw new BridgeError("encrypted room history could not be read", 502, "room_history_unavailable");
+        } finally {
+            clearTimeout(timer);
+            signer.destroy();
+        }
+    }
+
+    /** Run native room administration with an owner-matched delegated signer. */
+    async roomManagement(req: RoomManagementRequest): Promise<unknown> {
+        return this.roomTool({
+            key_ref: req.key_ref,
+            account_id: req.account_id,
+            agent_object_id: req.agent_object_id,
+            tool_name: req.operation === "archive" ? "messaging_archive_group" : "messaging_set_room_name",
+            arguments: req.operation === "archive"
+                ? { ...req.request, ownerConfirmation: req.request.ownerConfirmation }
+                : req.request,
+        });
+    }
+
+    /** Execute a caller-selected room tool only through the signed, permission-checking MCP gateway. */
+    async roomTool(req: RoomToolRequest): Promise<unknown> {
+        if (!this.opts.messagingRelayerUrl || !this.opts.delegates || !this.opts.verifier || !this.opts.delegateDefaults?.serverUrl) {
+            throw new BridgeError("room messaging is not configured", 503, "room_tool_unavailable");
+        }
+        if (!/^delegate:[A-Za-z0-9._-]{1,64}$/.test(req.key_ref)
+            || !/^0x[0-9a-fA-F]{1,64}$/.test(req.account_id)
+            || !/^0x[0-9a-fA-F]{1,64}$/.test(req.agent_object_id)
+            || !Object.hasOwn(ROOM_TOOL_METHODS, req.tool_name)
+            || Buffer.byteLength(JSON.stringify(req.arguments)) > (req.tool_name === "messaging_send_room_message" ? 72 * 1024 * 1024 : 128 * 1024)) {
+            throw new BridgeError("invalid room tool request", 400, "invalid_request");
+        }
+        const ref = req.key_ref.slice(DELEGATE_REF_PREFIX.length);
+        const opened = await this.opts.delegates.open(req.account_id, ref);
+        const authorizedActionIds = ROOM_ADMIN_TOOLS.has(req.tool_name)
+            ? ["messaging.create_group.v1"]
+            : req.tool_name === "messaging_get_room_history" || ROOM_READ_TOOLS.has(req.tool_name)
+                ? ["messaging.send_message.v1", "messaging.create_group.v1"]
+                : ["messaging.send_message.v1"];
+        if (opened.delegateClass !== "action_worker"
+            || normalizeObjectId(opened.agentObjectId) !== normalizeObjectId(req.agent_object_id)
+            || !authorizedActionIds.some((actionId) => opened.allowedActionIds.includes(actionId))) {
+            throw new BridgeError("no explicitly authorized room action-worker delegate is available", 403, "delegate_mismatch");
+        }
+        const needs = ROOM_READ_TOOLS.has(req.tool_name) ? CAP_MESSAGE_READ : CAP_MESSAGE_SEND;
+        await this.opts.verifier.verify({
+            seedHex: opened.seedHex,
+            serverUrl: this.opts.delegateDefaults.serverUrl,
+            accountId: req.account_id,
+            agentObjectId: opened.agentObjectId,
+            needs,
+            delegateClass: "action_worker",
+        });
+        const signer = new LocalEd25519Signer("development-file", req.key_ref, Buffer.from(opened.seedHex, "hex"));
+        try {
+            const gateway = new SponsoredSocialGateway({
+                signer,
+                accountId: req.account_id,
+                serverUrl: this.opts.delegateDefaults.serverUrl,
+                messagingRelayerUrl: this.opts.messagingRelayerUrl,
+            });
+            const methodName = ROOM_TOOL_METHODS[req.tool_name]!;
+            const method = (gateway as unknown as Record<string, unknown>)[methodName];
+            if (typeof method !== "function") throw new BridgeError("room tool is unavailable in this MCP build", 503, "room_tool_unavailable");
+            const arguments_ = req.tool_name === "messaging_add_reaction" || req.tool_name === "messaging_remove_reaction"
+                ? { ...req.arguments, add: req.tool_name === "messaging_add_reaction" }
+                : req.arguments;
+            return await (method as (input: Record<string, unknown>) => Promise<unknown>).call(gateway, arguments_);
+        } catch (error) {
+            if (error instanceof BridgeError) throw error;
+            const status = error && typeof error === "object" && "status" in error && typeof error.status === "number" ? error.status : 502;
+            const message = error instanceof Error ? error.message : "room tool failed";
+            throw new BridgeError(message, status >= 400 && status < 600 ? status : 502, "room_tool_failed");
+        } finally {
+            signer.destroy();
+        }
+    }
+
+    /** Dispatch one durable harness turn using a just-in-time run credential. */
+    async workRunDispatch(req: WorkRunDispatchRequest): Promise<unknown> {
+        if (!this.opts.workDispatchUrl || !this.opts.workDispatchSecret || !this.opts.internalSyncSecret) {
+            throw new BridgeError("durable work dispatch is not configured", 503, "work_dispatch_unavailable");
+        }
+        if (!this.opts.delegates || !this.opts.verifier || !this.opts.delegateDefaults?.serverUrl
+            || !/^delegate:[A-Za-z0-9._-]{1,64}$/.test(req.key_ref)
+            || !/^0x[0-9a-fA-F]{1,64}$/.test(req.account_id)
+            || !/^0x[0-9a-fA-F]{1,64}$/.test(req.parent_agent_id)
+            || !/^[0-9a-f-]{36}$/i.test(req.run_id)
+            || !/^[0-9a-f-]{36}$/i.test(req.dispatch_id)
+            || Buffer.byteLength(JSON.stringify(req.turn)) > 32 * 1024) {
+            throw new BridgeError("invalid durable work dispatch", 400, "invalid_request");
+        }
+        const delegateRef = req.key_ref.slice(DELEGATE_REF_PREFIX.length);
+        const opened = await this.opts.delegates.open(req.account_id, delegateRef);
+        if (opened.delegateClass !== "action_worker") throw new BridgeError("durable harness runs require an action_worker delegate", 403, "delegate_class_mismatch");
+        await this.opts.verifier.verify({
+            seedHex: opened.seedHex,
+            serverUrl: this.opts.delegateDefaults.serverUrl,
+            accountId: req.account_id,
+            agentObjectId: opened.agentObjectId,
+            needs: CAP_MYDATA_READ,
+            delegateClass: "action_worker",
+        });
+        const agent: ResolvedAgentKey = {
+            key: opened.seedHex,
+            accountId: req.account_id,
+            serverUrl: this.opts.delegateDefaults.serverUrl,
+            namespace: this.opts.delegateDefaults.namespace,
+        };
+        const client = this.client(agent, req.key_ref, agent.namespace);
+        const issueUrl = `${agent.serverUrl.replace(/\/+$/, "")}/internal/mcp/work-worker-credential/issue`;
+        const revokeUrl = `${agent.serverUrl.replace(/\/+$/, "")}/internal/mcp/work-worker-credential/revoke`;
+        const appUrl = `${this.opts.workDispatchUrl.replace(/\/+$/, "")}/api/myso/internal/work/runs/${req.run_id}/turn`;
+        return client.withMyDataSession(async (session) => {
+            const issueResponse = await this.fetchImpl(issueUrl, {
+                method: "POST", redirect: "error",
+                headers: { "content-type": "application/json", "x-internal-sync-secret": this.opts.internalSyncSecret!, "x-mydata-session": session },
+                body: JSON.stringify({ accountId: req.account_id, parentAgentId: req.parent_agent_id, runId: req.run_id, delegateRef, ttlSeconds: 1800,
+                    allowPrivateGraph: req.turn.allowPrivateGraph === true,
+                    allowRoomHistory: req.turn.allowRoomHistory === true,
+                    allowPrivateTaskArtifacts: req.turn.allowPrivateTaskArtifacts === true,
+                    allowPrivateContentSharing: req.turn.allowPrivateContentSharing === true }),
+                signal: AbortSignal.timeout(this.opts.requestTimeoutMs),
+            });
+            if (!issueResponse.ok) throw new BridgeError(`Memory refused run credential issuance (${issueResponse.status})`, issueResponse.status, "work_credential_issue_failed");
+            const issued = await issueResponse.json() as { credential?: unknown; workerAgentId?: unknown; runId?: unknown };
+            if (typeof issued.credential !== "string" || !/^mwr1\.[0-9a-f-]{36}\.[0-9a-f-]{36}$/i.test(issued.credential)
+                || typeof issued.workerAgentId !== "string" || normalizeObjectId(issued.workerAgentId) !== normalizeObjectId(opened.agentObjectId)
+                || issued.runId !== req.run_id) throw new BridgeError("Memory returned a mismatched run credential", 502, "work_credential_issue_failed");
+            const dispatchController = new AbortController();
+            // One sidecar request owns one resumable model slice. The automation worker
+            // dispatches continuations as separate calls under its durable delivery lease.
+            // Keep this deadline shorter than the credential's 30-minute lifetime.
+            const dispatchTimer = setTimeout(() => dispatchController.abort(), 25 * 60 * 1000);
+            try {
+                const worker = { keyRef: req.key_ref, accountId: req.account_id, parentAgentId: req.parent_agent_id, workerAgentId: opened.agentObjectId, runId: req.run_id, credential: issued.credential };
+                const maxModelTurns = req.turn.maxModelTurns;
+                if (typeof maxModelTurns !== "number" || !Number.isInteger(maxModelTurns) || maxModelTurns < 1 || maxModelTurns > 100) {
+                    throw new BridgeError("Work-run model-turn limit is invalid", 400, "invalid_work_run_turn");
+                }
+                const turn = { ...req.turn, maxModelTurns: 1, requestId: req.dispatch_id, continueRun: req.turn.continueRun === true };
+                let delayMs = 5_000;
+                while (!dispatchController.signal.aborted) {
+                    let response: Response;
+                    try {
+                        response = await this.fetchImpl(appUrl, {
+                            method: "POST", redirect: "error",
+                            headers: { "content-type": "application/json", "x-myso-worker-secret": this.opts.workDispatchSecret! },
+                            body: JSON.stringify({ worker, turn }),
+                            signal: dispatchController.signal,
+                        });
+                    } catch (error) {
+                        if (dispatchController.signal.aborted) throw error;
+                        // A lost connection does not tell us whether the app completed the turn.
+                        // Reissue the same idempotent request so its fenced journal can replay or resume it.
+                        await new Promise((resolve) => setTimeout(resolve, delayMs));
+                        delayMs = Math.min(delayMs * 2, 60_000);
+                        continue;
+                    }
+                    if (response.status === 202) {
+                        const retryAfter = Number(response.headers.get("retry-after"));
+                        await response.body?.cancel().catch(() => undefined);
+                        await new Promise((resolve) => setTimeout(resolve, Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 60_000) : delayMs));
+                        continue;
+                    }
+                    if (response.status >= 500) {
+                        await response.body?.cancel().catch(() => undefined);
+                        await new Promise((resolve) => setTimeout(resolve, delayMs));
+                        delayMs = Math.min(delayMs * 2, 60_000);
+                        continue;
+                    }
+                    if (response.status === 409) {
+                        const text = await response.text();
+                        let message = "";
+                        try { message = String((JSON.parse(text) as { error?: unknown }).error ?? ""); } catch { /* Preserve the generic conflict below. */ }
+                        if (message.includes("work turn is busy, expired or requires reconciliation")) {
+                            await new Promise((resolve) => setTimeout(resolve, delayMs));
+                            delayMs = Math.min(delayMs * 2, 60_000);
+                            continue;
+                        }
+                        throw new BridgeError(`MySo Agents could not safely resume the durable run (${response.status})`, response.status, "work_dispatch_reconciliation_required");
+                    }
+                    if (!response.ok) throw new BridgeError(`MySo Agents rejected the durable run turn (${response.status})`, response.status, response.status === 401 || response.status === 403 ? "work_dispatch_rejected" : "work_dispatch_failed");
+                    const text = await response.text();
+                    if (Buffer.byteLength(text) > 2 * 1024 * 1024) throw new BridgeError("MySo Agents work response exceeds 2 MiB", 502, "payload_too_large");
+                    return JSON.parse(text) as unknown;
+                }
+                throw new BridgeError("durable work turn exceeded its credential window", 504, "work_dispatch_timeout");
+            } finally {
+                clearTimeout(dispatchTimer);
+                const revokeResponse = await this.fetchImpl(revokeUrl, {
+                    method: "POST", redirect: "error",
+                    headers: { "content-type": "application/json", "x-internal-sync-secret": this.opts.internalSyncSecret!, "x-mydata-session": session },
+                    body: JSON.stringify({ accountId: req.account_id, parentAgentId: req.parent_agent_id, runId: req.run_id }),
+                    signal: AbortSignal.timeout(this.opts.requestTimeoutMs),
+                }).catch(() => undefined);
+                if (!revokeResponse?.ok) console.warn("run credential revocation could not be confirmed; the credential will expire automatically");
+            }
+        });
     }
 
     /**

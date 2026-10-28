@@ -104,7 +104,7 @@ impl RateLimitConfig {
 
 /// Get the cost weight for a given API path.
 ///
-/// Expensive endpoints (embedding + encrypt + File Storage upload + LLM)
+/// Expensive endpoints (embedding + encrypt + R2 storage + LLM)
 /// consume more of the rate limit budget than cheap read endpoints.
 ///
 /// MED-20 (full fix):
@@ -124,8 +124,9 @@ fn endpoint_weight(path: &str) -> i64 {
 
     match path {
         "/api/analyze" => 5,         // LLM extract + N × (1 pt per fact)
-        "/api/remember" => 5,        // embed + MYDATA encrypt + File Storage upload
-        "/api/remember/manual" => 3, // File Storage upload only (client did embed/encrypt)
+        "/api/remember" => 5,        // embed + MYDATA encrypt + R2 storage
+        "/api/remember/manual" => 3, // R2 storage only (client did embed/encrypt)
+        "/api/messaging/attachments/upload" => 3, // private R2 ciphertext write
         "/api/restore" => 3,         // download + decrypt + re-embed
         "/api/ask" => 2,             // recall + LLM
         "/api/social/post" => 3,

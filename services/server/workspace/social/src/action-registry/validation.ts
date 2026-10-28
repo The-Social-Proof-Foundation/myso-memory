@@ -18,6 +18,17 @@ function validateProperty(
     value: unknown,
     schema: JsonPropertySchema,
 ): SocialActionValidationIssue[] {
+    if(schema.type==="object"){
+        if(!isPlainObject(value))return [{code:"invalid_object",path,message:`${path} must be a plain JSON object`}];
+        const issues:SocialActionValidationIssue[]=[];
+        for(const key of schema.required)if(!Object.hasOwn(value,key))issues.push({code:"required",path:`${path}.${key}`,message:`${key} is required`});
+        for(const [key,item] of Object.entries(value)){
+            const property=schema.properties[key];
+            if(!Object.hasOwn(schema.properties,key)||!property)issues.push({code:"additional_property",path:`${path}.${key}`,message:`${key} is not accepted for this action`});
+            else issues.push(...validateProperty(`${path}.${key}`,item,property));
+        }
+        return issues;
+    }
     if (schema.type === "string") {
         if (typeof value !== "string") {
             return [{ code: "invalid_type", path, message: `${path} must be a string` }];

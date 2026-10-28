@@ -1,16 +1,31 @@
+import {buildOwnerRevokeAgentTx,buildOwnerGrantCapabilityTx,buildOwnerRevokeCapabilityTx,buildOwnerRaiseSpendingLimitTx,buildOwnerLowerSpendingLimitTx,validateOwnerAgentIdentity,validateOwnerGrantCapability,validateOwnerRevokeCapability,validateOwnerRaiseLimit,validateOwnerLowerLimit} from "../ptb/owner-agents.js";
+import { buildSendTokenTx, validateSendToken, buildTipPostTx, validateTipPost } from "../ptb/payments.js";
+import { buildAcceptBeneficiaryTransferTx, buildClaimCreatorVaultTx, validateAcceptBeneficiaryTransfer, validateClaimCreatorVault } from "../ptb/poc.js";
+import { buildClaimSpotPayoutTx, validateClaimSpotPayout, buildPlaceSpotBetTx, validatePlaceSpotBet, buildCreateSpotMarketTx, validateCreateSpotMarket } from "../ptb/spot.js";
+import { buildSubscribeToPlanTx, buildRenewSubscriptionTx, buildCancelSubscriptionTx, buildEnableAutoRenewTx, buildDisableAutoRenewTx, buildChangeServicePaymentRecipientTx, validateSubscribeToPlan, validateRenewSubscription, validateCancelSubscription, validateSubscriptionRenewalPreference, validateChangeServicePaymentRecipient } from "../ptb/subscription.js";
+import { buildShareMyDataTx, buildRevokeMyDataShareTx, validateShareMyData, validateRevokeMyDataShare } from "../ptb/mydata-owner.js";
+import { buildPublishMyDataGraphTx, validatePublishMyDataGraph, buildPurchaseMyDataAccessTx, validatePurchaseMyDataAccess, buildPurchasePostAccessTx, validatePurchasePostAccess } from "../ptb/mydata.js";
+import { buildGovernanceVoteTx, validateGovernanceVote, buildGovernanceDelegateVoteTx, validateGovernanceDelegateVote } from "../ptb/governance.js";
+import { buildTransferOwnedObjectTx, validateTransferOwnedObject, buildBurnZeroCoinTx, validateBurnZeroCoin } from "../ptb/assets.js";
+import { buildDexSwapTx, validateDexSwap } from "../ptb/dex.js";
+import { buildSptBuyTx, buildSptSellTx, validateSptBuy, validateSptSell } from "../ptb/spt.js";
+import { buildPlatformDeveloperTransferTx, buildPlatformFeeRecipientUpdateTx } from "../ptb/platform-admin.js";
+import { buildOwnerRotationActionTx } from "../ptb/owner-rotation.js";
 import {
     CAP_AGENT_REGISTER,
     CAP_AGENT_REVOKE,
+    CAP_BUDGET_MANAGE,
     CAP_AGENT_UPDATE,
     CAP_COMMENT,
     CAP_JURY,
     CAP_NONE,
     CAP_MEMORY_READ,
+    CAP_MYDATA_READ,
     CAP_MESSAGE_SEND,
     CAP_POST_PUBLISH,
     CAP_REACT,
     CAP_SOCIAL_GRAPH,
-    CAP_TASK_TRADE,
+    CAP_TASK_TRADE, CAP_TRADE_EXECUTE,
 } from "../contract.js";
 import {
     buildCreateCommentTx,
@@ -39,6 +54,7 @@ import {
     buildAcceptOrganizationInvitationTx,
     buildAssignOrganizationRoleTx,
     buildCreateMessagingGroupTx,
+    buildBindAgentRoomToTaskTx,
     buildCreateOrganizationInvitationTx,
     buildCreateOrganizationTx,
     buildDeactivateManagedAgentTx,
@@ -46,6 +62,9 @@ import {
     buildDeclineOrganizationInvitationTx,
     buildDefineOrganizationRoleTx,
     buildEnsureOrganizationMemoryGroupTx,
+    buildGrantOrganizationTreasuryAccessTx,
+    buildWithdrawOrganizationTreasuryTx,
+    buildFundOrganizationTreasuryTx,
     buildRegisterChildAgentTx,
     buildRegisterRootAgentTx,
     buildRevokeManagedAgentTx,
@@ -118,6 +137,7 @@ import type {
     SocialActionRequestMetadata,
     SocialActionValidationIssue,
 } from "./types.js";
+import type { OrganizationTreasuryAccessParams, OrganizationTreasuryFundParams, OrganizationTreasuryWithdrawParams, SptBuyParams, SptSellParams } from "../types.js";
 import { createSocialActionValidator } from "./validation.js";
 
 const NON_EMPTY_STRING = Object.freeze({ type: "string", minLength: 1 } as const);
@@ -136,10 +156,26 @@ const STRING_ARRAY = Object.freeze({
     type: "array",
     items: NON_EMPTY_STRING,
 } as const);
+const OWNER_ROTATION_IDS = Object.freeze({
+    type: "array",
+    maxItems: 512,
+    items: Object.freeze({ type: "string", pattern: "^0x[0-9a-fA-F]{1,64}$" }),
+} as const);
+const OWNER_ROTATION_STAGE = Object.freeze({ type: "string", enum: ["propose", "accept", "rollback", "cancel"] } as const);
 const MAX_32_STRINGS = Object.freeze({
     type: "array",
     items: NON_EMPTY_STRING,
     maxItems: 32,
+} as const);
+const SPT_BENEFICIARY_VAULTS = Object.freeze({
+    type: "array",
+    maxItems: 32,
+    items: Object.freeze({
+        type: "object",
+        additionalProperties: false,
+        required: Object.freeze(["vaultId", "minDepositBaseUnits"]),
+        properties: Object.freeze({ vaultId: NON_EMPTY_STRING, minDepositBaseUnits: NON_EMPTY_STRING }),
+    }),
 } as const);
 const ORG_TYPE = Object.freeze({
     type: "integer",
@@ -468,6 +504,21 @@ const createMessagingGroup = defineAction({
     buildTransaction: buildCreateMessagingGroupTx,
 });
 
+const bindAgentRoomToTask = defineAction({
+    id: "messaging.bind_room_to_task.v1",
+    version: 1,
+    legacyAction: "bind_agent_room_to_task",
+    requiredCapability: CAP_MESSAGE_SEND,
+    riskTier: "1B",
+    inputSchema: objectSchema(["groupId", "taskId"], {
+        groupId: NON_EMPTY_STRING,
+        taskId: NON_EMPTY_STRING,
+        platformObjectId: NON_EMPTY_STRING,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildBindAgentRoomToTaskTx,
+});
+
 const createOrganization = defineAction({
     id: "organization.create.v1",
     version: 1,
@@ -539,6 +590,77 @@ const ensureOrganizationMemoryGroup = organizationObjectAction(
     "ensure_organization_memory_group",
     buildEnsureOrganizationMemoryGroupTx,
 );
+
+const grantOrganizationTreasuryAccess = defineAction({
+    id: "organization.grant_treasury_access.v1",
+    version: 1,
+    legacyAction: "grant_organization_treasury_access",
+    requiredCapability: CAP_AGENT_UPDATE,
+    riskTier: "3",
+    inputSchema: objectSchema(["organizationId", "orgMemoryGroupId", "recipient", "hasAccess"], {
+        organizationId: NON_EMPTY_STRING,
+        orgMemoryGroupId: NON_EMPTY_STRING,
+        recipient: NON_EMPTY_STRING,
+        hasAccess: OPTIONAL_BOOLEAN,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildGrantOrganizationTreasuryAccessTx,
+});
+
+const withdrawOrganizationTreasury = defineAction({
+    id: "organization.withdraw_treasury.v1",
+    version: 1,
+    legacyAction: "withdraw_organization_treasury",
+    requiredCapability: CAP_TRADE_EXECUTE,
+    riskTier: "3",
+    inputSchema: objectSchema(["organizationId", "orgMemoryGroupId", "recipient", "amountBaseUnits", "coinType"], {
+        organizationId: NON_EMPTY_STRING,
+        orgMemoryGroupId: NON_EMPTY_STRING,
+        recipient: NON_EMPTY_STRING,
+        amountBaseUnits: NON_EMPTY_STRING,
+        coinType: NON_EMPTY_STRING,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildWithdrawOrganizationTreasuryTx,
+});
+
+const fundOrganizationTreasury = defineAction({
+    id: "organization.fund_treasury.v1",
+    version: 1,
+    legacyAction: "fund_organization_treasury",
+    requiredCapability: CAP_TRADE_EXECUTE,
+    riskTier: "3",
+    inputSchema: objectSchema(["organizationId", "paymentCoinId", "amountBaseUnits", "coinType"], {
+        organizationId: NON_EMPTY_STRING,
+        paymentCoinId: NON_EMPTY_STRING,
+        amountBaseUnits: NON_EMPTY_STRING,
+        coinType: NON_EMPTY_STRING,
+    }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildFundOrganizationTreasuryTx,
+});
+
+const transferPlatform = defineAction({
+    id: "platform.transfer_platform.v1",
+    version: 1,
+    legacyAction: "transfer_platform",
+    requiredCapability: CAP_NONE,
+    riskTier: "3",
+    inputSchema: objectSchema(["platformId", "platformAdminCapId", "newDeveloper"], { platformId: NON_EMPTY_STRING, platformAdminCapId: NON_EMPTY_STRING, newDeveloper: NON_EMPTY_STRING }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildPlatformDeveloperTransferTx,
+});
+
+const updatePlatformFeeRecipient = defineAction({
+    id: "platform.update_fee_recipient.v1",
+    version: 1,
+    legacyAction: "update_fee_recipient",
+    requiredCapability: CAP_NONE,
+    riskTier: "3",
+    inputSchema: objectSchema(["platformAdminCapId", "newRecipient"], { platformAdminCapId: NON_EMPTY_STRING, newRecipient: NON_EMPTY_STRING }),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildPlatformFeeRecipientUpdateTx,
+});
 
 const defineOrganizationRole = defineAction({
     id: "organization.define_role.v1",
@@ -774,6 +896,118 @@ const deleteComment = defineAction({
             context.Transaction,
         ),
 });
+
+const SUBSCRIPTION_TERMS = {type:"object",additionalProperties:false,required:["planId","expectedProfileOwner","coinType","priceBaseUnits","durationMs"],properties:{planId:NON_EMPTY_STRING,expectedProfileOwner:NON_EMPTY_STRING,coinType:NON_EMPTY_STRING,priceBaseUnits:NON_EMPTY_STRING,durationMs:NON_EMPTY_STRING,tierLevel:NON_EMPTY_STRING,planPlatformId:NON_EMPTY_STRING}} as const;
+const OWNER_AGENT_IDENTITY={agentObjectId:NON_EMPTY_STRING,expectedDerivedAddress:NON_EMPTY_STRING,expectedPlatformScope:NON_EMPTY_STRING};
+const OWNER_AGENT_KEYS=["agentObjectId","expectedDerivedAddress","expectedPlatformScope"];
+const ownerRevokeAgent=defineAction({id:"agent.revoke_agent.v1",version:1,legacyAction:"revoke_agent",requiredCapability:CAP_AGENT_REVOKE,riskTier:"3",inputSchema:objectSchema(OWNER_AGENT_KEYS,OWNER_AGENT_IDENTITY),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerRevokeAgentTx},validateOwnerAgentIdentity);
+const ownerGrantCapability=defineAction({id:"agent.grant_capability.v1",version:1,legacyAction:"grant_capability",requiredCapability:CAP_AGENT_UPDATE,riskTier:"3",inputSchema:objectSchema([...OWNER_AGENT_KEYS,"expectedCapabilities","capabilityMask"],{...OWNER_AGENT_IDENTITY,expectedCapabilities:NON_EMPTY_STRING,capabilityMask:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerGrantCapabilityTx},validateOwnerGrantCapability);
+const ownerRevokeCapability=defineAction({id:"agent.revoke_capability.v1",version:1,legacyAction:"revoke_capability",requiredCapability:CAP_AGENT_UPDATE,riskTier:"3",inputSchema:objectSchema([...OWNER_AGENT_KEYS,"expectedCapabilities","capabilityMask"],{...OWNER_AGENT_IDENTITY,expectedCapabilities:NON_EMPTY_STRING,capabilityMask:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerRevokeCapabilityTx},validateOwnerRevokeCapability);
+const ownerRaiseLimit=defineAction({id:"agent.raise_spending_limit.v1",version:1,legacyAction:"raise_spending_limit",requiredCapability:CAP_BUDGET_MANAGE,riskTier:"3",inputSchema:objectSchema([...OWNER_AGENT_KEYS,"expectedLimitMist","newLimitMist"],{...OWNER_AGENT_IDENTITY,expectedLimitMist:NON_EMPTY_STRING,newLimitMist:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerRaiseSpendingLimitTx},validateOwnerRaiseLimit);
+const ownerLowerLimit=defineAction({id:"agent.lower_spending_limit.v1",version:1,legacyAction:"lower_spending_limit",requiredCapability:CAP_BUDGET_MANAGE,riskTier:"3",inputSchema:objectSchema([...OWNER_AGENT_KEYS,"expectedLimitMist","newLimitMist"],{...OWNER_AGENT_IDENTITY,expectedLimitMist:NON_EMPTY_STRING,newLimitMist:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerLowerSpendingLimitTx},validateOwnerLowerLimit);
+const rotateOwnerKey=defineAction({id:"account.rotate_owner_key.v1",version:1,legacyAction:"rotate_owner_key",requiredCapability:CAP_NONE,riskTier:"3",inputSchema:objectSchema([], {stage:OWNER_ROTATION_STAGE,profileId:NON_EMPTY_STRING,newOwner:NON_EMPTY_STRING,agentObjectIds:OWNER_ROTATION_IDS,organizationObjectIds:OWNER_ROTATION_IDS,finalize:{type:"boolean"}}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:(context,input)=>{
+    const memoryRegistryId=context.chain.memoryRegistryId;
+    if (!memoryRegistryId) throw new TypeError("SOCIAL_MEMORY_REGISTRY_ID must be configured for owner migration");
+    return buildOwnerRotationActionTx({...context,memoryRegistryId},input);
+}}, input => {
+    const fields = input as unknown as Record<string, unknown>;
+    const stage = (fields.stage ?? "propose") as "propose" | "accept" | "rollback" | "cancel";
+    const allowed = stage === "propose" ? ["stage", "profileId", "newOwner", "agentObjectIds", "organizationObjectIds"]
+        : stage === "accept" ? ["stage", "profileId", "newOwner", "agentObjectIds", "organizationObjectIds", "finalize"]
+        : stage === "rollback" ? ["stage", "newOwner", "agentObjectIds", "organizationObjectIds"] : ["stage"];
+    if (!["propose", "accept", "rollback", "cancel"].includes(stage) || Object.keys(fields).some(key => !allowed.includes(key))) throw new TypeError(`Fields do not match owner migration stage ${stage}`);
+    const agentIds = fields.agentObjectIds;
+    const organizationIds = fields.organizationObjectIds;
+    if (stage === "propose") {
+        if (typeof fields.profileId !== "string" || typeof fields.newOwner !== "string" || !Array.isArray(agentIds) || !Array.isArray(organizationIds)) throw new TypeError("Proposal requires profileId, newOwner, and complete agent and organization manifests");
+        if (agentIds.length > 512 || organizationIds.length > 512) throw new TypeError("Owner migration manifest is too large");
+    } else if (stage === "accept") {
+        if (typeof fields.profileId !== "string" || typeof fields.newOwner !== "string" || typeof fields.finalize !== "boolean" || !Array.isArray(agentIds) || !Array.isArray(organizationIds)) throw new TypeError("Acceptance requires profileId, newOwner, bounded reference arrays, and finalize");
+        if (agentIds.length + organizationIds.length > 6 || (!fields.finalize && agentIds.length + organizationIds.length === 0)) throw new TypeError("Acceptance must update at most six references; only a finalization batch may be empty");
+    } else if (stage === "rollback") {
+        if (typeof fields.newOwner !== "string" || !Array.isArray(agentIds) || !Array.isArray(organizationIds) || agentIds.length + organizationIds.length < 1 || agentIds.length + organizationIds.length > 6) throw new TypeError("Rollback requires newOwner and between one and six references");
+    }
+});
+const sendToken=defineAction({id:"payments.send_token.v1",version:1,legacyAction:"send_token",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["paymentCoinId","recipient","coinType","amountBaseUnits"],{paymentCoinId:NON_EMPTY_STRING,recipient:NON_EMPTY_STRING,coinType:NON_EMPTY_STRING,amountBaseUnits:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildSendTokenTx},validateSendToken);
+const governanceVote=defineAction({id:"governance.vote.v1",version:1,legacyAction:"governance_vote",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["registryId","proposalId","paymentCoinId","voteCount","approve"],{registryId:NON_EMPTY_STRING,proposalId:NON_EMPTY_STRING,paymentCoinId:NON_EMPTY_STRING,voteCount:NON_EMPTY_STRING,approve:{type:"boolean"}}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildGovernanceVoteTx},validateGovernanceVote);
+const governanceDelegateVote=defineAction({id:"governance.delegate_vote.v1",version:1,legacyAction:"governance_delegate_vote",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"3",inputSchema:objectSchema(["registryId","proposalId","route","approve"],{registryId:NON_EMPTY_STRING,proposalId:NON_EMPTY_STRING,route:NON_EMPTY_STRING,approve:{type:"boolean"},reason:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildGovernanceDelegateVoteTx},validateGovernanceDelegateVote);
+const transferOwnedObject=defineAction({id:"assets.transfer_object.v1",version:1,legacyAction:"transfer_object",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"3",inputSchema:objectSchema(["objectId","recipient","objectType"],{objectId:NON_EMPTY_STRING,recipient:NON_EMPTY_STRING,objectType:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildTransferOwnedObjectTx},validateTransferOwnedObject);
+const burnZeroCoin=defineAction({id:"assets.burn_object.v1",version:1,legacyAction:"burn_object",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"3",inputSchema:objectSchema(["coinObjectId","coinType"],{coinObjectId:NON_EMPTY_STRING,coinType:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildBurnZeroCoinTx},validateBurnZeroCoin);
+const claimCreatorVault=defineAction({id:"poc.claim_creator_vault.v1",version:1,legacyAction:"claim_creator_vault",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"3",inputSchema:objectSchema(["vaultId","coinType"],{vaultId:NON_EMPTY_STRING,coinType:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildClaimCreatorVaultTx},validateClaimCreatorVault);
+const claimSpotPayout=defineAction({id:"spot.claim_payout.v1",version:1,legacyAction:"claim_spot_payout",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"3",inputSchema:objectSchema(["marketId","postId"],{marketId:NON_EMPTY_STRING,postId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildClaimSpotPayoutTx},validateClaimSpotPayout);
+const placeSpotBet=defineAction({id:"spot.place_bet.v1",version:1,legacyAction:"place_spot_bet",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["marketId","postId","paymentCoinId","amountBaseUnits","optionId"],{marketId:NON_EMPTY_STRING,postId:NON_EMPTY_STRING,paymentCoinId:NON_EMPTY_STRING,amountBaseUnits:NON_EMPTY_STRING,optionId:{type:"integer",minimum:0,maximum:255},referrerPostId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildPlaceSpotBetTx},validatePlaceSpotBet);
+const createSpotMarket=defineAction({id:"spot.create_market.v1",version:1,legacyAction:"create_spot_market",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"3",inputSchema:objectSchema(["postId","spotOracleAdminCapId","semanticClaimHashHex","marketKeyHashHex","resolutionPolicyHashHex","bettingOptions","resolutionAtMs"],{postId:NON_EMPTY_STRING,spotOracleAdminCapId:NON_EMPTY_STRING,semanticClaimHashHex:NON_EMPTY_STRING,marketKeyHashHex:NON_EMPTY_STRING,resolutionPolicyHashHex:NON_EMPTY_STRING,bettingOptions:{type:"array",maxItems:16,items:{type:"string",minLength:1}},resolutionAtMs:NON_EMPTY_STRING,maxResolutionWindowMs:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildCreateSpotMarketTx},validateCreateSpotMarket);
+const dexSwap=defineAction({id:"dex.swap.v1",version:1,legacyAction:"dex_swap",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["poolId","poolName","orderbookPackageId","baseAssetType","quoteAssetType","direction","inputCoinId","amountInBaseUnits","minAmountOutBaseUnits","recipientAddress"],{poolId:NON_EMPTY_STRING,poolName:NON_EMPTY_STRING,orderbookPackageId:NON_EMPTY_STRING,baseAssetType:NON_EMPTY_STRING,quoteAssetType:NON_EMPTY_STRING,direction:{type:"string",enum:["sell_base","buy_base"]},inputCoinId:NON_EMPTY_STRING,amountInBaseUnits:NON_EMPTY_STRING,minAmountOutBaseUnits:NON_EMPTY_STRING,recipientAddress:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildDexSwapTx},validateDexSwap);
+const sptBuy=defineAction({id:"spt.buy.v1",version:1,legacyAction:"spt_buy",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["poolId","paymentCoinId","paymentAmountBaseUnits","minTokensBaseUnits","beneficiaryVaults"],{poolId:NON_EMPTY_STRING,paymentCoinId:NON_EMPTY_STRING,paymentAmountBaseUnits:NON_EMPTY_STRING,minTokensBaseUnits:NON_EMPTY_STRING,beneficiaryVaults:SPT_BENEFICIARY_VAULTS}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildSptBuyTx},validateSptBuy);
+const sptSell=defineAction({id:"spt.sell.v1",version:1,legacyAction:"spt_sell",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["poolId","tokenObjectId","amountBaseUnits","minReceiveBaseUnits","beneficiaryVaults"],{poolId:NON_EMPTY_STRING,tokenObjectId:NON_EMPTY_STRING,amountBaseUnits:NON_EMPTY_STRING,minReceiveBaseUnits:NON_EMPTY_STRING,beneficiaryVaults:SPT_BENEFICIARY_VAULTS}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildSptSellTx},validateSptSell);
+const tipPost=defineAction({id:"payments.tip_post.v1",version:1,legacyAction:"tip_post",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["postId","paymentCoinId","coinType","amountBaseUnits","mode"],{postId:NON_EMPTY_STRING,paymentCoinId:NON_EMPTY_STRING,coinType:NON_EMPTY_STRING,amountBaseUnits:NON_EMPTY_STRING,mode:NON_EMPTY_STRING,beneficiaryVaultId:NON_EMPTY_STRING,minVaultDepositAmount:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildTipPostTx},validateTipPost);
+const acceptBeneficiaryTransfer=defineAction({id:"poc.accept_beneficiary_transfer.v1",version:1,legacyAction:"accept_beneficiary_transfer",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["beneficiaryId"],{beneficiaryId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildAcceptBeneficiaryTransferTx},validateAcceptBeneficiaryTransfer);
+const subscribeToPlan=defineAction({id:"subscription.subscribe_to_plan.v1",version:1,legacyAction:"subscribe_to_plan",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["serviceId","paymentCoinId","terms","autoRenew","renewalPeriods"],{serviceId:NON_EMPTY_STRING,paymentCoinId:NON_EMPTY_STRING,terms:SUBSCRIPTION_TERMS,autoRenew:{type:"boolean"},renewalPeriods:NON_EMPTY_STRING,platformObjectId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildSubscribeToPlanTx},validateSubscribeToPlan);
+const renewSubscription=defineAction({id:"subscription.renew_subscription.v1",version:1,legacyAction:"renew_subscription",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["serviceId","subscriptionId","paymentCoinId","terms"],{serviceId:NON_EMPTY_STRING,subscriptionId:NON_EMPTY_STRING,paymentCoinId:NON_EMPTY_STRING,terms:SUBSCRIPTION_TERMS,platformObjectId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildRenewSubscriptionTx},validateRenewSubscription);
+const cancelSubscription=defineAction({id:"subscription.cancel_subscription.v1",version:1,legacyAction:"cancel_subscription",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["serviceId","subscriptionId","coinType"],{serviceId:NON_EMPTY_STRING,subscriptionId:NON_EMPTY_STRING,coinType:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildCancelSubscriptionTx},validateCancelSubscription);
+const enableAutoRenew=defineAction({id:"subscription.enable_auto_renew.v1",version:1,legacyAction:"enable_auto_renew",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["serviceId","subscriptionId"],{serviceId:NON_EMPTY_STRING,subscriptionId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildEnableAutoRenewTx},validateSubscriptionRenewalPreference);
+const disableAutoRenew=defineAction({id:"subscription.disable_auto_renew.v1",version:1,legacyAction:"disable_auto_renew",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"2",inputSchema:objectSchema(["serviceId","subscriptionId"],{serviceId:NON_EMPTY_STRING,subscriptionId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildDisableAutoRenewTx},validateSubscriptionRenewalPreference);
+const changeServicePaymentRecipient=defineAction({id:"subscription.change_service_payment_recipient.v1",version:1,legacyAction:"change_service_payment_recipient",requiredCapability:CAP_TRADE_EXECUTE,riskTier:"3",inputSchema:objectSchema(["serviceId","newRecipient"],{serviceId:NON_EMPTY_STRING,newRecipient:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildChangeServicePaymentRecipientTx},validateChangeServicePaymentRecipient);
+
+const purchaseMyDataAccess = defineAction({
+    id: "access.purchase_mydata_access.v1",
+    version: 1,
+    legacyAction: "purchase_mydata_access",
+    requiredCapability: CAP_MYDATA_READ,
+    riskTier: "1B",
+    inputSchema: objectSchema(
+        ["mydataId", "paymentCoinId", "expectedSeller", "accessKind", "audienceKind", "priceMist", "durationDays", "encryptionIdHex", "encryptedDataDigestHex"],
+        {
+            mydataId: NON_EMPTY_STRING, paymentCoinId: NON_EMPTY_STRING, expectedSeller: NON_EMPTY_STRING,
+            accessKind: { type: "integer", enum: [2, 3] }, audienceKind: { type: "string", enum: ["agent", "organization"] }, priceMist: NON_EMPTY_STRING, durationDays: NON_EMPTY_STRING,
+            encryptionIdHex: NON_EMPTY_STRING, encryptedDataDigestHex: NON_EMPTY_STRING,
+            expectedListingPlatformId: NON_EMPTY_STRING, platformObjectId: NON_EMPTY_STRING,
+            organizationAudienceId: NON_EMPTY_STRING,
+            graphId: NON_EMPTY_STRING, graphVersion: NON_EMPTY_STRING,
+            manifestHashHex: NON_EMPTY_STRING, publicationSignatureHex: NON_EMPTY_STRING,
+        },
+    ),
+    idempotency: IDEMPOTENCY_POLICY,
+    buildTransaction: buildPurchaseMyDataAccessTx,
+}, validatePurchaseMyDataAccess);
+
+const publishMyDataGraph = defineAction({
+    id: "access.publish_mydata_graph.v1", version: 1, legacyAction: "publish_mydata_graph",
+    requiredCapability: CAP_MYDATA_READ, riskTier: "1B",
+    inputSchema: objectSchema(
+        ["mediaType", "tags", "timestampStart", "encryptedDataHex", "encryptionIdHex", "accessKind", "priceMist", "durationDays"],
+        { mediaType: { type: "string", const: "application/vnd.mysocial.graph-manifest+json;version=1" },
+          tags: { type: "array", minItems: 1, maxItems: 10, items: { type: "string", maxLength: 64 } },
+          timestampStart: NON_EMPTY_STRING, encryptedDataHex: NON_EMPTY_STRING, encryptionIdHex: NON_EMPTY_STRING,
+          accessKind: { type: "integer", enum: [2, 3] }, priceMist: NON_EMPTY_STRING, durationDays: NON_EMPTY_STRING,
+          platformObjectId: NON_EMPTY_STRING },
+    ),
+    idempotency: IDEMPOTENCY_POLICY, buildTransaction: buildPublishMyDataGraphTx,
+}, validatePublishMyDataGraph);
+
+const purchasePostAccess = defineAction({
+    id: "access.purchase_post_access.v1", version: 1, legacyAction: "purchase_post_access",
+    requiredCapability: CAP_MYDATA_READ, riskTier: "1B",
+    inputSchema: objectSchema(
+        ["postId", "mydataId", "paymentCoinId", "expectedSeller", "priceMist", "encryptionIdHex", "encryptedDataDigestHex"],
+        { postId: NON_EMPTY_STRING, mydataId: NON_EMPTY_STRING, paymentCoinId: NON_EMPTY_STRING,
+          expectedSeller: NON_EMPTY_STRING, priceMist: NON_EMPTY_STRING, encryptionIdHex: NON_EMPTY_STRING,
+          encryptedDataDigestHex: NON_EMPTY_STRING, expectedListingPlatformId: NON_EMPTY_STRING,
+          platformObjectId: NON_EMPTY_STRING },
+    ),
+    idempotency: IDEMPOTENCY_POLICY, buildTransaction: buildPurchasePostAccessTx,
+}, validatePurchasePostAccess);
+
+const shareMyData = defineAction({
+    id:"access.share_mydata.v1",version:1,legacyAction:"share_mydata",requiredCapability:CAP_MYDATA_READ,riskTier:"2",
+    inputSchema:objectSchema(["mydataId","recipient","accessType"],{mydataId:NON_EMPTY_STRING,recipient:NON_EMPTY_STRING,accessType:{type:"integer",enum:[0,1]},subscriptionDays:NON_EMPTY_STRING}),
+    idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildShareMyDataTx,
+},validateShareMyData);
+const revokeMyDataShare = defineAction({
+    id:"access.revoke_mydata_share.v1",version:1,legacyAction:"revoke_mydata_share",requiredCapability:CAP_MYDATA_READ,riskTier:"2",
+    inputSchema:objectSchema(["mydataId","recipient","accessType"],{mydataId:NON_EMPTY_STRING,recipient:NON_EMPTY_STRING,accessType:{type:"integer",enum:[0,1,2]}}),
+    idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildRevokeMyDataShareTx,
+},validateRevokeMyDataShare);
 
 const TASK_ID_PROPERTY = Object.freeze({ taskId: NON_EMPTY_STRING } as const);
 const U64_STRING = NON_EMPTY_STRING;
@@ -1186,6 +1420,37 @@ const juryEvict = simpleAction(
 );
 
 export const SOCIAL_ACTION_REGISTRY: SocialActionRegistry = Object.freeze({
+    "account.rotate_owner_key.v1": rotateOwnerKey,
+    "agent.revoke_agent.v1":ownerRevokeAgent,
+    "agent.grant_capability.v1":ownerGrantCapability,
+    "agent.revoke_capability.v1":ownerRevokeCapability,
+    "agent.raise_spending_limit.v1":ownerRaiseLimit,
+    "agent.lower_spending_limit.v1":ownerLowerLimit,
+    "payments.send_token.v1":sendToken,
+    "governance.vote.v1":governanceVote,
+    "governance.delegate_vote.v1":governanceDelegateVote,
+    "assets.transfer_object.v1":transferOwnedObject,
+    "assets.burn_object.v1":burnZeroCoin,
+    "payments.tip_post.v1":tipPost,
+    "poc.claim_creator_vault.v1":claimCreatorVault,
+    "poc.accept_beneficiary_transfer.v1":acceptBeneficiaryTransfer,
+    "spot.claim_payout.v1":claimSpotPayout,
+    "spot.place_bet.v1":placeSpotBet,
+    "spot.create_market.v1":createSpotMarket,
+    "dex.swap.v1":dexSwap,
+    "spt.buy.v1":sptBuy,
+    "spt.sell.v1":sptSell,
+    "subscription.subscribe_to_plan.v1":subscribeToPlan,
+    "subscription.renew_subscription.v1":renewSubscription,
+    "subscription.cancel_subscription.v1":cancelSubscription,
+    "subscription.enable_auto_renew.v1":enableAutoRenew,
+    "subscription.disable_auto_renew.v1":disableAutoRenew,
+    "subscription.change_service_payment_recipient.v1":changeServicePaymentRecipient,
+    "access.purchase_mydata_access.v1": purchaseMyDataAccess,
+    "access.publish_mydata_graph.v1": publishMyDataGraph,
+    "access.purchase_post_access.v1": purchasePostAccess,
+    "access.share_mydata.v1": shareMyData,
+    "access.revoke_mydata_share.v1": revokeMyDataShare,
     "social.react_to_post.v1": reactToPost,
     "social.remove_post_reaction.v1": removePostReaction,
     "social.react_to_comment.v1": reactToComment,
@@ -1202,11 +1467,17 @@ export const SOCIAL_ACTION_REGISTRY: SocialActionRegistry = Object.freeze({
     "social.unblock_profile.v1": unblockProfile,
     "messaging.send_message.v1": sendMessage,
     "messaging.create_group.v1": createMessagingGroup,
+    "messaging.bind_room_to_task.v1": bindAgentRoomToTask,
     "organization.create.v1": createOrganization,
     "organization.update_metadata.v1": updateOrganizationMetadata,
     "organization.update_category.v1": updateOrganizationCategory,
     "organization.deactivate.v1": deactivateOrganization,
     "organization.ensure_memory_group.v1": ensureOrganizationMemoryGroup,
+    "organization.grant_treasury_access.v1": grantOrganizationTreasuryAccess,
+    "organization.withdraw_treasury.v1": withdrawOrganizationTreasury,
+    "organization.fund_treasury.v1": fundOrganizationTreasury,
+    "platform.transfer_platform.v1": transferPlatform,
+    "platform.update_fee_recipient.v1": updatePlatformFeeRecipient,
     "organization.define_role.v1": defineOrganizationRole,
     "organization.assign_role.v1": assignOrganizationRole,
     "organization.revoke_role.v1": revokeOrganizationRole,

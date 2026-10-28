@@ -30,13 +30,14 @@ const inference: InferenceClient =
 
 const metrics = new Metrics();
 const store = new FileStore(config.storePath);
+const bundleDeps = {
+    social: new HttpSocialReader(config.socialServerUrl),
+    fetchEvidence: (uri: string) =>
+        fetchEvidence(uri, { allowedHosts: config.evidenceAllowedHosts, ipfsGateway: config.ipfsGateway }),
+};
 const judgments = new JudgmentService({
     store,
-    bundle: {
-        social: new HttpSocialReader(config.socialServerUrl),
-        fetchEvidence: (uri) =>
-            fetchEvidence(uri, { allowedHosts: config.evidenceAllowedHosts, ipfsGateway: config.ipfsGateway }),
-    },
+    bundle: bundleDeps,
     judge: { inference },
     saltSecret: config.saltSecret,
     now: Date.now,
@@ -51,6 +52,8 @@ const server = createJurorServer({
     maxBodyBytes: config.maxBodyBytes,
     metrics,
     metricsToken: config.metricsToken ?? undefined,
+    bundleReadToken: config.bundleReadToken ?? undefined,
+    bundle: bundleDeps,
     log,
 });
 

@@ -208,19 +208,25 @@ mod tests {
     #[test]
     fn a_persistent_deployment_refuses_the_placeholder_secret() {
         let with_db = lookup_from(&[("DATABASE_URL", "postgresql://db/automation")]);
-        assert!(Config::from_lookup(&with_db).insecure_secret_problem().is_some());
+        assert!(Config::from_lookup(&with_db)
+            .insecure_secret_problem()
+            .is_some());
 
         let copied = lookup_from(&[
             ("DATABASE_URL", "postgresql://db/automation"),
             ("INTERNAL_SYNC_SECRET", DEV_SECRET),
         ]);
-        assert!(Config::from_lookup(&copied).insecure_secret_problem().is_some());
+        assert!(Config::from_lookup(&copied)
+            .insecure_secret_problem()
+            .is_some());
 
         let real = lookup_from(&[
             ("DATABASE_URL", "postgresql://db/automation"),
             ("INTERNAL_SYNC_SECRET", "a-long-random-value"),
         ]);
-        assert!(Config::from_lookup(&real).insecure_secret_problem().is_none());
+        assert!(Config::from_lookup(&real)
+            .insecure_secret_problem()
+            .is_none());
     }
 
     #[test]
@@ -244,7 +250,10 @@ mod tests {
         let lookup = lookup_from(&[
             ("INTERNAL_SYNC_SECRET", "shared"),
             ("AUTOMATION_MEMORY_BRIDGE_SECRET", "bridge-only"),
-            ("AUTOMATION_MEMORY_BRIDGE_URL", "http://bridge.internal:9999"),
+            (
+                "AUTOMATION_MEMORY_BRIDGE_URL",
+                "http://bridge.internal:9999",
+            ),
         ]);
         let config = Config::from_lookup(&lookup);
         assert_eq!(config.memory_bridge_secret, "bridge-only");
@@ -262,7 +271,9 @@ mod tests {
 
     #[test]
     fn datastore_is_required_to_leave_in_memory_mode() {
-        assert!(Config::from_lookup(&lookup_from(&[])).database_url.is_none());
+        assert!(Config::from_lookup(&lookup_from(&[]))
+            .database_url
+            .is_none());
         let lookup = lookup_from(&[("DATABASE_URL", "postgresql://localhost/automation")]);
         assert_eq!(
             Config::from_lookup(&lookup).database_url.as_deref(),
@@ -275,30 +286,46 @@ mod tests {
         assert!(Config::from_lookup(&lookup_from(&[])).enabled);
         for value in ["true", "TRUE", "1"] {
             let lookup = lookup_from(&[("AUTOMATION_ENABLED", value)]);
-            assert!(Config::from_lookup(&lookup).enabled, "{value} should enable");
+            assert!(
+                Config::from_lookup(&lookup).enabled,
+                "{value} should enable"
+            );
         }
         for value in ["false", "FALSE", "0", "no"] {
             let lookup = lookup_from(&[("AUTOMATION_ENABLED", value)]);
-            assert!(!Config::from_lookup(&lookup).enabled, "{value} should disable");
+            assert!(
+                !Config::from_lookup(&lookup).enabled,
+                "{value} should disable"
+            );
         }
     }
 
     #[test]
     fn the_event_bus_defaults_to_room_for_a_jury_burst_and_ignores_nonsense() {
         let config = Config::from_lookup(&lookup_from(&[]));
-        assert_eq!(config.event_bus_capacity, crate::event_bus::DEFAULT_BUS_CAPACITY);
+        assert_eq!(
+            config.event_bus_capacity,
+            crate::event_bus::DEFAULT_BUS_CAPACITY
+        );
         assert_eq!(config.event_concurrency, 8);
         let set = Config::from_lookup(&lookup_from(&[
             ("AUTOMATION_EVENT_BUS_CAPACITY", "50000"),
             ("AUTOMATION_EVENT_CONCURRENCY", "32"),
         ]));
-        assert_eq!((set.event_bus_capacity, set.event_concurrency), (50_000, 32));
+        assert_eq!(
+            (set.event_bus_capacity, set.event_concurrency),
+            (50_000, 32)
+        );
         for bad in [("0", "0"), ("nope", "999"), ("-1", "")] {
             let config = Config::from_lookup(&lookup_from(&[
                 ("AUTOMATION_EVENT_BUS_CAPACITY", bad.0),
                 ("AUTOMATION_EVENT_CONCURRENCY", bad.1),
             ]));
-            assert_eq!(config.event_bus_capacity, crate::event_bus::DEFAULT_BUS_CAPACITY, "{bad:?}");
+            assert_eq!(
+                config.event_bus_capacity,
+                crate::event_bus::DEFAULT_BUS_CAPACITY,
+                "{bad:?}"
+            );
             assert_eq!(config.event_concurrency, 8, "{bad:?}");
         }
     }
@@ -321,7 +348,10 @@ mod tests {
         let blank = |k: &str| (k == "AI_CREDIT_ORACLE_API_SECRET").then(|| "  ".to_string());
         assert_eq!(Config::from_lookup(&blank).oracle_api_secret, None);
         let set = |k: &str| (k == "AI_CREDIT_ORACLE_API_SECRET").then(|| "s3".to_string());
-        assert_eq!(Config::from_lookup(&set).oracle_api_secret.as_deref(), Some("s3"));
+        assert_eq!(
+            Config::from_lookup(&set).oracle_api_secret.as_deref(),
+            Some("s3")
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ export const CAP_MYDATA_READ = 4;
 export const CAP_TASK_TRADE = 131072;
 /** Serve on a jury: accept, commit, reveal, claim. Spends nothing. */
 export const CAP_JURY = 262144;
+export const CAP_TRADE_EXECUTE = 256;
 /** The most a `memory` delegate may hold. Anything else on the key disqualifies it. */
 export const DELEGATE_ALLOWED_CAPS = CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_MYDATA_READ;
 
@@ -39,11 +40,12 @@ export const DELEGATE_ALLOWED_CAPS = CAP_MEMORY_READ | CAP_MEMORY_WRITE | CAP_MY
  * market; `juror` adds only jury service. None can ever
  * carry posting, trading, spending or agent-management capability.
  */
-export type DelegateClass = "memory" | "task_worker" | "juror";
+export type DelegateClass = "memory" | "task_worker" | "juror" | "action_worker";
 export const DELEGATE_CLASS_CAPS: Readonly<Record<DelegateClass, number>> = Object.freeze({
     memory: DELEGATE_ALLOWED_CAPS,
     task_worker: DELEGATE_ALLOWED_CAPS | CAP_TASK_TRADE,
     juror: DELEGATE_ALLOWED_CAPS | CAP_JURY,
+    action_worker: DELEGATE_ALLOWED_CAPS | CAP_TRADE_EXECUTE | CAP_MYDATA_READ | CAP_MEMORY_READ | CAP_MEMORY_WRITE | 16 | 512 | 1024 | 32 | 64 | 2048 | 4096 | 8192 | 32768 | 65536,
 });
 
 /** The classes that sign chain transactions; each must be short-lived. */
@@ -120,6 +122,7 @@ export function assertDelegateAllowed(
                 memory: "the delegate holds capabilities beyond memory read/write; register a narrower one",
                 task_worker: "the delegate holds capabilities beyond memory and the task market; register a narrower one",
                 juror: "the delegate holds capabilities beyond memory and jury service; register a narrower one",
+                action_worker: "the delegate holds capabilities beyond the registered action worker scope; register a narrower one",
             }[delegateClass],
             "delegate_overscoped",
         );
@@ -132,6 +135,9 @@ export function assertDelegateAllowed(
     }
     if (isZeroSpendClass(delegateClass) && ctx.maxActionSpendMist !== 0) {
         refuse("a jury delegate must have a spending limit of exactly zero", "delegate_spend_not_zero");
+    }
+    if (!isZeroSpendClass(delegateClass) && ctx.maxActionSpendMist <= 0) {
+        refuse("a chain action delegate must have a positive per-action MYSO limit", "delegate_spend_not_positive");
     }
     if (ctx.expiresAtMs === null) {
         refuse("the delegate never expires; register one with an expiry", "delegate_no_expiry");

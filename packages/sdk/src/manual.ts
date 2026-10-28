@@ -3,7 +3,7 @@
  *
  * User-side flow where the SDK handles everything locally:
  * - MYDATA encrypt/decrypt via @socialproof/mydata (user's own MySo wallet)
- * - File Storage upload/download via @socialproof/file-storage
+ * - Private Cloudflare R2 ciphertext transport through the authenticated memory server
  * - Embedding via OpenAI-compatible API (user's own key)
  * - Vector registration via Memory server (Ed25519 signed)
  *
@@ -13,13 +13,13 @@
  *
  * const memory = MemoryManual.create({
  *     key: process.env.MEMORY_DELEGATE_KEY!,      // Ed25519 delegate key
- *     mysoPrivateKey: process.env.MYSO_PRIVATE_KEY!, // mysoprivkey1... for MYDATA + File Storage
+ *     mysoPrivateKey: process.env.MYSO_PRIVATE_KEY!, // mysoprivkey1... for MYDATA
  *     embeddingApiKey: process.env.OPENAI_API_KEY!,
  *     packageId: "0x...",
  *     accountId: "0x...",
  * })
  *
- * // Remember — all client-side: embed → MYDATA encrypt → File Storage upload → register
+ * // Remember — client encrypts and embeds; the server stores ciphertext in private R2
  * await memory.rememberManual("I'm allergic to peanuts")
  *
  * // Recall — all client-side: embed → search → download → MYDATA decrypt
@@ -71,7 +71,6 @@ export class MemoryManual {
     // Lazily initialized heavy clients (typed as any to avoid peer dep compile errors)
     private _mysoClient: any = null;
     private _mydataClient: any = null;
-    private _FileStorageClient: any = null;
     private _keypair: any = null;
 
     private constructor(config: MemoryManualConfig) {
@@ -93,10 +92,10 @@ export class MemoryManual {
     /**
      * Create a new MemoryManual client.
      *
-     * Requires peer dependencies: @socialproof/myso, @socialproof/mydata, @socialproof/file-storage
+     * Requires peer dependencies: @socialproof/myso, @socialproof/mydata
      *
      * @param config.key - Ed25519 delegate private key (hex) for server auth
-     * @param config.mysoPrivateKey - MySo private key (bech32) for MYDATA + File Storage (OR walletSigner)
+     * @param config.mysoPrivateKey - MySo private key (bech32) for MYDATA (OR walletSigner)
      * @param config.walletSigner - Connected wallet signer from dapp-kit (OR mysoPrivateKey)
      * @param config.embeddingApiKey - OpenAI/OpenRouter API key for embeddings
      * @param config.packageId - Memory contract package ID
@@ -226,27 +225,6 @@ export class MemoryManual {
         return this.config.mydataThreshold ?? 2;
     }
 
-    private async getFileStorageClient() {
-        if (!this._FileStorageClient) {
-            // @ts-ignore — optional peer dependency
-            const { FileStorageClient } = await import("@socialproof/file-storage");
-            const mysoClient = await this.getMySoClient();
-            const network = this.config.mysoNetwork ?? "mainnet";
-            const uploadRelayHost = network === "testnet"
-                ? "https://upload-relay.testnet.mysocial.network"
-                : "https://upload-relay.mainnet.mysocial.network";
-            this._FileStorageClient = new FileStorageClient({
-                network: network as any,
-                mysoClient,
-                uploadRelay: {
-                    host: uploadRelayHost,
-                    sendTip: { max: 10_000_000 },
-                },
-            });
-        }
-        return this._FileStorageClient;
-    }
-
     // ============================================================
     // Core Manual API
     // ============================================================
@@ -255,7 +233,7 @@ export class MemoryManual {
      * Remember (hybrid flow):
      * 1. Embed text (OpenAI/OpenRouter)
      * 2. MYDATA encrypt locally (no wallet signature needed)
-     * 3. Send {encrypted_data, vector} to server — server handles File Storage upload relay
+     * 3. Send {encrypted_data, vector} to server — server stores ciphertext in private R2
      */
     async rememberManual(text: string, namespace?: string): Promise<RememberManualResult> {
         if (!text) throw new Error("Text cannot be empty");
@@ -271,7 +249,7 @@ export class MemoryManual {
         ]);
 
         // Step 3: Send encrypted bytes (base64) + vector to server.
-        // Server will upload to File Storage via upload-relay and return the blob_id.
+        // Server stores the ciphertext in private R2 and returns its opaque blob_id.
         const encryptedBase64 = btoa(String.fromCharCode(...encrypted));
         return this.signedRequest<RememberManualResult>("POST", "/api/remember/manual", {
             encrypted_data: encryptedBase64,
@@ -284,7 +262,7 @@ export class MemoryManual {
      * Recall (manual/full client-side):
      * 1. Embed query (OpenAI)
      * 2. Search server for matching vectors
-     * 3. Download blobs from File Storage
+     * 3. Receive ciphertext through the authenticated server response
      * 4. MYDATA decrypt each blob
      */
     async recallManual(query: string, limit: number = 10, namespace?: string): Promise<RecallManualResult> {
@@ -296,7 +274,7 @@ export class MemoryManual {
         const vector = await this.embed(query);
 
         // Step 2: Search server
-        const searchResult = await this.signedRequest<{ results: { blob_id: string; distance: number }[]; total: number }>(
+        const searchResult = await this.signedRequest<{ results: { blob_id: string; distance: number; encrypted_data: string }[]; total: number }>(
             "POST",
             "/api/recall/manual",
             { vector, limit, namespace: ns },
@@ -306,19 +284,12 @@ export class MemoryManual {
             return { results: [], total: 0 };
         }
 
-        // Step 3: Download all encrypted blobs from File Storage concurrently
-        const downloadTasks = searchResult.results.map(async (hit) => {
-            try {
-                const data = await this.fileStorageDownload(hit.blob_id);
-                return { blob_id: hit.blob_id, data, distance: hit.distance };
-            } catch (err) {
-                console.error(`[MemoryManual] File Storage download failed for ${hit.blob_id}:`, err);
-                return null;
-            }
-        });
-        const downloadedBlobs = (await Promise.all(downloadTasks)).filter(
-            (d): d is { blob_id: string; data: Uint8Array; distance: number } => d !== null,
-        );
+        // Step 3: Decode owner-authorized ciphertext returned by the R2-backed route.
+        const downloadedBlobs = searchResult.results.map((hit) => ({
+            blob_id: hit.blob_id,
+            data: Uint8Array.from(atob(hit.encrypted_data), (character) => character.charCodeAt(0)),
+            distance: hit.distance,
+        }));
 
         if (downloadedBlobs.length === 0) {
             return { results: [], total: 0 };
@@ -534,58 +505,6 @@ export class MemoryManual {
     }
 
     // ============================================================
-    // Internal: File Storage Upload/Download
-    // ============================================================
-
-    private async fileStorageUpload(data: Uint8Array): Promise<string> {
-        // Direct HTTP PUT to File Storage publisher (works in both browser and Node.js,
-        // unlike @socialproof/file-storage SDK which uses WASM and requires Node.js)
-        const network = this.config.mysoNetwork ?? "mainnet";
-        const defaultPublisher = network === "testnet"
-            ? "https://publisher.file-storage-testnet.mysocial.network"
-            : "https://publisher.file-storage-mainnet.mysocial.network";
-        const publisherUrl = this.config.fileStoragePublisherUrl ?? defaultPublisher;
-        const epochs = this.config.fileStorageEpochs ?? 50;
-
-        const resp = await fetch(`${publisherUrl}/v1/blobs?epochs=${epochs}&deletable=true`, {
-            method: "PUT",
-            headers: { "Content-Type": "application/octet-stream" },
-            body: data as unknown as BodyInit,
-        });
-
-        if (!resp.ok) {
-            const errText = await resp.text();
-            throw new Error(`File Storage upload failed (${resp.status}): ${errText}`);
-        }
-
-        const result = await resp.json() as any;
-        // Response can be { newlyCreated: { blobObject: { blobId } } }
-        // or { alreadyCertified: { blobId } }
-        const blobId = result.newlyCreated?.blobObject?.blobId
-            ?? result.alreadyCertified?.blobId;
-
-        if (!blobId) {
-            throw new Error(`File Storage upload: unexpected response: ${JSON.stringify(result)}`);
-        }
-        return blobId;
-    }
-
-    private async fileStorageDownload(blobId: string): Promise<Uint8Array> {
-        // Direct HTTP fetch to File Storage aggregator (works in both browser and Node.js,
-        // unlike @socialproof/file-storage SDK which requires Node.js APIs)
-        const network = this.config.mysoNetwork ?? "mainnet";
-        const defaultAggregator = network === "testnet"
-            ? "https://aggregator.file-storage-testnet.mysocial.network"
-            : "https://aggregator.file-storage-mainnet.mysocial.network";
-        const aggregatorUrl = this.config.fileStorageAggregatorUrl ?? defaultAggregator;
-        const resp = await fetch(`${aggregatorUrl}/v1/blobs/${blobId}`);
-        if (!resp.ok) {
-            throw new Error(`File Storage download failed (${resp.status}): ${await resp.text()}`);
-        }
-        const buffer = await resp.arrayBuffer();
-        return new Uint8Array(buffer);
-    }
-
     // ============================================================
     // Internal: Signed HTTP Requests (same pattern as Memory class)
     // ============================================================
@@ -665,7 +584,7 @@ export class MemoryManual {
     // ============================================================
 
     /**
-     * Restore a namespace — server downloads all blobs from File Storage,
+     * Restore a namespace — server downloads all blobs from private R2,
      * decrypts with delegate key, re-embeds, and re-indexes.
      *
      * @param namespace - Namespace to restore

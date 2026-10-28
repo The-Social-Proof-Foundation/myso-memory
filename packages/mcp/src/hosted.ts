@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { McpRuntimeError, toStructuredMcpError } from "./errors.js";
 import { authenticateHostedRequest, type HostedMcpPrincipal } from "./oauth.js";
 import { createMemoryMcpServer } from "./server.js";
-import type { ToolDependencies } from "./tools.js";
+import { TOOL_OAUTH_SCOPES, type ToolDependencies } from "./tools.js";
 
 export interface HostedMcpOptions {
     verifier: OAuthTokenVerifier;
@@ -13,6 +13,11 @@ export interface HostedMcpOptions {
     allowedHosts: readonly string[];
     allowedOrigins?: readonly string[];
     maxContentLength?: number;
+    /** Optional service-verified path for revocable, one-run action-worker credentials. */
+    authenticateWorkerRequest?(request: IncomingMessage, credential: string): Promise<HostedMcpPrincipal | undefined>;
+    resolveWalletPrincipal?(walletAddress: string, boundAgentId?: string): Promise<{ accountId: string; agentObjectId: string; signerSessionId: string } | null>;
+    /** Enables room history, reactions, and receipts on the principal-bound gateway. */
+    messagingRelayerUrl?: string;
     createDependencies(principal: HostedMcpPrincipal): Promise<ToolDependencies>;
     destroyDependencies?(dependencies: ToolDependencies): void | Promise<void>;
 }
@@ -24,6 +29,14 @@ export function createHostedMcpHttpServer(options: HostedMcpOptions): Server {
     }
     if (options.allowedHosts.length === 0) {
         throw new McpRuntimeError("INVALID_CONFIGURATION", "Hosted MCP allowedHosts must not be empty.");
+    }
+    if (options.messagingRelayerUrl) {
+        let relayer: URL;
+        try { relayer = new URL(options.messagingRelayerUrl); }
+        catch { throw new McpRuntimeError("INVALID_CONFIGURATION", "Hosted MCP messagingRelayerUrl is invalid."); }
+        if ((relayer.protocol !== "https:" && relayer.protocol !== "http:") || (relayer.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(relayer.hostname))) {
+            throw new McpRuntimeError("INVALID_CONFIGURATION", "Hosted MCP messagingRelayerUrl must use HTTPS, except for loopback development.");
+        }
     }
     return createServer((request, response) => {
         void handleHostedRequest(request, response, options, resource);
@@ -39,16 +52,16 @@ async function handleHostedRequest(
     try {
         applySecurityHeaders(response);
         const url = new URL(request.url ?? "/", resource);
+        if (url.pathname === "/health") {
+            if (request.method !== "GET") return methodNotAllowed(response, "GET");
+            return json(response, 200, { status: "ok" });
+        }
         if (url.pathname === "/.well-known/oauth-protected-resource") {
             if (request.method !== "GET") return methodNotAllowed(response, "GET");
             return json(response, 200, {
                 resource: resource.toString().replace(/\/$/, ""),
                 authorization_servers: [options.authorizationServerUrl],
-                scopes_supported: [
-                    "mcp:connect", "memory:read", "memory:write", "chain:read",
-                    "social:write", "social:publish", "social:approve", "social:destructive", "ai:spend",
-                    "messaging:read", "organization:read", "organization:admin", "agent:provision",
-                ],
+                scopes_supported: ["mcp:connect", ...new Set(Object.values(TOOL_OAUTH_SCOPES))],
             });
         }
         if (url.pathname !== "/mcp") return json(response, 404, { error: "not_found" });
@@ -57,11 +70,28 @@ async function handleHostedRequest(
         if (!Number.isFinite(length) || length < 0 || length > (options.maxContentLength ?? 1_048_576)) {
             return json(response, 413, { error: "request_too_large" });
         }
-        const principal = await authenticateHostedRequest(request, options.verifier, resource);
+        const authorization = request.headers.authorization;
+        const workerToken = typeof authorization === "string" ? /^Bearer (mwr1\.[0-9a-f-]{36}\.[0-9a-f-]{36})$/i.exec(authorization)?.[1] : undefined;
+        const principal = workerToken
+            ? await options.authenticateWorkerRequest?.(request, workerToken)
+                ?? (() => { throw new McpRuntimeError("AUTHENTICATION_FAILED", "The run worker credential could not be validated."); })()
+            : await authenticateHostedRequest(request, options.verifier, resource, options.resolveWalletPrincipal);
         const dependencies = await options.createDependencies(principal);
+        try {
+            if (options.messagingRelayerUrl) {
+                if (!dependencies.social?.enableRoomMessaging && !dependencies.social?.supportedToolNames.includes("messaging_get_room_history")) {
+                    throw new McpRuntimeError("INVALID_CONFIGURATION", "Hosted room messaging requires a SponsoredSocialGateway or an already-configured room messaging adapter.");
+                }
+                dependencies.social?.enableRoomMessaging?.(options.messagingRelayerUrl);
+            }
+        } catch (error) {
+            await options.destroyDependencies?.(dependencies);
+            throw error;
+        }
         const scopedDependencies: ToolDependencies = {
             ...dependencies,
             oauthScopes: new Set(principal.auth.scopes),
+            principal: {accountId:principal.accountId,agentObjectId:principal.agentObjectId,workerRun:!!principal.workerRun},
         };
         const server = createMemoryMcpServer(scopedDependencies);
         const transport = new StreamableHTTPServerTransport({

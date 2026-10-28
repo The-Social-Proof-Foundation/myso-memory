@@ -23,8 +23,15 @@ pub(crate) struct OpenRouterModel {
     context_length: Option<u64>,
     architecture: ModelArchitecture,
     #[serde(default)]
+    supported_parameters: Vec<String>,
+    #[serde(default)]
+    top_provider: Option<TopProvider>,
+    #[serde(default)]
     pricing: ModelPricing,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+struct TopProvider { max_completion_tokens: Option<u32> }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ModelArchitecture {
@@ -43,6 +50,8 @@ pub struct LlmModelOption {
     pub id: String,
     pub display_name: String,
     pub context_length: Option<u64>,
+    pub max_output_tokens: Option<u32>,
+    pub supports_tools: bool,
     // Provider list prices, not quotes in chain currency or an oracle billing rate.
     pub input_usd_per_1m: Option<f64>,
     pub output_usd_per_1m: Option<f64>,
@@ -116,6 +125,8 @@ pub(crate) fn catalog_options(models: &[OpenRouterModel]) -> Vec<LlmModelOption>
             id: id.to_string(),
             display_name: model.name.clone(),
             context_length: model.context_length,
+            max_output_tokens: model.top_provider.as_ref().and_then(|p|p.max_completion_tokens),
+            supports_tools: model.supported_parameters.iter().any(|p|p=="tools"),
             input_usd_per_1m: usd_per_million(model.pricing.prompt.as_deref()),
             output_usd_per_1m: usd_per_million(model.pricing.completion.as_deref()),
         });

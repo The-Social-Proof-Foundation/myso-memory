@@ -8,16 +8,18 @@ import {
     CAP_JURY,
     CAP_NONE,
     CAP_MEMORY_READ,
+    CAP_MYDATA_READ,
     CAP_MESSAGE_SEND,
     CAP_POST_PUBLISH,
     CAP_REACT,
     CAP_SOCIAL_GRAPH,
-    CAP_TASK_TRADE,
+    CAP_TASK_TRADE, CAP_TRADE_EXECUTE,
 } from "../contract.js";
 import { deriveAgentAddress } from "../ptb/organization.js";
 import type { SocialChainConfig } from "../types.js";
 import {
     SOCIAL_ACTION_IDS,
+    SOCIAL_ACTION_REGISTRY_VERSION,
     SOCIAL_ACTION_REGISTRY,
     UnsupportedSocialActionError,
     buildRegisteredSocialAction,
@@ -99,6 +101,15 @@ test("registry assigns capability and risk policy to every current action", () =
             return [id, descriptor.requiredCapability, descriptor.riskTier];
         }),
         [
+            ["payments.send_token.v1",CAP_TRADE_EXECUTE,"2"],
+            ["subscription.subscribe_to_plan.v1",CAP_TRADE_EXECUTE,"2"],
+            ["subscription.renew_subscription.v1",CAP_TRADE_EXECUTE,"2"],
+            ["subscription.cancel_subscription.v1",CAP_TRADE_EXECUTE,"2"],
+            ["subscription.enable_auto_renew.v1",CAP_TRADE_EXECUTE,"2"],
+            ["subscription.disable_auto_renew.v1",CAP_TRADE_EXECUTE,"2"],
+            ["access.purchase_mydata_access.v1", CAP_MYDATA_READ, "1B"],
+            ["access.share_mydata.v1", CAP_MYDATA_READ, "2"],
+            ["access.revoke_mydata_share.v1", CAP_MYDATA_READ, "2"],
             ["social.react_to_post.v1", CAP_REACT, "1A"],
             ["social.remove_post_reaction.v1", CAP_REACT, "1A"],
             ["social.react_to_comment.v1", CAP_REACT, "1A"],
@@ -115,6 +126,7 @@ test("registry assigns capability and risk policy to every current action", () =
             ["social.unblock_profile.v1", CAP_SOCIAL_GRAPH, "1A"],
             ["messaging.send_message.v1", CAP_MESSAGE_SEND, "1B"],
             ["messaging.create_group.v1", CAP_MESSAGE_SEND, "1B"],
+            ["messaging.bind_room_to_task.v1", CAP_MESSAGE_SEND, "1B"],
             ["organization.create.v1", CAP_AGENT_REGISTER, "3"],
             ["organization.update_metadata.v1", CAP_AGENT_UPDATE, "3"],
             ["organization.update_category.v1", CAP_AGENT_UPDATE, "3"],
@@ -261,6 +273,16 @@ test("registered builders preserve exact Move targets and important arguments", 
             },
             target: "0xe110::messaging::create_agent_and_share_group",
             check(args: unknown[]) { assert.equal(args.length, 16); },
+        },
+        {
+            id: "messaging.bind_room_to_task.v1",
+            input: { groupId: "0xroom", taskId: "0xtask" },
+            target: "0xe110::messaging::bind_agent_room_to_task",
+            check(args: unknown[]) {
+                assert.equal(args.length, 9);
+                assertObjectArgument(args[2], "0xroom");
+                assertObjectArgument(args[3], "0xtask");
+            },
         },
         {
             id: "organization.create.v1",
@@ -447,7 +469,7 @@ test("request and preparation metadata pin idempotency, registry, package, and b
         { postId: "0xpost", reaction: "like" },
         "request-123",
     );
-    assert.equal(request.registryVersion, "1.5.0");
+    assert.equal(request.registryVersion, SOCIAL_ACTION_REGISTRY_VERSION);
     assert.equal(request.idempotency.scope, "account-agent-action");
     assert.match(request.parameterHash, /^sha256:[a-f0-9]{64}$/);
 

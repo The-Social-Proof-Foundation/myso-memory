@@ -35,6 +35,8 @@ export interface RunnerConfig {
     rationalePublisher: { secret: string; intervalMs: number } | null;
     /** Bearer token for `GET /metrics`. `null` leaves the route off. */
     metricsToken: string | null;
+    /** Bearer token for the verified case bundle read used by the MySo Agents juror UI. */
+    bundleReadToken: string | null;
     /** Watches delegates for expiry; `null` unless `MONITOR_DELEGATES` names some. */
     delegateMonitor: DelegateMonitorConfig | null;
     /** The crank recovery loop; `null` unless `RECONCILER_ENABLED` is set. */
@@ -167,6 +169,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     if (metricsToken !== null && metricsToken.length < 16) {
         throw new ConfigError("METRICS_TOKEN must be at least 16 characters");
     }
+    const bundleReadToken = env.BUNDLE_READ_TOKEN?.trim() || null;
+    if (bundleReadToken !== null && bundleReadToken.length < 32) {
+        throw new ConfigError("BUNDLE_READ_TOKEN must be at least 32 characters");
+    }
     const delegateMonitor = env.MONITOR_DELEGATES?.trim() ? loadDelegateMonitor(env, production) : null;
     const reconciler = ["1", "true", "yes", "on"].includes((env.RECONCILER_ENABLED ?? "").trim().toLowerCase())
         ? loadReconciler(env, production)
@@ -192,6 +198,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
               }
             : null,
         metricsToken,
+        bundleReadToken,
         delegateMonitor,
         reconciler,
         production,

@@ -1,6 +1,6 @@
 # @socialproof/memory
 
-Privacy-first AI memory SDK for storing encrypted memories on File Storage and retrieving them with semantic search.
+Privacy-first AI memory SDK for storing encrypted memories in private Cloudflare R2 and retrieving them with semantic search.
 
 > Memory is currently in beta and actively evolving. While fully usable today, we continue to refine the developer experience and operational guidance. We welcome feedback from early builders as we continue to improve the product.
 
@@ -17,7 +17,7 @@ pnpm add @socialproof/memory
 Peer dependencies (install as needed):
 
 ```bash
-pnpm add @socialproof/myso @socialproof/mydata @socialproof/file-storage ai zod
+pnpm add @socialproof/myso @socialproof/mydata ai zod
 ```
 
 ## Quick Start
@@ -43,14 +43,14 @@ If you are self-hosting the relayer and do not have an account ID yet, see [Self
 
 | Entry | Description |
 |---|---|
-| `@socialproof/memory` | Default client (`Memory`). The relayer handles embedding, encryption, File Storage upload/download, retrieval, and restore. |
-| `@socialproof/memory/manual` | Manual client flow (`MemoryManual`). You handle embedding calls and local MYDATA operations. The relayer still handles upload relay, registration, search, and restore. |
+| `@socialproof/memory` | Default client (`Memory`). The relayer handles embedding, encryption, private R2 storage/download, retrieval, and restore. |
+| `@socialproof/memory/manual` | Manual client flow (`MemoryManual`). You handle embedding calls and local MYDATA operations. The relayer stores ciphertext in private R2 and handles registration, search, and restore. |
 | `@socialproof/memory/ai` | Vercel AI SDK integration - wraps `Memory` as middleware for use with `streamText`, `generateText`, etc. |
 
 ## How It Works
 
 1. **Scope** - Each memory operation runs inside an `owner + namespace` boundary
-2. **Store** - The relayer embeds, encrypts, uploads to File Storage, and stores vector metadata in PostgreSQL
+2. **Store** - The relayer embeds, encrypts, uploads to private R2, and stores vector metadata in PostgreSQL
 3. **Recall** - The relayer searches by owner plus namespace, resolves matching blobs, and returns plaintext results
 4. **Restore** - The relayer can incrementally rebuild missing indexed entries for one namespace
 

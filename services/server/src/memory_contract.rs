@@ -51,6 +51,7 @@ pub const E_SUB_AGENT_WRONG_PLATFORM_SCOPE: u64 = 17;
 pub const E_SUB_AGENT_MISSING_CAP: u64 = 18;
 pub const E_SUB_AGENT_APPROVAL_REQUIRED: u64 = 19;
 pub const E_SUB_AGENT_INACTIVE_ANCESTOR: u64 = 29;
+#[cfg(test)]
 pub const E_SUB_AGENT_SPEND_EXCEEDED: u64 = 30;
 
 pub fn has_cap(capabilities: u64, required: u64) -> bool {
@@ -95,6 +96,7 @@ pub fn check_direct_execution_allowed(
     }
 }
 
+#[cfg(test)]
 pub fn check_spend_limit(max_action_spend: Option<u64>, spend_amount: u64) -> Result<(), u64> {
     let Some(max) = max_action_spend else {
         return Ok(());

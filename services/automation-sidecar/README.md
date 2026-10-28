@@ -92,6 +92,10 @@ Production (`NODE_ENV=production`, which the Dockerfile sets) requires:
 | `AUTOMATION_MYDATA_PRIVATE_KEYS` | `id:base64url`, comma-separated to rotate. **The one secret that matters.** |
 | `AUTOMATION_ENGINE_URL` | Where encrypted delegates are stored. Falls back to `AUTOMATION_EVENTS_URL`. |
 | `MEMORY_SERVER_URL` | Memory relayer origin used for delegates. |
+| `AUTOMATION_WORK_MCP_URL` | Hosted MySo Agents MCP `/mcp` endpoint used by the run-scoped worker proxy. Required in production; must be HTTPS. |
+| `AUTOMATION_WORK_DISPATCH_URL` | MySo Agents app origin for secret-protected work-run turn dispatch. HTTPS required outside loopback. |
+| `AUTOMATION_WORK_DISPATCH_SECRET` | High-entropy secret shared with `MYSO_AGENTS_WORKER_DISPATCH_SECRET` in the app deployment. |
+| `MCP_MESSAGING_RELAYER_URL` | Optional HTTPS messaging relayer; enables unattended room-history reads only with per-run owner consent and the worker's live room-reader permission. |
 | `HOST` / `PORT` | `0.0.0.0` in a container (the Dockerfile sets it), `8011` by default. |
 
 In production the bridge **refuses to start** if `AUTOMATION_AGENT_KEYS_JSON` or
@@ -146,8 +150,7 @@ pnpm smoke:automation   # engine + bridge end to end against a stub relayer
 
 ## Deploying on Railway
 
-- Root directory: the **repo root** (the SDK is a workspace dependency).
-- `RAILWAY_DOCKERFILE_PATH=services/automation-sidecar/Dockerfile`
+- Build context must include sibling `myso-memory` and `myso-messaging-stack` checkouts, as required by the hosted MCP package's linked messaging SDK. Set `RAILWAY_DOCKERFILE_PATH=myso-memory/services/automation-sidecar/Dockerfile` for that combined context.
 - Healthcheck path: `/health`.
 - **No public domain and no database.** The engine reaches it over private networking.
 
