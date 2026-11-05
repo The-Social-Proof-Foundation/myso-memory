@@ -22,6 +22,7 @@ export type OwnerRotationActionParams =
     | (ProposeOwnerRotationParams & { stage?: "propose" })
     | (OwnerRotationReferencesParams & { stage: "accept"; profileId: string; newOwner: string; finalize: boolean })
     | (OwnerRotationReferencesParams & { stage: "rollback"; newOwner: string })
+    | { stage: "complete"; profileId: string; newOwner: string; aiCreditBalanceId: string }
     | { stage: "cancel" };
 
 export const OWNER_ROTATION_MAX_REFERENCES_PER_TRANSACTION = 6;
@@ -116,17 +117,42 @@ export function buildAcceptOwnerRotationBatchTx(
         });
     }
     if (params.finalize) {
+        // The recipient confirms; the old owner then hands the owned Profile over with
+        // `profile::complete_owner_rotation` (see buildCompleteOwnerRotationTx).
         tx.moveCall({
-            target: `${ctx.chain.packageId}::profile::accept_owner_rotation`,
-            arguments: [
-                tx.object(ctx.chain.usernameRegistryId),
-                tx.object(ctx.memoryRegistryId),
-                account,
-                tx.object(params.profileId),
-                tx.object(clock(ctx)),
-            ],
+            target: `${ctx.chain.packageId}::memory::accept_owner_rotation`,
+            arguments: [account, tx.object(clock(ctx))],
         });
     }
+    return tx;
+}
+
+/**
+ * Old owner's final step. Profiles are owned objects, so only the current owner can pass the
+ * Profile by value; Move moves the MemoryAccount, AiCreditBalance, username-registry owner index
+ * and the Profile object to the new wallet atomically and clears the ecosystem badge selection.
+ */
+export function buildCompleteOwnerRotationTx(
+    ctx: OwnerRotationContext,
+    params: { profileId: string; aiCreditBalanceId: string },
+): any {
+    address(ctx.memoryRegistryId, "memoryRegistryId");
+    address(ctx.memoryAccountId, "memoryAccountId");
+    address(ctx.chain.usernameRegistryId, "usernameRegistryId");
+    address(params.profileId, "profileId");
+    address(params.aiCreditBalanceId, "aiCreditBalanceId");
+    const tx = new ctx.Transaction();
+    tx.moveCall({
+        target: `${ctx.chain.packageId}::profile::complete_owner_rotation`,
+        arguments: [
+            tx.object(ctx.chain.usernameRegistryId),
+            tx.object(ctx.memoryRegistryId),
+            tx.object(ctx.memoryAccountId),
+            tx.object(params.aiCreditBalanceId),
+            tx.object(params.profileId),
+            tx.object(clock(ctx)),
+        ],
+    });
     return tx;
 }
 
@@ -176,6 +202,7 @@ export function buildOwnerRotationActionTx(ctx: OwnerRotationContext, params: Ow
     }
     if (params.stage === "accept") return buildAcceptOwnerRotationBatchTx(ctx, params);
     if (params.stage === "rollback") return buildRollbackOwnerRotationReferencesTx(ctx, params);
+    if (params.stage === "complete") return buildCompleteOwnerRotationTx(ctx, params);
     if (params.stage === "cancel") return buildCancelOwnerRotationTx(ctx);
     throw new TypeError("Unsupported owner migration stage");
 }

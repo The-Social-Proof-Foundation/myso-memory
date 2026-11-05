@@ -161,7 +161,7 @@ const OWNER_ROTATION_IDS = Object.freeze({
     maxItems: 512,
     items: Object.freeze({ type: "string", pattern: "^0x[0-9a-fA-F]{1,64}$" }),
 } as const);
-const OWNER_ROTATION_STAGE = Object.freeze({ type: "string", enum: ["propose", "accept", "rollback", "cancel"] } as const);
+const OWNER_ROTATION_STAGE = Object.freeze({ type: "string", enum: ["propose", "accept", "rollback", "complete", "cancel"] } as const);
 const MAX_32_STRINGS = Object.freeze({
     type: "array",
     items: NON_EMPTY_STRING,
@@ -905,17 +905,18 @@ const ownerGrantCapability=defineAction({id:"agent.grant_capability.v1",version:
 const ownerRevokeCapability=defineAction({id:"agent.revoke_capability.v1",version:1,legacyAction:"revoke_capability",requiredCapability:CAP_AGENT_UPDATE,riskTier:"3",inputSchema:objectSchema([...OWNER_AGENT_KEYS,"expectedCapabilities","capabilityMask"],{...OWNER_AGENT_IDENTITY,expectedCapabilities:NON_EMPTY_STRING,capabilityMask:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerRevokeCapabilityTx},validateOwnerRevokeCapability);
 const ownerRaiseLimit=defineAction({id:"agent.raise_spending_limit.v1",version:1,legacyAction:"raise_spending_limit",requiredCapability:CAP_BUDGET_MANAGE,riskTier:"3",inputSchema:objectSchema([...OWNER_AGENT_KEYS,"expectedLimitMist","newLimitMist"],{...OWNER_AGENT_IDENTITY,expectedLimitMist:NON_EMPTY_STRING,newLimitMist:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerRaiseSpendingLimitTx},validateOwnerRaiseLimit);
 const ownerLowerLimit=defineAction({id:"agent.lower_spending_limit.v1",version:1,legacyAction:"lower_spending_limit",requiredCapability:CAP_BUDGET_MANAGE,riskTier:"3",inputSchema:objectSchema([...OWNER_AGENT_KEYS,"expectedLimitMist","newLimitMist"],{...OWNER_AGENT_IDENTITY,expectedLimitMist:NON_EMPTY_STRING,newLimitMist:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:buildOwnerLowerSpendingLimitTx},validateOwnerLowerLimit);
-const rotateOwnerKey=defineAction({id:"account.rotate_owner_key.v1",version:1,legacyAction:"rotate_owner_key",requiredCapability:CAP_NONE,riskTier:"3",inputSchema:objectSchema([], {stage:OWNER_ROTATION_STAGE,profileId:NON_EMPTY_STRING,newOwner:NON_EMPTY_STRING,agentObjectIds:OWNER_ROTATION_IDS,organizationObjectIds:OWNER_ROTATION_IDS,finalize:{type:"boolean"}}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:(context,input)=>{
+const rotateOwnerKey=defineAction({id:"account.rotate_owner_key.v1",version:1,legacyAction:"rotate_owner_key",requiredCapability:CAP_NONE,riskTier:"3",inputSchema:objectSchema([], {stage:OWNER_ROTATION_STAGE,profileId:NON_EMPTY_STRING,newOwner:NON_EMPTY_STRING,agentObjectIds:OWNER_ROTATION_IDS,organizationObjectIds:OWNER_ROTATION_IDS,finalize:{type:"boolean"},aiCreditBalanceId:NON_EMPTY_STRING}),idempotency:IDEMPOTENCY_POLICY,buildTransaction:(context,input)=>{
     const memoryRegistryId=context.chain.memoryRegistryId;
     if (!memoryRegistryId) throw new TypeError("SOCIAL_MEMORY_REGISTRY_ID must be configured for owner migration");
     return buildOwnerRotationActionTx({...context,memoryRegistryId},input);
 }}, input => {
     const fields = input as unknown as Record<string, unknown>;
-    const stage = (fields.stage ?? "propose") as "propose" | "accept" | "rollback" | "cancel";
+    const stage = (fields.stage ?? "propose") as "propose" | "accept" | "rollback" | "complete" | "cancel";
     const allowed = stage === "propose" ? ["stage", "profileId", "newOwner", "agentObjectIds", "organizationObjectIds"]
         : stage === "accept" ? ["stage", "profileId", "newOwner", "agentObjectIds", "organizationObjectIds", "finalize"]
-        : stage === "rollback" ? ["stage", "newOwner", "agentObjectIds", "organizationObjectIds"] : ["stage"];
-    if (!["propose", "accept", "rollback", "cancel"].includes(stage) || Object.keys(fields).some(key => !allowed.includes(key))) throw new TypeError(`Fields do not match owner migration stage ${stage}`);
+        : stage === "rollback" ? ["stage", "newOwner", "agentObjectIds", "organizationObjectIds"]
+        : stage === "complete" ? ["stage", "profileId", "newOwner", "aiCreditBalanceId"] : ["stage"];
+    if (!["propose", "accept", "rollback", "complete", "cancel"].includes(stage) || Object.keys(fields).some(key => !allowed.includes(key))) throw new TypeError(`Fields do not match owner migration stage ${stage}`);
     const agentIds = fields.agentObjectIds;
     const organizationIds = fields.organizationObjectIds;
     if (stage === "propose") {
@@ -924,6 +925,8 @@ const rotateOwnerKey=defineAction({id:"account.rotate_owner_key.v1",version:1,le
     } else if (stage === "accept") {
         if (typeof fields.profileId !== "string" || typeof fields.newOwner !== "string" || typeof fields.finalize !== "boolean" || !Array.isArray(agentIds) || !Array.isArray(organizationIds)) throw new TypeError("Acceptance requires profileId, newOwner, bounded reference arrays, and finalize");
         if (agentIds.length + organizationIds.length > 6 || (!fields.finalize && agentIds.length + organizationIds.length === 0)) throw new TypeError("Acceptance must update at most six references; only a finalization batch may be empty");
+    } else if (stage === "complete") {
+        if (typeof fields.profileId !== "string" || typeof fields.newOwner !== "string" || typeof fields.aiCreditBalanceId !== "string") throw new TypeError("Completion requires profileId, newOwner, and aiCreditBalanceId");
     } else if (stage === "rollback") {
         if (typeof fields.newOwner !== "string" || !Array.isArray(agentIds) || !Array.isArray(organizationIds) || agentIds.length + organizationIds.length < 1 || agentIds.length + organizationIds.length > 6) throw new TypeError("Rollback requires newOwner and between one and six references");
     }

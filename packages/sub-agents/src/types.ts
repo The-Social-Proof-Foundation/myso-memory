@@ -859,6 +859,7 @@ export type OwnerRotationActionParams =
     | OwnerRotationProposalParams
     | { stage:"accept"; profileId:string; newOwner:string; agentObjectIds:string[]; organizationObjectIds:string[]; finalize:boolean }
     | { stage:"rollback"; newOwner:string; agentObjectIds:string[]; organizationObjectIds:string[] }
+    | { stage:"complete"; profileId:string; newOwner:string; aiCreditBalanceId:string }
     | { stage:"cancel" };
 export interface OwnerChangeCapabilityParams extends OwnerAgentIdentityParams { expectedCapabilities:string; capabilityMask:string; }
 /** Finite per-action MIST limit; "unlimited" explicitly removes the ceiling. No cumulative budget is implied. */
