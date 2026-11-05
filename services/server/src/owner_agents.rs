@@ -136,6 +136,8 @@ struct PendingOwnerRotation {
     organization_manifest: Vec<String>,
     updated_agents: Vec<String>,
     updated_organizations: Vec<String>,
+    /// Recipient ran `memory::accept_owner_rotation`; the old owner may now complete.
+    accepted: bool,
 }
 
 async fn rotation_table_ids(state: &AppState, rotation: &Value, name: &str) -> Result<Vec<String>, AppError> {
@@ -200,7 +202,8 @@ async fn pending_owner_rotation(state: &AppState, auth: &AuthInfo) -> Result<Opt
     let updated_organizations = rotation_table_ids(state, rotation, "updated_organizations").await?;
     if updated_agents.iter().any(|id| !agent_manifest.iter().any(|expected| same(id, expected)))
         || updated_organizations.iter().any(|id| !organization_manifest.iter().any(|expected| same(id, expected))) { return Err(invalid()); }
-    Ok(Some(PendingOwnerRotation { old_owner, new_owner, profile_id, agent_manifest, organization_manifest, updated_agents, updated_organizations }))
+    let accepted = rotation_fields.get("accepted").and_then(Value::as_bool).unwrap_or(false);
+    Ok(Some(PendingOwnerRotation { old_owner, new_owner, profile_id, agent_manifest, organization_manifest, updated_agents, updated_organizations, accepted }))
 }
 
 fn requested_ids(value: Option<&Value>, maximum: usize, label: &str) -> Result<Vec<String>, AppError> {
@@ -221,7 +224,7 @@ pub async fn validate_owner_rotation_action(state: &AppState, auth: &AuthInfo, p
     request_scope(state, auth)?;
     if !configured(&state.config) { return Err(AppError::Forbidden("Owner migration actions are not enabled".into())); }
     let stage = p.get("stage").and_then(Value::as_str).unwrap_or("propose");
-    let (agent_ids, organization_ids) = if stage == "cancel" {
+    let (agent_ids, organization_ids) = if stage == "cancel" || stage == "complete" {
         (Vec::new(), Vec::new())
     } else {
         (requested_ids(p.get("agentObjectIds"), if stage == "propose" { 512 } else { 6 }, "agents")?, requested_ids(p.get("organizationObjectIds"), if stage == "propose" { 512 } else { 6 }, "organizations")?)
@@ -270,7 +273,17 @@ pub async fn validate_owner_rotation_action(state: &AppState, auth: &AuthInfo, p
             if !pending.updated_agents.is_empty() || !pending.updated_organizations.is_empty() { return Err(AppError::Conflict("Every updated reference must be rolled back before cancellation".into())); }
             if !agent_ids.is_empty() || !organization_ids.is_empty() { return Err(bad("Cancellation does not accept reference IDs")); }
         }
-        _ => return Err(bad("stage must be propose, accept, rollback, or cancel")),
+        "complete" => {
+            // Old owner hands the owned Profile over after the recipient accepted.
+            let pending = pending.ok_or_else(|| AppError::Conflict("No owner migration is pending".into()))?;
+            if !pending.accepted { return Err(AppError::Conflict("The recipient wallet has not accepted the owner migration yet".into())); }
+            if !same(&address(p.get("profileId"))?, &pending.profile_id) || !same(&address(p.get("newOwner"))?, &pending.new_owner) { return Err(AppError::Conflict("Owner migration completion does not match the pending profile or recipient".into())); }
+            address(p.get("aiCreditBalanceId")).map_err(|_| bad("aiCreditBalanceId must be the profile's AiCreditBalance object ID"))?;
+            let all_agents_updated = pending.agent_manifest.iter().all(|id| pending.updated_agents.iter().any(|updated| same(id, updated)));
+            let all_orgs_updated = pending.organization_manifest.iter().all(|id| pending.updated_organizations.iter().any(|updated| same(id, updated)));
+            if !all_agents_updated || !all_orgs_updated { return Err(AppError::Conflict("Every manifest reference must be updated before completion".into())); }
+        }
+        _ => return Err(bad("stage must be propose, accept, rollback, complete, or cancel")),
     }
     Ok(())
 }
@@ -285,7 +298,7 @@ pub async fn validate_owner_rotation_signer(state: &AppState, auth: &AuthInfo, p
     let allowed = match stage {
         "accept" => same(signer, &pending.new_owner),
         "rollback" => same(signer, &pending.old_owner) || same(signer, &pending.new_owner),
-        "cancel" => same(signer, &pending.old_owner),
+        "cancel" | "complete" => same(signer, &pending.old_owner),
         _ => false,
     };
     if !allowed { return Err(AppError::Forbidden("Wallet signer is not an authorized party to this pending owner migration".into())); }
@@ -833,10 +846,12 @@ async fn rotation_receipt(state: &AppState, auth: &AuthInfo, digest: &str) -> Re
     let reference_type = coin_type(&format!("{package}::memory::MemoryAccountOwnerRotationReferenceUpdated"))?;
     let rotated_type = coin_type(&format!("{package}::memory::MemoryAccountOwnerRotated"))?;
     let profile_type = coin_type(&format!("{package}::profile::ProfileOwnerRotatedEvent"))?;
-    let mut proposals = Vec::new(); let mut references = Vec::new(); let mut rotations = Vec::new(); let mut profiles = Vec::new();
+    let accepted_type = coin_type(&format!("{package}::memory::MemoryAccountOwnerRotationAccepted"))?;
+    let mut proposals = Vec::new(); let mut references = Vec::new(); let mut rotations = Vec::new(); let mut profiles = Vec::new(); let mut accepteds = Vec::new();
     for event in events {
         let event_type = coin_type(event.get("type").and_then(Value::as_str).ok_or_else(invalid)?)?;
         if event_type == proposal_type { proposals.push(event); }
+        else if event_type == accepted_type { accepteds.push(event); }
         else if event_type == reference_type { references.push(event); }
         else if event_type == rotated_type { rotations.push(event); }
         else if event_type == profile_type { profiles.push(event); }
@@ -866,17 +881,28 @@ async fn rotation_receipt(state: &AppState, auth: &AuthInfo, digest: &str) -> Re
                 let expected_kind = if agents.iter().any(|v| address(Some(v)).is_ok_and(|id| same(&id,&reference_id))) {1} else if organizations.iter().any(|v| address(Some(v)).is_ok_and(|id| same(&id,&reference_id))) {2} else {0};
                 if expected_kind==0 || kind!=expected_kind || !seen.insert(reference_id.clone()) || !same(&address(p.get("account_id"))?,account_id) || !same(&address(p.get("old_owner"))?,expected_old) || !same(&address(p.get("new_owner"))?,expected_new) || !same(&address(p.get("updated_by"))?,signer) || !same(&address(event.get("sender"))?,signer) { return Err(invalid()); }
             }
+            // Finalizing acceptance only records the recipient's confirmation; the move itself
+            // happens in the old owner's `complete` stage.
             let finalizes = context.get("finalize").and_then(Value::as_bool).unwrap_or(false);
-            if (stage == "accept" && finalizes && (rotations.len()!=1 || profiles.len()!=1)) || ((stage != "accept" || !finalizes) && (!rotations.is_empty() || !profiles.is_empty())) { return Err(AppError::Conflict("Owner migration finalization events do not match the prepared batch".into())); }
+            if !rotations.is_empty() || !profiles.is_empty()
+                || (stage == "accept" && finalizes && accepteds.len()!=1)
+                || ((stage != "accept" || !finalizes) && !accepteds.is_empty()) { return Err(AppError::Conflict("Owner migration finalization events do not match the prepared batch".into())); }
             if finalizes {
-                let r = rotations[0].get("parsedJson").and_then(Value::as_object).ok_or_else(invalid)?;
-                let profile = profiles[0].get("parsedJson").and_then(Value::as_object).ok_or_else(invalid)?;
-                if !same(&address(r.get("account_id"))?,account_id) || !same(&address(r.get("old_owner"))?,old_owner) || !same(&address(r.get("new_owner"))?,&new_owner) || !same(&address(r.get("profile_id"))?,context_profile.as_deref().ok_or_else(invalid)?) || !same(&address(profile.get("memory_account_id"))?,account_id) || !same(&address(profile.get("profile_id"))?,context_profile.as_deref().ok_or_else(invalid)?) || !same(&address(profile.get("old_owner"))?,old_owner) || !same(&address(profile.get("new_owner"))?,&new_owner) { return Err(invalid()); }
+                let a = accepteds[0].get("parsedJson").and_then(Value::as_object).ok_or_else(invalid)?;
+                if !same(&address(a.get("account_id"))?,account_id) || !same(&address(a.get("old_owner"))?,old_owner) || !same(&address(a.get("new_owner"))?,&new_owner) || !same(&address(accepteds[0].get("sender"))?,signer) { return Err(invalid()); }
             }
             Ok(json!({"digest":digest,"accountId":account_id,"stage":stage,"status":status,"referenceEvents":references,"finalized":finalizes,"evidence":references,"preparedContext":context,"checkpoint":checkpoint.map(|v|v.to_string())}))
         }
+        "complete" => {
+            if !proposals.is_empty() || !references.is_empty() || !accepteds.is_empty() || rotations.len()!=1 || profiles.len()!=1 || !same(signer,old_owner) { return Err(AppError::Conflict("Owner migration completion events do not match the prepared action".into())); }
+            let profile_id = context_profile.as_deref().ok_or_else(invalid)?;
+            let r = rotations[0].get("parsedJson").and_then(Value::as_object).ok_or_else(invalid)?;
+            let profile = profiles[0].get("parsedJson").and_then(Value::as_object).ok_or_else(invalid)?;
+            if !same(&address(r.get("account_id"))?,account_id) || !same(&address(r.get("old_owner"))?,old_owner) || !same(&address(r.get("new_owner"))?,&new_owner) || !same(&address(r.get("profile_id"))?,profile_id) || !same(&address(profile.get("memory_account_id"))?,account_id) || !same(&address(profile.get("profile_id"))?,profile_id) || !same(&address(profile.get("old_owner"))?,old_owner) || !same(&address(profile.get("new_owner"))?,&new_owner) || !same(&address(profiles[0].get("sender"))?,signer) { return Err(invalid()); }
+            Ok(json!({"digest":digest,"accountId":account_id,"stage":stage,"status":status,"oldOwner":old_owner,"newOwner":new_owner,"finalized":true,"evidence":[rotations[0],profiles[0]],"preparedContext":context,"checkpoint":checkpoint.map(|v|v.to_string())}))
+        }
         "cancel" => {
-            if !proposals.is_empty() || !references.is_empty() || !rotations.is_empty() || !profiles.is_empty() || !same(signer,old_owner) { return Err(invalid()); }
+            if !proposals.is_empty() || !references.is_empty() || !rotations.is_empty() || !profiles.is_empty() || !accepteds.is_empty() || !same(signer,old_owner) { return Err(invalid()); }
             if pending_owner_rotation(state, auth).await?.is_some() { return Err(AppError::Conflict("Owner migration cancellation is not reflected in live state".into())); }
             Ok(json!({"digest":digest,"accountId":account_id,"stage":stage,"status":status,"evidence":[],"preparedContext":context,"checkpoint":checkpoint.map(|v|v.to_string())}))
         }
