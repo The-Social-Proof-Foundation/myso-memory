@@ -444,8 +444,16 @@ export function buildCreateMessagingGroupTx(ctx: BuildTxContext, params: CreateM
     }
     const tx = new ctx.Transaction();
     const packageId = requiredChainField(ctx.chain, "messagingPackageId");
-    tx.moveCall({
-        target: `${packageId}::messaging::create_agent_and_share_group`,
+    // Every new chat is MLS (E2EE M7): `create_agent_group_with_e2ee` writes `e2ee=mls1` while the
+    // group is built (the agent sender has no MetadataAdmin), then all three objects are shared in
+    // this same transaction, so the room never exists without its flag.
+    const [members] = tx.moveCall({
+        target: "0x2::vec_set::from_keys",
+        typeArguments: ["address"],
+        arguments: [tx.pure("vector<address>", params.initialMembers)],
+    });
+    const [group, encryptionHistory, messageLog] = tx.moveCall({
+        target: `${packageId}::messaging::create_agent_group_with_e2ee`,
         arguments: [
             tx.object(requiredChainField(ctx.chain, "messagingVersionId")),
             tx.object(requiredChainField(ctx.chain, "messagingNamespaceId")),
@@ -459,13 +467,22 @@ export function buildCreateMessagingGroupTx(ctx: BuildTxContext, params: CreateM
             tx.pure("string", params.name),
             tx.pure("string", params.uuid),
             tx.pure("vector<u8>", encryptedDek),
-            tx.pure("vector<address>", params.initialMembers),
+            members,
             optU8(tx, params.roomKind),
             // `ID` has the same BCS bytes as an address.
             optAddress(tx, params.roomTaskId),
+            tx.pure("string", "mls1"),
             tx.object(ctx.chain.clockId ?? MYSO_CLOCK),
         ],
     });
+    const shared: [unknown, string][] = [
+        [group, `0x2::permissioned_group::PermissionedGroup<${packageId}::messaging::Messaging>`],
+        [encryptionHistory, `${packageId}::encryption_history::EncryptionHistory`],
+        [messageLog, `${packageId}::message_log::MessageLog`],
+    ];
+    for (const [object, type] of shared) {
+        tx.moveCall({ target: "0x2::transfer::public_share_object", typeArguments: [type], arguments: [object] });
+    }
     return tx;
 }
 

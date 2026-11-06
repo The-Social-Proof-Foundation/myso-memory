@@ -1014,6 +1014,9 @@ importers:
       '@socialproof/myso-messaging-stack':
         specifier: link:../../../myso-messaging-stack/ts-sdks/packages/myso-messaging-stack
         version: link:../../../myso-messaging-stack/ts-sdks/packages/myso-messaging-stack
+      '@socialproof/myso-mls':
+        specifier: 0.1.0
+        version: 0.1.0
       '@socialproof/sub-agents':
         specifier: workspace:^
         version: link:../sub-agents
@@ -4739,6 +4742,9 @@ packages:
     resolution: {integrity: sha512-MJ3Bw+l91tLIUFkLAEWvez8deHlA2QPTluNc2vMLduHglHXzejRVLd3qEa2SQgphtPeXNlCttHCM6RN0zKSOKA==}
     peerDependencies:
       '@socialproof/myso': ^0.0.4
+
+  '@socialproof/myso-mls@0.1.0':
+    resolution: {integrity: sha512-dt+e7/yMvBT+jiVNNvatC7amm3a4W5eb4kWbtzzvw+bKGrW7iSkxugIBksjt/6STEvK0oZ/G7rCWxxHE/Rl3Hw==}
 
   '@socialproof/myso@0.0.4':
     resolution: {integrity: sha512-3SbHrYfv9JdoFQuKAcdWXPUc7viVeMtkmm2/fnQiK7lvg0kmFKt00JEt1apDlG1T0ltPv/uMYUv3hL+cerRDyQ==}
@@ -17070,6 +17076,8 @@ snapshots:
       '@socialproof/bcs': 0.0.2
       '@socialproof/myso': 0.0.4(typescript@5.9.3)
 
+  '@socialproof/myso-mls@0.1.0': {}
+
   '@socialproof/myso@0.0.4(typescript@5.9.3)':
     dependencies:
       '@graphql-typed-document-node/core': 3.2.0(graphql@16.13.2)
@@ -19810,7 +19818,7 @@ snapshots:
       eslint: 9.39.4(jiti@2.7.0)
       eslint-import-resolver-node: 0.3.10
       eslint-import-resolver-typescript: 3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0))
-      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.4(jiti@2.7.0))
+      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0))
       eslint-plugin-jsx-a11y: 6.10.2(eslint@9.39.4(jiti@2.7.0))
       eslint-plugin-react: 7.37.5(eslint@9.39.4(jiti@2.7.0))
       eslint-plugin-react-hooks: 7.1.1(eslint@9.39.4(jiti@2.7.0))
@@ -19843,7 +19851,7 @@ snapshots:
       tinyglobby: 0.2.16
       unrs-resolver: 1.11.1
     optionalDependencies:
-      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.4(jiti@2.7.0))
+      eslint-plugin-import: 2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0))
     transitivePeerDependencies:
       - supports-color
 
@@ -19857,7 +19865,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  eslint-plugin-import@2.32.0(eslint-import-resolver-typescript@3.10.1)(eslint@9.39.4(jiti@2.7.0)):
+  eslint-plugin-import@2.32.0(eslint-import-resolver-typescript@3.10.1(eslint-plugin-import@2.32.0(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)))(eslint@9.39.4(jiti@2.7.0)):
     dependencies:
       '@rtsao/scc': 1.1.0
       array-includes: 3.1.9

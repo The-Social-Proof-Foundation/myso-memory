@@ -506,6 +506,7 @@ mod tests {
             prompt: "hello",
             max_tokens: 32,
             idempotency_key: "idem-1",
+            max_amount_mist: None,
         };
         let value = serde_json::to_value(&body).unwrap();
         assert_eq!(value["owner"], "0xowner");

@@ -3,6 +3,7 @@ mod work_turns;
 mod work_runs;
 mod task_deliverables;
 mod room_attachments;
+mod mls_state;
 mod access_request_client;
 mod owner_auth;
 mod agent_key_backups;
@@ -283,6 +284,10 @@ async fn main() {
             "/api/agent/llm-model",
             get(llm_models::get_llm_model).put(llm_models::set_llm_model),
         )
+        .route("/api/messaging/mls/lease", post(mls_state::acquire))
+        .route("/api/messaging/mls/lease/renew", post(mls_state::renew))
+        .route("/api/messaging/mls/lease/release", post(mls_state::release))
+        .route("/api/messaging/mls/state", axum::routing::put(mls_state::put_state).layer(DefaultBodyLimit::max(24 * 1024 * 1024)))
         .route("/api/messaging/inbox", get(routes::messaging_inbox))
         .route("/api/messaging/wait", get(routes::messaging_wait))
         .route(

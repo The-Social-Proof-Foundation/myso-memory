@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { Signer, type SignatureScheme, type SignatureWithBytes } from "@socialproof/myso/cryptography";
 import { Ed25519PublicKey } from "@socialproof/myso/keypairs/ed25519";
 import { verifyPersonalMessageSignature } from "@socialproof/myso/verify";
-import { AgentMyDataReaderPolicy, createMySoMessagingStackClient, messagingPermissionTypes, resolveGenesisMessagingConfig, type GroupRef } from "@socialproof/myso-messaging-stack";
+import { createRequire } from "node:module";
+import { AgentMyDataReaderPolicy, createMySoMessagingStackClient, deriveHostedSealKey, hostedDeviceId, messagingPermissionTypes, resolveGenesisMessagingConfig, withHostedMlsStore, type GroupRef, type HostedMlsLeaseBackend, type MlsWasmModule } from "@socialproof/myso-messaging-stack";
 import { CAP_MESSAGE_READ, CAP_MESSAGE_SEND } from "@socialproof/sub-agents";
 import { McpRuntimeError } from "./errors.js";
 import type { AgentSigner } from "./signers.js";
@@ -124,7 +125,7 @@ export class McpRoomMessagingClient implements RoomHistoryClient {
         private readonly signer: AgentSigner,
         private readonly relayerUrl: string,
         getAgentContext: () => Promise<unknown>,
-        private readonly signedJson?: (method: "POST", path: string, body: object) => Promise<unknown>,
+        private readonly signedJson?: (method: "POST" | "PUT", path: string, body: object) => Promise<unknown>,
     ) {
         this.getContext = getAgentContext;
         let parsed: URL;
@@ -133,6 +134,80 @@ export class McpRoomMessagingClient implements RoomHistoryClient {
     }
 
     getAgentContext(): Promise<unknown> { return this.getContext(); }
+
+    // === MLS rooms (E2EE): the agent is its own hosted MLS device ===
+
+    private static mlsWasm: MlsWasmModule | null = null;
+    private sealKeys = new Map<string, Promise<CryptoKey>>();
+
+    private static loadMlsWasm(): MlsWasmModule {
+        // Node build of @socialproof/myso-mls: CommonJS, loads the WASM synchronously.
+        McpRoomMessagingClient.mlsWasm ??= createRequire(import.meta.url)("@socialproof/myso-mls") as MlsWasmModule;
+        return McpRoomMessagingClient.mlsWasm;
+    }
+
+    /** Lease backend on the memory server (`/api/messaging/mls/*`, agent-signed requests). */
+    private mlsLeaseBackend(deviceId: string): HostedMlsLeaseBackend {
+        const call = this.signedJson;
+        if (!call) throw new McpRuntimeError("INVALID_CONFIGURATION", "MLS rooms need the memory server to keep this agent's encrypted device state.");
+        const busy = (error: unknown) => error instanceof McpRuntimeError && error.code === "CONFLICT";
+        return {
+            acquire: async () => {
+                try {
+                    const r = await call("POST", "/api/messaging/mls/lease", { device_id: deviceId }) as { lease_token: string; version: number; blob: string | null };
+                    return { token: r.lease_token, version: r.version, blob: r.blob ? new Uint8Array(Buffer.from(r.blob, "base64")) : null };
+                } catch (error) {
+                    if (busy(error)) return null;
+                    throw error;
+                }
+            },
+            write: async (token, expectedVersion, blob) => {
+                try {
+                    const r = await call("PUT", "/api/messaging/mls/state", { device_id: deviceId, lease_token: token, expected_version: expectedVersion, blob: Buffer.from(blob).toString("base64") }) as { version: number };
+                    return r.version;
+                } catch (error) {
+                    if (busy(error)) return null;
+                    throw error;
+                }
+            },
+            renew: async (token) => {
+                try {
+                    await call("POST", "/api/messaging/mls/lease/renew", { device_id: deviceId, lease_token: token });
+                    return true;
+                } catch (error) {
+                    if (busy(error)) return false;
+                    throw error;
+                }
+            },
+            release: async (token) => { await call("POST", "/api/messaging/mls/lease/release", { device_id: deviceId, lease_token: token }); },
+        };
+    }
+
+    /**
+     * Run `fn` with the agent's MLS device open when the room is `mls1` (no-op otherwise). The device
+     * state is leased (one writer across MCP instances) and sealed with a key derived from the
+     * agent's own signature, so the memory server can't read it.
+     */
+    private async withRoomMls<T>(created: Awaited<ReturnType<McpRoomMessagingClient["createClient"]>>, groupRef: GroupRef, fn: () => Promise<T>): Promise<T> {
+        const { client, signer } = created;
+        const groupId = client.messaging.derive.resolveGroupRef(groupRef).groupId;
+        const meta = (await client.messaging.view.groupsMetadata({ groupIds: [groupId] }))[groupId] as { data?: { contents?: { key: string; value: string }[] } } | undefined;
+        if (meta?.data?.contents?.find((c) => c.key === "e2ee")?.value !== "mls1") return fn();
+        const agent = signer.toMySoAddress().toLowerCase();
+        const deviceId = hostedDeviceId("mcp", agent);
+        let pending = this.sealKeys.get(deviceId);
+        if (!pending) {
+            const derived = deriveHostedSealKey((bytes) => this.signer.sign(bytes), agent, deviceId);
+            derived.catch(() => this.sealKeys.delete(deviceId));
+            this.sealKeys.set(deviceId, derived);
+            pending = derived;
+        }
+        const sealKey = await pending;
+        return withHostedMlsStore({ backend: this.mlsLeaseBackend(deviceId), sealKey, owner: agent, deviceId }, async (store) => {
+            await client.messaging.openMlsSession({ wasm: McpRoomMessagingClient.loadMlsWasm(), store, signer, deviceId, primary: true });
+            return fn();
+        });
+    }
 
     private async createClient(permission: "read" | "send", transactionSigner = false) {
         const context = parseContext(await this.getContext());
@@ -306,55 +381,61 @@ export class McpRoomMessagingClient implements RoomHistoryClient {
     }
 
     async sendRoomMessage(request: { groupRef: GroupRef; text?: string; files?: Array<{ fileName: string; mimeType: string; contentBase64: string }>; idempotencyKey: string }): Promise<unknown> {
-        const { client, signer } = await this.createClient("send");
-        const groupId = client.messaging.derive.resolveGroupRef(request.groupRef).groupId;
-        const text = request.text ?? "";
-        if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > 64 * 1024) throw new McpRuntimeError("INVALID_ARGUMENT", "Room message text may contain at most 65,536 UTF-8 bytes.");
-        if (!text.trim() && (!Array.isArray(request.files) || request.files.length === 0)) throw new McpRuntimeError("INVALID_ARGUMENT", "Provide nonempty text or at least one attachment.");
-        if (typeof request.idempotencyKey !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.idempotencyKey)) {
-            throw new McpRuntimeError("INVALID_ARGUMENT", "idempotencyKey must be a canonical UUID v4.");
-        }
-        const files = (request.files ?? []).map((file) => {
-            if (!file || typeof file.fileName !== "string" || !file.fileName.trim() || file.fileName.length > 255
-                || typeof file.mimeType !== "string" || !file.mimeType.trim() || file.mimeType.length > 128
-                || typeof file.contentBase64 !== "string" || !file.contentBase64) throw new McpRuntimeError("INVALID_ARGUMENT", "Each attachment requires a filename, MIME type and base64 content.");
-            const data = Buffer.from(file.contentBase64, "base64");
-            if (data.toString("base64") !== file.contentBase64 || !data.byteLength || data.byteLength > 5 * 1024 * 1024 - 16) throw new McpRuntimeError("INVALID_ARGUMENT", "Attachments must be canonical base64 containing 1–5 MiB less encryption overhead.");
-            return { fileName: file.fileName, mimeType: file.mimeType, data: new Uint8Array(data) };
+        const created = await this.createClient("send");
+        return this.withRoomMls(created, request.groupRef, async () => {
+            const { client, signer } = created;
+            const groupId = client.messaging.derive.resolveGroupRef(request.groupRef).groupId;
+            const text = request.text ?? "";
+            if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > 64 * 1024) throw new McpRuntimeError("INVALID_ARGUMENT", "Room message text may contain at most 65,536 UTF-8 bytes.");
+            if (!text.trim() && (!Array.isArray(request.files) || request.files.length === 0)) throw new McpRuntimeError("INVALID_ARGUMENT", "Provide nonempty text or at least one attachment.");
+            if (typeof request.idempotencyKey !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.idempotencyKey)) {
+                throw new McpRuntimeError("INVALID_ARGUMENT", "idempotencyKey must be a canonical UUID v4.");
+            }
+            const files = (request.files ?? []).map((file) => {
+                if (!file || typeof file.fileName !== "string" || !file.fileName.trim() || file.fileName.length > 255
+                    || typeof file.mimeType !== "string" || !file.mimeType.trim() || file.mimeType.length > 128
+                    || typeof file.contentBase64 !== "string" || !file.contentBase64) throw new McpRuntimeError("INVALID_ARGUMENT", "Each attachment requires a filename, MIME type and base64 content.");
+                const data = Buffer.from(file.contentBase64, "base64");
+                if (data.toString("base64") !== file.contentBase64 || !data.byteLength || data.byteLength > 5 * 1024 * 1024 - 16) throw new McpRuntimeError("INVALID_ARGUMENT", "Attachments must be canonical base64 containing 1–5 MiB less encryption overhead.");
+                return { fileName: file.fileName, mimeType: file.mimeType, data: new Uint8Array(data) };
+            });
+            if (files.length > 10 || files.reduce((size, file) => size + file.data.byteLength, 0) > 50 * 1024 * 1024) throw new McpRuntimeError("INVALID_ARGUMENT", "Room messages support at most 10 attachments and 50 MiB total file data.");
+            if (files.length && !this.signedJson) throw new McpRuntimeError("SIGNER_UNAVAILABLE", "Authenticated R2 storage is not configured for this MCP room client.");
+            await this.assertRoomIdPermission(client, signer, groupId, "MessagingSender");
+            const sent = await client.messaging.sendMessage({ signer, groupRef: request.groupRef, text, ...(files.length ? { files } : {}), idempotencyKey: request.idempotencyKey });
+            if (!sent || typeof sent.messageId !== "string" || !sent.messageId) {
+                throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The messaging relayer did not return a message ID.");
+            }
+            const message = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: sent.messageId });
+            await this.assertRoomIdPermission(client, signer, groupId, "MessagingSender");
+            if (message.groupId !== groupId || message.messageId !== sent.messageId || message.isDeleted || !message.senderVerified
+                || address(message.senderAddress, "message sender") !== signer.toMySoAddress()
+                || message.text !== text || message.attachments.length !== files.length
+                || message.attachmentIntegrity !== (files.length ? "verified" : "none")) {
+                throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The sent room message could not be confirmed by a verified caller-bound readback.");
+            }
+            return {
+                messageId: message.messageId,
+                groupId,
+                order: message.order,
+                senderAddress: address(message.senderAddress, "message sender"),
+                textSha256: createHash("sha256").update(message.text, "utf8").digest("hex"),
+                attachmentCount: message.attachments.length,
+                attachmentIntegrity: message.attachmentIntegrity,
+                signatureVerified: true,
+                permissionSource: "live_fullnode_messaging_sender_checked_before_and_after",
+                contentSource: "relayer_readback_signature_verified",
+            };
         });
-        if (files.length > 10 || files.reduce((size, file) => size + file.data.byteLength, 0) > 50 * 1024 * 1024) throw new McpRuntimeError("INVALID_ARGUMENT", "Room messages support at most 10 attachments and 50 MiB total file data.");
-        if (files.length && !this.signedJson) throw new McpRuntimeError("SIGNER_UNAVAILABLE", "Authenticated R2 storage is not configured for this MCP room client.");
-        await this.assertRoomIdPermission(client, signer, groupId, "MessagingSender");
-        const sent = await client.messaging.sendMessage({ signer, groupRef: request.groupRef, text, ...(files.length ? { files } : {}), idempotencyKey: request.idempotencyKey });
-        if (!sent || typeof sent.messageId !== "string" || !sent.messageId) {
-            throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The messaging relayer did not return a message ID.");
-        }
-        const message = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: sent.messageId });
-        await this.assertRoomIdPermission(client, signer, groupId, "MessagingSender");
-        if (message.groupId !== groupId || message.messageId !== sent.messageId || message.isDeleted || !message.senderVerified
-            || address(message.senderAddress, "message sender") !== signer.toMySoAddress()
-            || message.text !== text || message.attachments.length !== files.length
-            || message.attachmentIntegrity !== (files.length ? "verified" : "none")) {
-            throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The sent room message could not be confirmed by a verified caller-bound readback.");
-        }
-        return {
-            messageId: message.messageId,
-            groupId,
-            order: message.order,
-            senderAddress: address(message.senderAddress, "message sender"),
-            textSha256: createHash("sha256").update(message.text, "utf8").digest("hex"),
-            attachmentCount: message.attachments.length,
-            attachmentIntegrity: message.attachmentIntegrity,
-            signatureVerified: true,
-            permissionSource: "live_fullnode_messaging_sender_checked_before_and_after",
-            contentSource: "relayer_readback_signature_verified",
-        };
     }
 
     async readRoomHistory(request: { groupRef: GroupRef; afterOrder?: number; beforeOrder?: number; limit?: number }): Promise<unknown> {
-        const { client, signer } = await this.createClient("read");
-        const page = await client.messaging.getRoomMessages({ signer, ...request });
-        return page;
+        const created = await this.createClient("read");
+        return this.withRoomMls(created, request.groupRef, async () => {
+            const { client, signer } = created;
+            const page = await client.messaging.getRoomMessages({ signer, ...request });
+            return page;
+        });
     }
 
     async readRoomAttachment(request: { groupRef: GroupRef; messageId: string; storageId: string }): Promise<unknown> {
@@ -362,34 +443,37 @@ export class McpRoomMessagingClient implements RoomHistoryClient {
             || typeof request.storageId !== "string" || request.storageId.length > 512) {
             throw new McpRuntimeError("INVALID_ARGUMENT", "A valid messageId and attachment storageId are required.");
         }
-        const { client, signer } = await this.createClient("read");
-        await this.assertRoomPermission(client, signer, request.groupRef, "MessagingReader");
-        const message = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
-        if (!message.senderVerified || message.attachmentIntegrity !== "verified" || message.isDeleted) {
-            throw new McpRuntimeError("CAPABILITY_DENIED", "Attachment plaintext is available only from a verified, undeleted signed room message.");
-        }
-        const attachment = message.attachments.find((item) => item.wire.storageId === request.storageId);
-        if (!attachment) throw new McpRuntimeError("INVALID_ARGUMENT", "The selected attachment is not part of this verified room message.");
-        if (!Number.isSafeInteger(attachment.fileSize) || attachment.fileSize < 0 || attachment.fileSize > 5 * 1024 * 1024) {
-            throw new McpRuntimeError("INVALID_ARGUMENT", "This attachment exceeds the 5 MiB plaintext limit.");
-        }
-        const bytes = await attachment.data();
-        await this.assertRoomPermission(client, signer, request.groupRef, "MessagingReader");
-        if (bytes.byteLength !== attachment.fileSize) throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "Decrypted attachment size does not match its signed metadata.");
-        return {
-            messageId: message.messageId,
-            groupId: message.groupId,
-            order: message.order,
-            storageId: request.storageId,
-            fileName: attachment.fileName,
-            mimeType: attachment.mimeType,
-            fileSize: bytes.byteLength,
-            contentBase64: Buffer.from(bytes).toString("base64"),
-            contentSha256: sha256Hex(bytes),
-            senderVerified: true,
-            attachmentIntegrity: "verified",
-            permissionSource: "live_fullnode_messaging_reader_checked_before_and_after",
-        };
+        const created = await this.createClient("read");
+        return this.withRoomMls(created, request.groupRef, async () => {
+            const { client, signer } = created;
+            await this.assertRoomPermission(client, signer, request.groupRef, "MessagingReader");
+            const message = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
+            if (!message.senderVerified || message.attachmentIntegrity !== "verified" || message.isDeleted) {
+                throw new McpRuntimeError("CAPABILITY_DENIED", "Attachment plaintext is available only from a verified, undeleted signed room message.");
+            }
+            const attachment = message.attachments.find((item) => item.wire.storageId === request.storageId);
+            if (!attachment) throw new McpRuntimeError("INVALID_ARGUMENT", "The selected attachment is not part of this verified room message.");
+            if (!Number.isSafeInteger(attachment.fileSize) || attachment.fileSize < 0 || attachment.fileSize > 5 * 1024 * 1024) {
+                throw new McpRuntimeError("INVALID_ARGUMENT", "This attachment exceeds the 5 MiB plaintext limit.");
+            }
+            const bytes = await attachment.data();
+            await this.assertRoomPermission(client, signer, request.groupRef, "MessagingReader");
+            if (bytes.byteLength !== attachment.fileSize) throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "Decrypted attachment size does not match its signed metadata.");
+            return {
+                messageId: message.messageId,
+                groupId: message.groupId,
+                order: message.order,
+                storageId: request.storageId,
+                fileName: attachment.fileName,
+                mimeType: attachment.mimeType,
+                fileSize: bytes.byteLength,
+                contentBase64: Buffer.from(bytes).toString("base64"),
+                contentSha256: sha256Hex(bytes),
+                senderVerified: true,
+                attachmentIntegrity: "verified",
+                permissionSource: "live_fullnode_messaging_reader_checked_before_and_after",
+            };
+        });
     }
 
     private async getOwnedMessage(
@@ -408,27 +492,42 @@ export class McpRoomMessagingClient implements RoomHistoryClient {
     }
 
     async editRoomMessage(request: { groupRef: GroupRef; messageId: string; text: string }): Promise<unknown> {
-        const { client, signer } = await this.createClient("send");
-        const before = await this.getOwnedMessage(client, signer, request.groupRef, request.messageId);
-        await client.messaging.editMessage({ signer, groupRef: request.groupRef, messageId: request.messageId, text: request.text });
-        await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
-        const after = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
-        if (!after.senderVerified || address(after.senderAddress, "message sender") !== address(signer.toMySoAddress(), "agent signer") || after.isDeleted || !after.isEdited || after.text !== request.text) {
-            throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The relayer accepted an edit, but the updated signed message could not be verified.");
-        }
-        return { updated: true, messageId: request.messageId, groupId: before.groupId, order: after.order, updatedAt: after.updatedAt, verification: "signed_message_refetched", source: "messaging_relayer" };
+        const created = await this.createClient("send");
+        return this.withRoomMls(created, request.groupRef, async () => {
+            const { client, signer } = created;
+            const before = await this.getOwnedMessage(client, signer, request.groupRef, request.messageId);
+            await client.messaging.editMessage({ signer, groupRef: request.groupRef, messageId: request.messageId, text: request.text });
+            await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
+            // v2 / MLS rooms: an edit is an encrypted event; the original row never changes, so its
+            // readback can't show it. The event send above is the confirmation.
+            if (await client.messaging.writesContentEnvelopeV2(request.groupRef)) {
+                return { updated: true, messageId: request.messageId, groupId: before.groupId, order: before.order, verification: "encrypted_edit_event_sent", source: "messaging_relayer" };
+            }
+            const after = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
+            if (!after.senderVerified || address(after.senderAddress, "message sender") !== address(signer.toMySoAddress(), "agent signer") || after.isDeleted || !after.isEdited || after.text !== request.text) {
+                throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The relayer accepted an edit, but the updated signed message could not be verified.");
+            }
+            return { updated: true, messageId: request.messageId, groupId: before.groupId, order: after.order, updatedAt: after.updatedAt, verification: "signed_message_refetched", source: "messaging_relayer" };
+        });
     }
 
     async deleteRoomMessage(request: { groupRef: GroupRef; messageId: string }): Promise<unknown> {
-        const { client, signer } = await this.createClient("send");
-        const before = await this.getOwnedMessage(client, signer, request.groupRef, request.messageId);
-        await client.messaging.deleteMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
-        await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
-        const after = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
-        if (!after.isDeleted || address(after.senderAddress, "message sender") !== address(signer.toMySoAddress(), "agent signer")) {
-            throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The relayer accepted deletion, but the matching sender-owned tombstone could not be verified.");
-        }
-        return { deleted: true, messageId: request.messageId, groupId: before.groupId, order: after.order, updatedAt: after.updatedAt, verification: "sender_owned_tombstone_refetched", source: "messaging_relayer" };
+        const created = await this.createClient("send");
+        return this.withRoomMls(created, request.groupRef, async () => {
+            const { client, signer } = created;
+            const before = await this.getOwnedMessage(client, signer, request.groupRef, request.messageId);
+            await client.messaging.deleteMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
+            await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
+            // v2 / MLS rooms: a delete is an encrypted event (and the relayer copy is dropped).
+            if (await client.messaging.writesContentEnvelopeV2(request.groupRef)) {
+                return { deleted: true, messageId: request.messageId, groupId: before.groupId, order: before.order, verification: "encrypted_delete_event_sent", source: "messaging_relayer" };
+            }
+            const after = await client.messaging.getMessage({ signer, groupRef: request.groupRef, messageId: request.messageId });
+            if (!after.isDeleted || address(after.senderAddress, "message sender") !== address(signer.toMySoAddress(), "agent signer")) {
+                throw new McpRuntimeError("UPSTREAM_UNAVAILABLE", "The relayer accepted deletion, but the matching sender-owned tombstone could not be verified.");
+            }
+            return { deleted: true, messageId: request.messageId, groupId: before.groupId, order: after.order, updatedAt: after.updatedAt, verification: "sender_owned_tombstone_refetched", source: "messaging_relayer" };
+        });
     }
 
     async removeRoomMembersAndRotateKey(request: { groupRef: GroupRef; members: string[] }): Promise<unknown> {
@@ -591,14 +690,17 @@ export class McpRoomMessagingClient implements RoomHistoryClient {
     }
 
     async changeRoomReaction(request: { groupRef: GroupRef; order: number; emoji: string; add: boolean }): Promise<unknown> {
-        const { client, signer } = await this.createClient("send");
-        await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
-        const { add, ...reaction } = request;
-        if (add) await client.messaging.addReaction({ signer, ...reaction });
-        else await client.messaging.removeReaction({ signer, ...reaction });
-        const result = await client.messaging.listReactions({ signer, groupRef: request.groupRef, order: request.order });
-        await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
-        return result;
+        const created = await this.createClient("send");
+        return this.withRoomMls(created, request.groupRef, async () => {
+            const { client, signer } = created;
+            await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
+            const { add, ...reaction } = request;
+            if (add) await client.messaging.addReaction({ signer, ...reaction });
+            else await client.messaging.removeReaction({ signer, ...reaction });
+            const result = await client.messaging.listReactions({ signer, groupRef: request.groupRef, order: request.order });
+            await this.assertRoomPermission(client, signer, request.groupRef, "MessagingSender");
+            return result;
+        });
     }
 
     async getRoomReceipts(request: { groupRef: GroupRef }): Promise<unknown> {

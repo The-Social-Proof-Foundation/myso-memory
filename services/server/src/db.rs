@@ -69,6 +69,7 @@ impl VectorDb {
             ("029", include_str!("../migrations/029_work_run_worker_task_artifact_consent.sql")),
             ("031", include_str!("../migrations/031_reenable_consented_hosted_graph_reads.sql")),
             ("032", include_str!("../migrations/032_work_operation_gas_receipts.sql")),
+            ("033", include_str!("../migrations/033_mls_agent_device_state.sql")),
         ] {
             sqlx::raw_sql(sql).execute(&pool).await.map_err(|e| {
                 AppError::Internal(format!("Failed to run migration {}: {}", name, e))

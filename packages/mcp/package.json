@@ -20,6 +20,7 @@
     "@socialproof/memory": "workspace:^",
     "@socialproof/myso": "0.0.4",
     "@socialproof/myso-messaging-stack": "link:../../../myso-messaging-stack/ts-sdks/packages/myso-messaging-stack",
+    "@socialproof/myso-mls": "0.1.0",
     "@socialproof/sub-agents": "workspace:^",
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
